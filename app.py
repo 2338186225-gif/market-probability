@@ -3,6 +3,7 @@ import numpy as np
 from scipy.stats import norm
 import math
 import yfinance as yf
+import pandas as pd
 from datetime import datetime
 
 st.set_page_config(
@@ -41,11 +42,18 @@ st.markdown("""
         border-radius: 0 8px 8px 0;
         margin-top: 1rem;
     }
+    .stock-card {
+        background: #1a2332;
+        border: 1px solid #2d3a4f;
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 0.5rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">市场行情概率测算器</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">基于几何布朗运动（GBM）/ Black-Scholes · 支持实时行情、历史年化收益与关注列表</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">支持多股票实时数据、股息收益率与概率测算</div>', unsafe_allow_html=True)
 
 # 初始化 session state
 if "s0" not in st.session_state:
@@ -58,12 +66,99 @@ if "cagr" not in st.session_state:
     st.session_state.cagr = None
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = []
+if "multi_data" not in st.session_state:
+    st.session_state.multi_data = None
 
-# 侧边栏
+# ==================== 多股票数据区域 ====================
+st.subheader("多股票实时数据总览")
+
+multi_input = st.text_input(
+    "输入多个股票代码（用英文逗号分隔，如 AAPL,MSFT,GOOG,0700.HK,BTC-USD）",
+    value="AAPL,MSFT,GOOG"
+)
+
+col_multi, col_clear = st.columns([3, 1])
+with col_multi:
+    if st.button("🔄 拉取所有股票数据", type="primary", use_container_width=True):
+        tickers = [t.strip().upper() for t in multi_input.split(",") if t.strip()]
+        if not tickers:
+            st.warning("请输入至少一个股票代码")
+        else:
+            with st.spinner("正在获取多只股票数据..."):
+                results = []
+                for ticker in tickers:
+                    try:
+                        stock = yf.Ticker(ticker)
+                        hist = stock.history(period="max")
+                        if hist.empty:
+                            results.append({"代码": ticker, "名称": "无数据", "当前价": None})
+                            continue
+                        
+                        current_price = float(hist["Close"].iloc[-1])
+                        returns = hist["Close"].pct_change().dropna()
+                        hist_vol = float(returns.std() * np.sqrt(252) * 100)
+                        
+                        # CAGR
+                        start_price = float(hist["Close"].iloc[0])
+                        start_date = hist.index[0]
+                        end_date = hist.index[-1]
+                        years = (end_date - start_date).days / 365.25
+                        cagr = None
+                        if years > 0 and start_price > 0:
+                            cagr = (current_price / start_price) ** (1 / years) - 1
+                        
+                        # 股息信息
+                        info = stock.info
+                        name = info.get("shortName", ticker)
+                        dividend_yield = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
+                        dividend_rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
+                        
+                        # 如果 yield 是小数，转为百分比
+                        if dividend_yield is not None and dividend_yield < 1:
+                            dividend_yield = dividend_yield * 100
+                        
+                        results.append({
+                            "代码": ticker,
+                            "名称": name,
+                            "当前价": round(current_price, 2),
+                            "历史年化收益%": round(cagr * 100, 2) if cagr is not None else None,
+                            "年化波动率%": round(hist_vol, 1),
+                            "股息率%": round(dividend_yield, 2) if dividend_yield is not None else None,
+                            "年股息": round(dividend_rate, 2) if dividend_rate is not None else None,
+                        })
+                    except Exception as e:
+                        results.append({"代码": ticker, "名称": f"错误: {str(e)[:30]}", "当前价": None})
+                
+                st.session_state.multi_data = pd.DataFrame(results)
+
+with col_clear:
+    if st.button("清空", use_container_width=True):
+        st.session_state.multi_data = None
+
+if st.session_state.multi_data is not None and not st.session_state.multi_data.empty:
+    st.dataframe(
+        st.session_state.multi_data,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "当前价": st.column_config.NumberColumn(format="%.2f"),
+            "历史年化收益%": st.column_config.NumberColumn(format="%.2f"),
+            "年化波动率%": st.column_config.NumberColumn(format="%.1f"),
+            "股息率%": st.column_config.NumberColumn(format="%.2f"),
+            "年股息": st.column_config.NumberColumn(format="%.2f"),
+        }
+    )
+    st.caption("股息率与年股息来自 Yahoo Finance，部分股票可能无数据。历史年化收益为成立以来 CAGR。")
+
+st.markdown("---")
+
+# ==================== 单股票概率测算区域 ====================
+st.subheader("单股票概率测算")
+
 with st.sidebar:
-    st.header("参数设置")
+    st.header("单股票参数")
     
-    ticker = st.text_input("股票代码（如 AAPL、TSLA、0700.HK）", value="AAPL").strip().upper()
+    ticker = st.text_input("股票代码", value="AAPL").strip().upper()
     
     col_fetch, col_add = st.columns(2)
     with col_fetch:
@@ -88,7 +183,6 @@ with st.sidebar:
                     returns = hist["Close"].pct_change().dropna()
                     hist_vol = returns.std() * np.sqrt(252) * 100
                     
-                    # 计算成立以来年化收益率 CAGR
                     start_price = hist["Close"].iloc[0]
                     start_date = hist.index[0]
                     end_date = hist.index[-1]
@@ -110,24 +204,17 @@ with st.sidebar:
     # 关注列表
     if st.session_state.watchlist:
         st.markdown("**关注列表**")
-        for i, code in enumerate(st.session_state.watchlist):
+        for code in st.session_state.watchlist[:]:
             col_a, col_b = st.columns([3, 1])
             with col_a:
                 if st.button(code, key=f"wl_{code}", use_container_width=True):
-                    st.session_state.ticker_to_load = code
+                    st.session_state["ticker_input"] = code
                     st.rerun()
             with col_b:
                 if st.button("×", key=f"del_{code}"):
                     st.session_state.watchlist.remove(code)
                     st.rerun()
         st.markdown("---")
-
-    # 处理从关注列表加载
-    if "ticker_to_load" in st.session_state:
-        ticker = st.session_state.ticker_to_load
-        del st.session_state.ticker_to_load
-        # 触发拉取逻辑（简化处理，实际可优化）
-        st.experimental_rerun()
 
     mode = st.radio("测算模式", ["单目标价", "价格区间"], horizontal=True)
     
