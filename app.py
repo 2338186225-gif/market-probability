@@ -68,7 +68,17 @@ st.markdown("""
         .qgrid .score-num { display: none; }
         .qgrid .qleft { grid-column: 1; grid-row: 1 / span 2; }
         .qgrid .px { grid-column: 2; grid-row: 1; font-size: 15px; }
-        .qgrid .pct { grid-column: 2; grid-row: 2; min-width: 64px; padding: 4px 6px; font-size: 12px; }
+        .qgrid .pct, .qhead .pct-h { grid-column: 2; grid-row: 2; min-width: 64px; padding: 4px 6px; font-size: 12px; }
+        .qhead { padding-right: 40px; }
+        div[data-testid="stElementContainer"]:has(.add-bar) + div[data-testid="stElementContainer"] > div[data-testid="stHorizontalBlock"],
+        .element-container:has(.add-bar) + .element-container > div[data-testid="stHorizontalBlock"] {
+            flex-direction: row !important;
+            flex-wrap: nowrap !important;
+        }
+        div[data-testid="stElementContainer"]:has(.add-bar) + div[data-testid="stElementContainer"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
+        .element-container:has(.add-bar) + .element-container > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+            width: auto !important; min-width: 0 !important; flex: 1 1 auto !important; max-width: none !important;
+        }
         .row-name { max-width: 52vw; }
         .bn-quote { flex-direction: column; gap: 8px; }
         .bn-last { font-size: 32px; }
@@ -88,7 +98,11 @@ st.markdown("""
             flex: 1 1 100% !important;
         }
     }
-    .qrow { display: flex; align-items: center; border-bottom: 1px solid #f2f3f5; }
+    .qhead { padding: 2px 40px 6px 4px; }
+    .qhead .qleft { gap: 12px; }
+    a.sort-link, a.sort-link:hover { color: #8b919a; text-decoration: none; font-size: 12px; font-weight: 500; }
+    a.sort-link.on { color: #111827; font-weight: 700; }
+    .pct-h { text-align: right; }
     .qrow:hover { background: #fafafa; }
     a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; flex: 1; padding: 10px 0 10px 4px; cursor: pointer; }
     a.row-hit.bare, a.row-hit.bare:hover { padding-right: 0; }
@@ -216,6 +230,14 @@ if drop:
     st.rerun()
 if opened:
     st.session_state.selected_ticker = opened
+sort_q = st.query_params.get("sort")
+if isinstance(sort_q, list):
+    sort_q = sort_q[0] if sort_q else None
+if sort_q == "off":
+    st.session_state.watch_sort = None
+    del st.query_params["sort"]
+elif sort_q in ("name", "amount", "score", "price", "chg"):
+    st.session_state.watch_sort = sort_q
 
 ALIASES = {
     "BTC": "BTC-USD",
@@ -1909,6 +1931,7 @@ else:
 
     with watch_col:
         st.markdown('<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · 延迟行情</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="add-bar"></div>', unsafe_allow_html=True)
         add_l, add_r = st.columns([5, 1])
         with add_l:
             new_ticker = st.text_input("添加股票", placeholder="代码，如 AAPL、BTC", label_visibility="collapsed")
@@ -1922,21 +1945,22 @@ else:
                     del st.session_state.stock_cache[t]
                 st.rerun()
         active_sort = st.session_state.get("watch_sort")
-        h_name, h_score, h_price, h_chg, h_pad = st.columns([5.2, 1.3, 1.3, 1.2, 0.45], gap="small")
-        with h_name:
-            n1, n2 = st.columns(2)
-            for column, key, label in ((n1, "name", "名称"), (n2, "amount", "成交额")):
-                with column:
-                    mark = " ↓" if active_sort == key else ""
-                    if st.button(label + mark, key=f"wsort_{key}", type="primary" if active_sort == key else "secondary", use_container_width=True):
-                        st.session_state.watch_sort = None if active_sort == key else key
-                        st.rerun()
-        for column, key, label in ((h_score, "score", "评分"), (h_price, "price", "最新价"), (h_chg, "chg", "涨跌幅")):
-            with column:
-                mark = " ↓" if active_sort == key else ""
-                if st.button(label + mark, key=f"wsort_{key}", type="primary" if active_sort == key else "secondary", use_container_width=True):
-                    st.session_state.watch_sort = None if active_sort == key else key
-                    st.rerun()
+
+        def sort_link(key, label):
+            on = active_sort == key
+            href = "?sort=off" if on else f"?sort={key}"
+            mark = " ↓" if on else ""
+            return f'<a class="sort-link{" on" if on else ""}" href="{href}">{label}{mark}</a>'
+
+        st.markdown(
+            '<div class="qgrid qhead">'
+            f'<div class="qleft">{sort_link("name", "名称")}{sort_link("amount", "成交额")}</div>'
+            f'<div class="score-num">{sort_link("score", "评分")}</div>'
+            f'<div class="px">{sort_link("price", "最新价")}</div>'
+            f'<div class="pct-h">{sort_link("chg", "涨跌幅")}</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
         rows = []
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
