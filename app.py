@@ -73,7 +73,15 @@ st.markdown("""
         .bn-quote { flex-direction: column; gap: 8px; }
         .bn-last { font-size: 32px; }
         .bn-stats { width: 100%; min-width: 0; }
-        div[data-testid="stHorizontalBlock"]:has(input) { flex-wrap: nowrap !important; }
+        div[data-testid="stHorizontalBlock"]:has(input),
+        div[data-testid="stHorizontalBlock"]:has([class*="st-key-wsort_"]) { flex-wrap: nowrap !important; }
+        div[data-testid="stHorizontalBlock"]:has([class*="st-key-wsort_"]) > div[data-testid="column"],
+        div[data-testid="stHorizontalBlock"]:has([class*="st-key-wsort_"]) > div[data-testid="stColumn"] {
+            min-width: 0 !important; width: auto !important; flex: 1 1 0% !important; max-width: none !important;
+        }
+        div[class*="st-key-wsort_"] button {
+            font-size: 11px !important; min-height: 28px !important; padding: 0 2px !important; white-space: nowrap !important;
+        }
         .stButton > button { min-height: 2.2rem; }
     }
     .qrow { display: flex; align-items: center; border-bottom: 1px solid #f2f3f5; }
@@ -1908,10 +1916,22 @@ else:
                 if t in st.session_state.stock_cache:
                     del st.session_state.stock_cache[t]
                 st.rerun()
-        sort_options = ["默认", "名称", "成交额", "买入评分", "最新价", "涨跌幅"]
-        sort_keys = {"默认": None, "名称": "name", "成交额": "amount", "买入评分": "score", "最新价": "price", "涨跌幅": "chg"}
-        picked_sort = st.selectbox("排序", sort_options, label_visibility="collapsed")
-        active_sort = sort_keys[picked_sort]
+        active_sort = st.session_state.get("watch_sort")
+        h_name, h_score, h_price, h_chg, h_pad = st.columns([5.2, 1.3, 1.3, 1.2, 0.45], gap="small")
+        with h_name:
+            n1, n2 = st.columns(2)
+            for column, key, label in ((n1, "name", "名称"), (n2, "amount", "成交额")):
+                with column:
+                    mark = " ↓" if active_sort == key else ""
+                    if st.button(label + mark, key=f"wsort_{key}", type="primary" if active_sort == key else "secondary", use_container_width=True):
+                        st.session_state.watch_sort = None if active_sort == key else key
+                        st.rerun()
+        for column, key, label in ((h_score, "score", "评分"), (h_price, "price", "最新价"), (h_chg, "chg", "涨跌幅")):
+            with column:
+                mark = " ↓" if active_sort == key else ""
+                if st.button(label + mark, key=f"wsort_{key}", type="primary" if active_sort == key else "secondary", use_container_width=True):
+                    st.session_state.watch_sort = None if active_sort == key else key
+                    st.rerun()
         rows = []
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
