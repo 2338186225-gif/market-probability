@@ -282,7 +282,7 @@ if isinstance(page, list):
 paper_book = st.query_params.get("book")
 if isinstance(paper_book, list):
     paper_book = paper_book[0] if paper_book else None
-if paper_book not in ("watch", "market"):
+if paper_book not in ("watch", "market", "edge"):
     paper_book = "watch"
 paper_hold = st.query_params.get("hold")
 if isinstance(paper_hold, list):
@@ -1606,15 +1606,19 @@ def load_books():
         books = {"watch": raw, "market": empty_paper()}
     else:
         books = {"watch": empty_paper(), "market": empty_paper()}
-    for key in ("watch", "market"):
+    for key in ("watch", "market", "edge"):
         books.setdefault(key, empty_paper())
         books[key].setdefault("positions", {})
         books[key].setdefault("trades", [])
         books[key].setdefault("seen", [])
         books[key].setdefault("cash", PAPER_CASH)
     stamp = books.get("updated")
-    if "books" not in st.session_state or (stamp and stamp != st.session_state.books.get("updated")):
+    current = st.session_state.get("books")
+    if not current or (stamp and stamp != current.get("updated")):
         st.session_state.books = books
+    else:
+        for key in ("watch", "market", "edge"):
+            st.session_state.books.setdefault(key, empty_paper())
     return st.session_state.books
 
 def save_books(books):
@@ -1708,9 +1712,29 @@ def close_position(book, ticker, price, reason, today):
     })
     return True
 
+EDGE_SKIP = {"SOXL", "KORU", "TQQQ", "SQQQ", "UVXY", "SOXS", "LABU", "LABD", "DRAM"}
+
+def edge_ok(row):
+    ticker = row.get("ticker") or ""
+    if ticker in EDGE_SKIP:
+        return False
+    if ticker.endswith("-USD") and ticker not in ("BTC-USD", "ETH-USD"):
+        return False
+    monthly = (row.get("horizons") or {}).get("月") or {}
+    if monthly.get("label") != "买入":
+        return False
+    if row.get("label") not in ("买入", "强烈买入"):
+        return False
+    if (row.get("score") or 0) < 70:
+        return False
+    vol = row.get("vol")
+    if vol is not None and vol > 0.8:
+        return False
+    return True
+
 def paper_rebalance(book, signals, kind):
     today = date.today().isoformat()
-    rule_id = "quant-v1"
+    rule_id = "quant-v2"
     if book.get("last_run") == today and book.get("rules") == rule_id:
         return book
     books = load_books()
@@ -1728,7 +1752,11 @@ def paper_rebalance(book, signals, kind):
         else:
             label = (sig.get("horizons") or {}).get(horizon, {}).get("label")
             up = sig.get("up_prob")
-            if label in ("回避", "观望"):
+            monthly = (sig.get("horizons") or {}).get("月", {}).get("label")
+            if kind == "edge":
+                if monthly == "回避":
+                    reason = "月线转为回避，趋势仓退出"
+            elif label in ("回避", "观望"):
                 reason = f"{horizon}线评级变为{label}"
             elif horizon == "日" and up is not None and up < 0.4 and sig.get("label") != "强烈买入":
                 reason = f"日线仓位的20日上涨概率降至 {up * 100:.0f}%"
@@ -1772,11 +1800,17 @@ def paper_rebalance(book, signals, kind):
                     px = float((by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0)
                     equity += pos["shares"] * float(px)
     caps = {"日": 0.30, "周": 0.60, "月": 1.0}
+    slots = 5 if kind == "edge" else PAPER_SLOTS
     ranked = []
-    for row in signals:
-        horizon = best_horizon(row, n, wins)
-        if horizon:
-            ranked.append((horizon, row))
+    if kind == "edge":
+        for row in signals:
+            if edge_ok(row):
+                ranked.append(("月", row))
+    else:
+        for row in signals:
+            horizon = best_horizon(row, n, wins)
+            if horizon:
+                ranked.append((horizon, row))
     ranked.sort(key=lambda pair: ({"月": 0, "周": 1, "日": 2}[pair[0]], -(pair[1].get("score") or -999)))
 
     def sleeve_value(horizon):
@@ -1791,16 +1825,20 @@ def paper_rebalance(book, signals, kind):
     def quant_budget(horizon, vol, room):
         vol = float(vol) if vol and vol > 0.05 else 0.30
         risk = {"日": 0.004, "周": 0.007, "月": 0.010}[horizon]
-        name_cap = {"日": 0.08, "周": 0.12, "月": 0.18}[horizon]
+        name_cap = {"日": 0.08, "周": 0.12, "月": 0.20 if kind == "edge" else 0.18}[horizon]
         weight = min(name_cap, risk / vol)
-        return max(0.0, min(book["cash"], room, equity * weight))
+        room_left = room
+        if kind == "edge":
+            invested = equity - book["cash"]
+            room_left = min(room, equity * 0.8 - invested)
+        return max(0.0, min(book["cash"], room_left, equity * weight))
 
     for horizon, row in ranked:
-        if len(book["positions"]) >= PAPER_SLOTS or row["ticker"] in book["positions"]:
+        if len(book["positions"]) >= slots or row["ticker"] in book["positions"]:
             continue
         price = float(row["price"])
         up = row.get("up_prob")
-        if horizon == "日" and up is not None and up < 0.55:
+        if kind != "edge" and horizon == "日" and up is not None and up < 0.55:
             continue
         room = equity * caps[horizon] - sleeve_value(horizon)
         budget = quant_budget(horizon, row.get("vol"), room)
@@ -1870,7 +1908,7 @@ def apply_shocks(books, price_fn=None):
                 if close_position(book, ticker, price, f"重大消息：{zh}", today):
                     book.setdefault("seen", []).append(key)
                     book["seen"] = book["seen"][-80:]
-                    acted.append(f"{'自选' if name == 'watch' else '全市场'} {show_symbol(ticker)} 卖出 · {zh}")
+                    acted.append(f"{'自选' if name == 'watch' else '择股' if name == 'edge' else '全市场'} {show_symbol(ticker)} 卖出 · {zh}")
     return acted
 
 def _monitor_loop():
@@ -2042,44 +2080,86 @@ def render_book_list(book_key, book, signals):
             unsafe_allow_html=True,
         )
 
+def sleeve_report(book, signals):
+    equity, _, _, _, positions = book_snapshot(book, signals)
+    if equity <= 0:
+        return "还没有资产。"
+    buckets = {}
+    for pos in positions:
+        buckets[pos["horizon"]] = buckets.get(pos["horizon"], 0) + pos["value"]
+    daily = buckets.get("日", 0) / equity
+    weekly = buckets.get("周", 0) / equity
+    daily_text = "超过上限" if daily > 0.305 else "未超过上限"
+    weekly_text = "超过上限" if weekly > 0.605 else "未超过上限"
+    return f"持仓 {len(positions)} 只。日线 {daily * 100:.0f}%，{daily_text}。周线 {weekly * 100:.0f}%，{weekly_text}。"
+
+def book_equity(book, signals):
+    prices = {row["ticker"]: row["price"] for row in signals}
+    equity = float(book.get("cash") or 0)
+    for ticker, pos in book.get("positions", {}).items():
+        equity += pos["shares"] * float(prices.get(ticker) or pos.get("cost") or 0)
+    return equity
+
 def render_paper():
+    st.markdown(
+        '<a href="?" target="_self" style="display:inline-block;margin:0 0 12px;color:#111827;font-weight:760;text-decoration:none;">← 返回主页</a>',
+        unsafe_allow_html=True,
+    )
     books = load_books()
     key = paper_book if paper_book in books else "watch"
-    other = "market" if key == "watch" else "watch"
     tabs = (
         f'<div class="paper-tabs">'
         f'<a class="{"on" if key == "watch" else ""}" href="?view=paper&book=watch" target="_self">自选</a>'
         f'<a class="{"on" if key == "market" else ""}" href="?view=paper&book=market" target="_self">全市场</a>'
+        f'<a class="{"on" if key == "edge" else ""}" href="?view=paper&book=edge" target="_self">择股</a>'
         f'</div>'
     )
     st.markdown(tabs, unsafe_allow_html=True)
-    with st.spinner("正在按日线、周线和月线检查模拟仓"):
+    with st.spinner("正在检查三笔模拟仓"):
         watch_rows = paper_signals(st.session_state.watchlist)
-        ranked = rank_universe(MARKET)[:12]
+        ranked = rank_universe(MARKET)[:20]
         market_rows = []
         for item in ranked:
             row = signal_from_item(item.get("ticker"), item)
             if row and row.get("price"):
                 market_rows.append(row)
         have = {row["ticker"] for row in market_rows}
-        extra = [ticker for ticker in books["market"]["positions"] if ticker not in have]
+        extra = [ticker for ticker in list(books["market"]["positions"]) + list(books["edge"]["positions"]) if ticker not in have]
         if extra:
             market_rows.extend(paper_signals(extra))
-    signals = {"watch": watch_rows, "market": market_rows}
+    signals = {"watch": watch_rows, "market": market_rows, "edge": market_rows}
     paper_rebalance(books["watch"], watch_rows, "watch")
     paper_rebalance(books["market"], market_rows, "market")
+    paper_rebalance(books["edge"], market_rows, "edge")
     apply_shocks(books)
     save_books(books)
-    if paper_hold and paper_hold in books[key]["positions"] or (paper_hold and any(t.get("ticker") == paper_hold for t in books[key].get("trades") or [])):
+    equities = {name: book_equity(books[name], signals[name]) for name in ("watch", "market", "edge")}
+    st.caption(
+        "累计盈亏对照：自选 "
+        + f"{equities['watch'] - PAPER_CASH:+,.0f}"
+        + " · 全市场 "
+        + f"{equities['market'] - PAPER_CASH:+,.0f}"
+        + " · 择股 "
+        + f"{equities['edge'] - PAPER_CASH:+,.0f}"
+    )
+    held = paper_hold and (
+        paper_hold in books[key]["positions"]
+        or any(trade.get("ticker") == paper_hold for trade in books[key].get("trades") or [])
+    )
+    if held:
         render_holding(key, books[key], signals[key])
     else:
         render_book_list(key, books[key], signals[key])
+        if key == "edge":
+            st.caption("择股只做月线多头，综合分至少 70，最多 5 只，并留两成现金。杠杆 ETF、DRAM 和波动很大的票不买。目标是少做来回，跑赢上面两笔。")
+        else:
+            st.caption("持仓检查：" + sleeve_report(books[key], signals[key]))
     paper_monitor()
     if st.button("这笔重置为 100 万美元"):
         books[key] = empty_paper()
         save_books(books)
         st.rerun()
-    st.caption("两笔都是有信号才买，没有信号就留现金。日线合计不超过总资产 30%，周线不超过 60%，这是上限，不会为了凑满这个比例去买。仓位按波动率决定大小。关掉页面后，服务器仍约每 3 分钟查一次持仓新闻。")
+    st.caption("三笔各 100 万美元。日线、周线的 30% 和 60% 只是上限。没有佣金，不是下单建议。")
 
 def paper_entry():
     books = load_books()
@@ -2087,7 +2167,7 @@ def paper_entry():
     shown = f"{wins / n * 100:.0f}%" if n else "—"
     st.markdown(
         f'<a class="paper-entry" href="?view=paper" target="_self">'
-        f'<span class="paper-entry-main"><b>模拟仓</b><i>点这里进入 · 自选和全市场各 100 万美元</i></span>'
+        f'<span class="paper-entry-main"><b>模拟仓</b><i>点这里进入 · 三笔各 100 万美元</i></span>'
         f'<span class="paper-entry-rate"><em>胜率</em><strong>{shown}</strong></span></a>',
         unsafe_allow_html=True,
     )
