@@ -14,29 +14,36 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# 白色简洁主题
+# 更清晰的白色主题
 st.markdown("""
 <style>
-    .stApp { background-color: #ffffff; }
+    .stApp { background-color: #f9fafb; }
     .main-header { 
-        font-size: 1.8rem; font-weight: 700; color: #1a1a1a; 
-        border-bottom: 2px solid #e5e7eb; padding-bottom: 8px; margin-bottom: 16px;
+        font-size: 1.9rem; font-weight: 700; color: #111827; 
+        padding-bottom: 10px; margin-bottom: 12px;
+        border-bottom: 3px solid #3b82f6;
     }
     .stock-card {
-        background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 12px;
-        padding: 14px 16px; margin: 8px 0; transition: all 0.2s;
+        background: #ffffff; border: 1px solid #e5e7eb; border-radius: 14px;
+        padding: 16px; margin: 10px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        transition: all 0.2s ease;
     }
-    .stock-card:hover { border-color: #3b82f6; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
-    .price { font-size: 1.5rem; font-weight: 700; color: #111827; }
+    .stock-card:hover { border-color: #3b82f6; box-shadow: 0 4px 12px rgba(59,130,246,0.1); }
+    .price { font-size: 1.6rem; font-weight: 700; color: #111827; }
     .up { color: #059669; font-weight: 600; }
     .down { color: #dc2626; font-weight: 600; }
-    .muted { color: #6b7280; font-size: 0.85rem; }
-    .section-title { font-size: 1.2rem; font-weight: 600; color: #1f2937; margin: 16px 0 8px 0; }
+    .muted { color: #6b7280; font-size: 0.88rem; }
+    .section-title { font-size: 1.25rem; font-weight: 650; color: #1f2937; margin: 20px 0 10px 0; }
     .analysis-box { 
-        background: #f0f9ff; border-left: 4px solid #3b82f6; 
-        padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 12px 0;
+        background: #eff6ff; border-left: 4px solid #3b82f6; 
+        padding: 14px 18px; border-radius: 0 10px 10px 0; margin: 14px 0;
+        line-height: 1.6;
     }
-    .tf-btn { margin: 2px; }
+    .link-box { 
+        background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; 
+        padding: 12px; margin: 8px 0;
+    }
+    div[data-testid="stMetricValue"] { font-size: 1.3rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -76,12 +83,11 @@ def get_stock_summary(ticker):
         return None
 
 def fetch_hist(ticker, timeframe):
-    """根据周期获取历史数据"""
     stock = yf.Ticker(ticker)
     mapping = {
         "15m": ("7d", "15m"),
         "1h": ("60d", "1h"),
-        "4h": ("60d", "1h"),   # 用1h数据重采样
+        "4h": ("60d", "1h"),
         "1d": ("1y", "1d"),
         "1wk": ("5y", "1wk"),
         "1mo": ("max", "1mo"),
@@ -90,29 +96,42 @@ def fetch_hist(ticker, timeframe):
     hist = stock.history(period=period, interval=interval)
     if timeframe == "4h" and not hist.empty:
         hist = hist.resample("4h").agg({
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum"
+            "Open": "first", "High": "max", "Low": "min",
+            "Close": "last", "Volume": "sum"
         }).dropna()
     return hist
 
-# ==================== 详情页优先显示（顶部） ====================
+def format_wan(value):
+    """将数值转换为万元显示"""
+    if value is None or not isinstance(value, (int, float)):
+        return "N/A"
+    wan = value / 10000
+    if abs(wan) >= 10000:
+        return f"{wan/10000:.2f} 亿"
+    return f"{wan:,.0f} 万元"
+
+# ==================== 详情页优先显示 ====================
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
     st.markdown(f'<div class="section-title">{ticker} 详情</div>', unsafe_allow_html=True)
     
-    if st.button("← 返回列表", type="secondary"):
-        st.session_state.selected_ticker = None
-        st.rerun()
+    col_back, col_refresh = st.columns([1, 4])
+    with col_back:
+        if st.button("← 返回列表", type="secondary"):
+            st.session_state.selected_ticker = None
+            st.rerun()
+    with col_refresh:
+        if st.button("🔄 刷新价格", type="primary"):
+            # 清除缓存强制刷新
+            if ticker in st.session_state.stock_cache:
+                del st.session_state.stock_cache[ticker]
+            st.rerun()
     
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
         name = info.get("shortName", ticker)
         
-        # 当前价格（用日线快速获取）
         quick = stock.history(period="2d")
         current_price = float(quick["Close"].iloc[-1]) if not quick.empty else 0
         prev_close = info.get("previousClose", current_price)
@@ -123,12 +142,12 @@ if st.session_state.selected_ticker:
         
         st.markdown(f'<div class="price">${current_price:.2f}</div>', unsafe_allow_html=True)
         st.markdown(f'<span class="{color}">{sign}{change:.2f} ({sign}{change_pct:.2f}%)</span> · {name}', unsafe_allow_html=True)
+        st.caption("数据来自 Yahoo Finance，存在延迟。点击「刷新价格」可手动更新。")
         
         tab1, tab2, tab3, tab4 = st.tabs(["概览", "财务", "分析", "概率测算"])
         
         with tab1:
-            # 周期选择
-            st.markdown("**K线周期**")
+            st.markdown("**K线周期**（可拖拽、滚轮缩放）")
             tf_cols = st.columns(6)
             timeframes = [("15分", "15m"), ("1小时", "1h"), ("4小时", "4h"), ("1天", "1d"), ("周线", "1wk"), ("月线", "1mo")]
             for i, (label, tf) in enumerate(timeframes):
@@ -155,31 +174,35 @@ if st.session_state.selected_ticker:
                 df["RSI"] = 100 - (100 / (1 + rs))
                 
                 fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                                    vertical_spacing=0.04, row_heights=[0.55, 0.2, 0.25])
+                                    vertical_spacing=0.03, row_heights=[0.55, 0.2, 0.25])
                 
                 fig.add_trace(go.Candlestick(
                     x=df.index, open=df["Open"], high=df["High"],
                     low=df["Low"], close=df["Close"], name="K线",
                     increasing_line_color="#059669", decreasing_line_color="#dc2626"
                 ), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df["MA7"], name="MA7", line=dict(color="#f59e0b", width=1)), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df["MA25"], name="MA25", line=dict(color="#3b82f6", width=1)), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df["MA60"], name="MA60", line=dict(color="#8b5cf6", width=1)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["MA7"], name="MA7", line=dict(color="#f59e0b", width=1.2)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["MA25"], name="MA25", line=dict(color="#3b82f6", width=1.2)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["MA60"], name="MA60", line=dict(color="#8b5cf6", width=1.2)), row=1, col=1)
                 
                 colors = ["#059669" if c >= o else "#dc2626" for c, o in zip(df["Close"], df["Open"])]
                 fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="成交量", marker_color=colors), row=2, col=1)
                 
-                fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#6366f1")), row=3, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#6366f1", width=1.5)), row=3, col=1)
                 fig.add_hline(y=70, line_dash="dash", line_color="#ef4444", row=3, col=1)
                 fig.add_hline(y=30, line_dash="dash", line_color="#10b981", row=3, col=1)
                 
                 fig.update_layout(
-                    template="plotly_white", height=650,
-                    margin=dict(l=0, r=0, t=20, b=0),
+                    template="plotly_white", height=680,
+                    margin=dict(l=0, r=0, t=10, b=0),
                     xaxis_rangeslider_visible=False,
-                    legend=dict(orientation="h", y=1.02, x=1, xanchor="right")
+                    legend=dict(orientation="h", y=1.02, x=1, xanchor="right", bgcolor="rgba(255,255,255,0.8)"),
+                    dragmode="zoom",  # 默认拖拽缩放
+                    hovermode="x unified"
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                # 确保可交互缩放
+                fig.update_xaxes(rangeslider_visible=False)
+                st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
                 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("市值", f"${info.get('marketCap', 0)/1e9:.1f}B" if info.get('marketCap') else "N/A")
@@ -188,15 +211,20 @@ if st.session_state.selected_ticker:
                 c4.metric("52周高/低", f"{info.get('fiftyTwoWeekHigh','N/A')} / {info.get('fiftyTwoWeekLow','N/A')}")
         
         with tab2:
-            st.markdown("### 财务摘要")
+            st.markdown("### 财务摘要（单位：万元）")
             try:
                 fin = stock.financials
                 if not fin.empty:
-                    st.dataframe(fin.iloc[:, :3], use_container_width=True)
+                    # 转换为万元显示
+                    fin_wan = fin.copy()
+                    for col in fin_wan.columns:
+                        fin_wan[col] = fin_wan[col].apply(lambda x: x / 10000 if pd.notna(x) and isinstance(x, (int, float)) else x)
+                    st.dataframe(fin_wan.iloc[:, :3].style.format("{:,.0f}"), use_container_width=True)
+                    st.caption("以上数字单位为万元")
                 else:
                     st.info("暂无详细财务数据")
                 
-                st.markdown("**关键指标**")
+                st.markdown("**关键指标（万元）**")
                 items = [
                     ("营收(TTM)", info.get("totalRevenue")),
                     ("净利润(TTM)", info.get("netIncomeToCommon")),
@@ -209,14 +237,30 @@ if st.session_state.selected_ticker:
                         if isinstance(val, float) and abs(val) < 1:
                             st.write(f"- {label}: {val*100:.1f}%")
                         else:
-                            st.write(f"- {label}: {val:,.0f}")
-            except:
-                st.info("财务数据暂不可用")
+                            st.write(f"- {label}: {format_wan(val)}")
+                
+                st.markdown("### 最新财报相关链接")
+                yahoo_url = f"https://finance.yahoo.com/quote/{ticker}/financials"
+                st.markdown(f'<div class="link-box"><a href="{yahoo_url}" target="_blank">📊 Yahoo Finance 财务报表</a></div>', unsafe_allow_html=True)
+                
+                # 尝试获取公司官网或 IR
+                website = info.get("website")
+                if website:
+                    st.markdown(f'<div class="link-box"><a href="{website}" target="_blank">🏢 公司官网</a></div>', unsafe_allow_html=True)
+                
+                # SEC 或通用链接提示
+                if ticker.endswith(".HK"):
+                    st.markdown('<div class="link-box">港股财报可前往港交所披露易查询</div>', unsafe_allow_html=True)
+                else:
+                    sec_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={info.get('symbol', ticker)}&type=10-&dateb=&owner=include&count=10"
+                    st.markdown(f'<div class="link-box"><a href="{sec_url}" target="_blank">📄 SEC EDGAR 财报查询（美股）</a></div>', unsafe_allow_html=True)
+                    
+            except Exception as e:
+                st.info(f"财务数据暂不可用：{str(e)}")
         
         with tab3:
             st.markdown("### 简短分析")
             analysis = []
-            # 用当前周期数据做简单分析
             hist_analysis = fetch_hist(ticker, "1d")
             if not hist_analysis.empty:
                 df_a = hist_analysis.tail(100).copy()
@@ -281,7 +325,7 @@ if st.session_state.selected_ticker:
     
     st.markdown("---")
 
-# ==================== 自选列表（在详情下方） ====================
+# ==================== 自选列表 ====================
 st.markdown('<div class="section-title">自选</div>', unsafe_allow_html=True)
 
 add_col1, add_col2 = st.columns([5, 1])
@@ -316,7 +360,6 @@ for ticker in st.session_state.watchlist:
         st.rerun()
     st.markdown("---")
 
-# 移除
 if st.session_state.watchlist:
     remove_col1, remove_col2 = st.columns([4, 1])
     with remove_col1:
@@ -326,4 +369,4 @@ if st.session_state.watchlist:
             st.session_state.watchlist.remove(to_remove)
             st.rerun()
 
-st.caption("本工具仅供学习与研究使用，不构成任何投资建议。市场有风险，决策需谨慎。数据来源于 Yahoo Finance。")
+st.caption("本工具仅供学习与研究使用，不构成任何投资建议。市场有风险，决策需谨慎。数据来源于 Yahoo Finance，存在延迟。")
