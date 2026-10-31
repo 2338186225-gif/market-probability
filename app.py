@@ -10,7 +10,7 @@ import html
 import json
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import date
+from datetime import date, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -29,7 +29,10 @@ st.markdown("""
     .stApp { background: #ffffff; }
     .block-container { max-width: 100%; padding-top: 1.1rem; padding-bottom: 2rem; padding-left: 1.25rem; padding-right: 1.25rem; }
     .topbar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
-    a.paper-link, a.paper-link:hover { margin-left: auto; color: #111827; text-decoration: none; font-size: 14px; font-weight: 720; }
+    a.paper-link, a.paper-link:hover {
+        margin-left: auto; color: #fff; text-decoration: none; font-size: 14px; font-weight: 720;
+        background: #111827; border-radius: 999px; padding: 6px 14px;
+    }
     .brand { font-size: 22px; font-weight: 760; color: #111827; letter-spacing: -0.03em; }
     .brand span { color: #1677ff; }
     .brand-sub { color: #8b919a; font-size: 13px; }
@@ -1422,18 +1425,50 @@ def fetch_news(ticker, limit=6, timeout=12):
         items = []
     return items
 
+_ZH_CACHE = {}
+
+def to_zh(text):
+    text = (text or "").strip()
+    if not text:
+        return text
+    if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+        return text
+    if text in _ZH_CACHE:
+        return _ZH_CACHE[text]
+    translated = ""
+    try:
+        url = "https://api.mymemory.translated.net/get?langpair=en|zh-CN&q=" + quote(text[:420])
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            payload = json.loads(resp.read().decode())
+        translated = ((payload.get("responseData") or {}).get("translatedText") or "").strip()
+    except Exception:
+        translated = ""
+    if not translated or translated.upper() == text.upper() or "MYMEMORY WARNING" in translated.upper():
+        try:
+            url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=" + quote(text[:420])
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+            translated = "".join(part[0] for part in data[0] if part and part[0])
+        except Exception:
+            translated = text
+    _ZH_CACHE[text] = translated or text
+    return _ZH_CACHE[text]
+
 @st.cache_data(ttl=900, show_spinner=False)
 def market_headlines(tickers: tuple):
     seen = set()
     rows = []
     for ticker in tickers:
-        for item in fetch_news(ticker, limit=3):
+        for item in fetch_news(ticker, limit=2):
             key = item["title"].lower()
             if key in seen:
                 continue
             seen.add(key)
             row = dict(item)
             row["ticker"] = ticker
+            row["title_zh"] = to_zh(item["title"])
             rows.append(row)
             if len(rows) >= 8:
                 return rows
@@ -1511,84 +1546,163 @@ def load_iv_rows(ticker, spot):
 PAPER_PATH = Path(__file__).with_name("paper_book.json")
 PAPER_CASH = 1_000_000.0
 PAPER_SLOTS = 10
+SHOCKS = (
+    "hack", "hacked", "stolen", "exploit", "bankrupt", "bankruptcy", "fraud",
+    "sec charges", "trading halt", "halted", "delisting", "default",
+    "data breach", "embezzl", "plunges", "investigation", "earnings miss",
+    "misses estimates", "guidance cut", "cuts guidance", "accounting scandal",
+    "被盗", "黑客", "破产", "欺诈", "停牌", "暴雷",
+)
 
 def empty_paper():
-    return {"cash": PAPER_CASH, "positions": {}, "trades": [], "last_run": "", "started": date.today().isoformat()}
+    return {"cash": PAPER_CASH, "positions": {}, "trades": [], "last_run": "", "started": date.today().isoformat(), "seen": []}
 
-def load_paper():
-    if "paper" not in st.session_state:
-        book = None
+def load_books():
+    if "books" not in st.session_state:
+        raw = None
         try:
-            book = json.loads(PAPER_PATH.read_text())
+            raw = json.loads(PAPER_PATH.read_text())
         except Exception:
-            book = None
-        st.session_state.paper = book or empty_paper()
-    return st.session_state.paper
+            raw = None
+        if isinstance(raw, dict) and "watch" in raw and "market" in raw:
+            books = raw
+        elif isinstance(raw, dict) and "cash" in raw:
+            books = {"watch": raw, "market": empty_paper()}
+        else:
+            books = {"watch": empty_paper(), "market": empty_paper()}
+        for key in ("watch", "market"):
+            books[key].setdefault("positions", {})
+            books[key].setdefault("trades", [])
+            books[key].setdefault("seen", [])
+            books[key].setdefault("cash", PAPER_CASH)
+        st.session_state.books = books
+    return st.session_state.books
 
-def save_paper(book):
-    st.session_state.paper = book
+def save_books(books):
+    st.session_state.books = books
     try:
-        PAPER_PATH.write_text(json.dumps(book, ensure_ascii=False))
+        PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False))
     except Exception:
         pass
 
-def paper_signals():
-    symbols = list(st.session_state.watchlist)
+def win_record(books):
+    n = wins = 0
+    by_h = {h: [0, 0] for h in ("日", "周", "月")}
+    for book in books.values():
+        for trade in book.get("trades") or []:
+            if trade.get("side") != "卖" or "win" not in trade:
+                continue
+            n += 1
+            wins += 1 if trade.get("win") else 0
+            bucket = by_h.get(trade.get("horizon"))
+            if bucket:
+                bucket[0] += 1
+                bucket[1] += 1 if trade.get("win") else 0
+    return n, wins, by_h
+
+def buy_ok(row, horizon, n, wins):
+    label = (row.get("horizons") or {}).get(horizon, {}).get("label")
+    rate = (wins / n) if n >= 6 else None
+    up = row.get("up_prob")
+    if rate is not None and rate < 0.45:
+        return row.get("label") == "强烈买入" and label == "买入"
+    if rate is not None and rate > 0.62 and horizon in ("周", "月") and label in ("买入", "持有"):
+        return True
+    if horizon == "日" and up is not None and up < 0.5:
+        return False
+    return label in ("买入", "强烈买入")
+
+def best_horizon(row, n, wins):
+    for horizon in ("月", "周", "日"):
+        if buy_ok(row, horizon, n, wins):
+            return horizon
+    return None
+
+def signal_from_item(symbol, item):
+    if not item:
+        return None
+    item = merge_context(dict(item), True)
+    horizons = {}
+    for unit in ("日", "周", "月"):
+        cell = (item.get("by_unit") or {}).get(unit) or {}
+        horizons[unit] = {"label": cell.get("label") or "—", "score": cell.get("score")}
+    return {
+        "ticker": symbol,
+        "price": item.get("price"),
+        "label": item.get("label") or "—",
+        "score": item.get("score"),
+        "up_prob": item.get("up_prob"),
+        "horizons": horizons,
+    }
+
+def paper_signals(symbols):
+    symbols = list(dict.fromkeys(symbols))
+    if not symbols:
+        return []
     with ThreadPoolExecutor(max_workers=6) as executor:
         rated = list(executor.map(rate_ticker, symbols))
     rows = []
     for symbol, item in zip(symbols, rated):
-        if not item:
-            continue
-        item = merge_context(item, True)
-        rows.append({
-            "ticker": symbol,
-            "price": item.get("price"),
-            "label": item.get("label") or "—",
-            "score": item.get("score"),
-            "up_prob": item.get("up_prob"),
-        })
+        row = signal_from_item(symbol, item)
+        if row and row.get("price"):
+            rows.append(row)
     return rows
 
-def paper_rebalance(book, signals):
+def close_position(book, ticker, price, reason, today):
+    pos = book["positions"].pop(ticker, None)
+    if not pos or not price:
+        if pos:
+            book["positions"][ticker] = pos
+        return False
+    shares = int(pos["shares"])
+    cost = float(pos.get("cost") or 0)
+    book["cash"] += shares * float(price)
+    book["trades"].append({
+        "date": today, "side": "卖", "ticker": ticker, "shares": shares,
+        "price": round(float(price), 4), "reason": reason,
+        "horizon": pos.get("horizon") or "",
+        "win": float(price) > cost,
+        "pnl": round((float(price) - cost) * shares, 2),
+    })
+    return True
+
+def paper_rebalance(book, signals, kind):
     today = date.today().isoformat()
     if book.get("last_run") == today:
         return book
+    books = load_books()
+    n, wins, _ = win_record(books)
     by_ticker = {row["ticker"]: row for row in signals if row.get("price")}
     for ticker in list(book["positions"]):
         sig = by_ticker.get(ticker)
-        price = (sig or {}).get("price")
-        if not price:
-            continue
-        label = (sig or {}).get("label")
-        up = (sig or {}).get("up_prob")
+        price = (sig or {}).get("price") or book["positions"][ticker].get("cost")
+        horizon = book["positions"][ticker].get("horizon") or "日"
         reason = None
-        if ticker not in st.session_state.watchlist:
+        if kind == "watch" and ticker not in st.session_state.watchlist:
             reason = "已移出自选"
-        elif label not in ("买入", "强烈买入"):
-            reason = f"综合评级变为{label}"
-        elif up is not None and up < 0.4 and label != "强烈买入":
-            reason = f"20日上涨概率降至 {up * 100:.0f}%"
-        if not reason:
+        elif not sig or not price:
             continue
-        shares = int(book["positions"].pop(ticker)["shares"])
-        book["cash"] += shares * float(price)
-        book["trades"].append({
-            "date": today, "side": "卖", "ticker": ticker, "shares": shares,
-            "price": round(float(price), 4), "reason": reason,
-        })
+        else:
+            label = (sig.get("horizons") or {}).get(horizon, {}).get("label")
+            up = sig.get("up_prob")
+            if label in ("回避", "观望"):
+                reason = f"{horizon}线评级变为{label}"
+            elif horizon == "日" and up is not None and up < 0.4 and sig.get("label") != "强烈买入":
+                reason = f"日线仓位的20日上涨概率降至 {up * 100:.0f}%"
+        if reason:
+            close_position(book, ticker, price, reason, today)
     equity = book["cash"]
     for ticker, pos in book["positions"].items():
         price = (by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0
         equity += pos["shares"] * float(price)
     slot = equity / PAPER_SLOTS if PAPER_SLOTS else equity
-    buys = [
-        row for row in signals
-        if row.get("price") and row["label"] in ("买入", "强烈买入")
-        and (row.get("up_prob") is None or row["up_prob"] >= 0.5)
-    ]
-    buys.sort(key=lambda row: row.get("score") if row.get("score") is not None else -999, reverse=True)
-    for row in buys:
+    ranked = []
+    for row in signals:
+        horizon = best_horizon(row, n, wins)
+        if horizon:
+            ranked.append((horizon, row))
+    ranked.sort(key=lambda pair: pair[1].get("score") if pair[1].get("score") is not None else -999, reverse=True)
+    for horizon, row in ranked:
         if len(book["positions"]) >= PAPER_SLOTS or row["ticker"] in book["positions"]:
             continue
         price = float(row["price"])
@@ -1596,69 +1710,158 @@ def paper_rebalance(book, signals):
         if shares <= 0:
             continue
         book["cash"] -= shares * price
-        book["positions"][row["ticker"]] = {"shares": shares, "cost": price}
-        prob = f"{row['up_prob'] * 100:.0f}%" if row.get("up_prob") is not None else "—"
+        book["positions"][row["ticker"]] = {"shares": shares, "cost": price, "horizon": horizon}
         book["trades"].append({
             "date": today, "side": "买", "ticker": row["ticker"], "shares": shares,
-            "price": round(price, 4),
-            "reason": f"综合{row['label']} {row.get('score')}，20日上涨概率 {prob}",
+            "price": round(price, 4), "horizon": horizon,
+            "reason": f"{horizon}线{row['horizons'][horizon]['label']}，综合{row.get('label')} {row.get('score')}",
         })
     book["last_run"] = today
     book["trades"] = book["trades"][-200:]
     return book
 
-def render_paper():
-    st.markdown('<div class="board-head"><div class="section-title">模拟仓</div><div class="muted">100 万美元 · 只做自选 · 收盘价</div></div>', unsafe_allow_html=True)
-    st.caption("买入要同时满足：综合评级是买入或强烈买入，且按最近一年日收益估算的 20 个交易日上涨概率不低于 50%。评级掉到持有以下，或上涨概率低于 40%，就卖出。最多 10 只，每只大约用总资产的十分之一。每个自然日只调一次。没有佣金和滑点，也不是下单建议。")
-    book = load_paper()
-    with st.spinner("正在按综合评级和上涨概率检查持仓"):
-        signals = paper_signals()
-    changed = book.get("last_run") != date.today().isoformat()
-    book = paper_rebalance(book, signals)
-    save_paper(book)
+def shock_headline(title):
+    text = (title or "").lower()
+    return any(word in text for word in SHOCKS)
+
+def apply_shocks(books):
+    held = []
+    for book in books.values():
+        held.extend(book.get("positions") or [])
+    held = list(dict.fromkeys(held))
+    if not held:
+        return []
+    acted = []
+    today = date.today().isoformat()
+    for ticker in held:
+        try:
+            items = fetch_news(ticker, limit=4, timeout=5)
+        except Exception:
+            items = []
+        for item in items:
+            title = item.get("title") or ""
+            if not shock_headline(title):
+                continue
+            key = title.lower()
+            zh = to_zh(title)
+            for name, book in books.items():
+                if ticker not in book.get("positions", {}):
+                    continue
+                if key in book.get("seen", []):
+                    continue
+                price = book["positions"][ticker].get("cost")
+                summary = get_stock_summary(ticker)
+                if summary and summary.get("price"):
+                    price = summary["price"]
+                if close_position(book, ticker, price, f"重大消息：{zh}", today):
+                    book.setdefault("seen", []).append(key)
+                    book["seen"] = book["seen"][-80:]
+                    acted.append(f"{'自选' if name == 'watch' else '全市场'} {show_symbol(ticker)} 卖出 · {zh}")
+    return acted
+
+def book_table(book, signals):
     prices = {row["ticker"]: row["price"] for row in signals}
     labels = {row["ticker"]: row for row in signals}
     market_value = 0.0
-    cost_value = 0.0
-    held_rows = []
+    rows = []
     for ticker, pos in book["positions"].items():
         price = prices.get(ticker) or pos.get("cost") or 0
         value = pos["shares"] * float(price)
         cost = pos["shares"] * float(pos.get("cost") or 0)
         market_value += value
-        cost_value += cost
         sig = labels.get(ticker) or {}
-        held_rows.append({
+        horizon = pos.get("horizon") or "日"
+        rows.append({
             "代码": show_symbol(ticker),
+            "级别": f"{horizon}线",
             "股数": pos["shares"],
             "成本": round(float(pos.get("cost") or 0), 2),
             "现价": round(float(price), 2),
             "市值": round(value, 2),
             "浮动盈亏": round(value - cost, 2),
-            "评级": sig.get("label") or "—",
-            "20日上涨概率": f"{sig['up_prob'] * 100:.0f}%" if sig.get("up_prob") is not None else "—",
+            "该级别评级": ((sig.get("horizons") or {}).get(horizon) or {}).get("label") or "—",
         })
     equity = book["cash"] + market_value
+    return equity, market_value, rows
+
+def render_one_book(title, note, book, signals):
+    equity, market_value, rows = book_table(book, signals)
     pnl = equity - PAPER_CASH
+    st.markdown(f'<div class="board-head"><div class="section-title">{title}</div><div class="muted">{note}</div></div>', unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("总资产", f"{equity:,.0f}")
     c2.metric("现金", f"{book['cash']:,.0f}")
     c3.metric("持仓市值", f"{market_value:,.0f}")
     c4.metric("累计盈亏", f"{pnl:,.0f}", f"{pnl / PAPER_CASH * 100:+.2f}%")
-    if changed:
-        st.caption(f"今天已按收盘价调仓。起始日 {book.get('started') or '—'}。")
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
-        st.caption("今天已经调过仓，刷新不会重复买卖。")
-    if held_rows:
-        st.dataframe(pd.DataFrame(held_rows), use_container_width=True, hide_index=True)
-    else:
-        st.info("今天没有符合条件的买入，仓位是空的。现金仍是 100 万美元。")
-    trades = list(reversed(book.get("trades") or []))[:30]
+        st.caption("今天没有符合条件的买入，这笔现金还在。")
+    trades = list(reversed(book.get("trades") or []))[:12]
     if trades:
-        st.markdown("**最近成交**")
         st.dataframe(pd.DataFrame(trades), use_container_width=True, hide_index=True)
-    if st.button("重置为 100 万美元"):
-        save_paper(empty_paper())
+
+def render_win_rate(books):
+    n, wins, by_h = win_record(books)
+    rate = (wins / n) if n else None
+    if n < 6:
+        rule = "已平仓不足 6 笔，买入门槛先不改。日线要评级是买入，并且 20 日上涨概率不低于 50%。周线和月线不看这一个短线概率。"
+    elif rate < 0.45:
+        rule = f"最近胜率 {rate * 100:.0f}%，门槛收紧：只有综合评级是强烈买入，并且这一级仍是买入，才允许开仓。"
+    elif rate > 0.62:
+        rule = f"最近胜率 {rate * 100:.0f}%，周线和月线放宽到持有也可以开仓。日线仍然要买入，并且上涨概率不低于 50%。"
+    else:
+        rule = f"最近胜率 {rate * 100:.0f}%，门槛维持：日线、周线、月线只要是买入或强烈买入就可以开仓。"
+    parts = [f"已平仓 {n} 笔，获胜 {wins} 笔" + (f"，胜率 {rate * 100:.0f}%。" if rate is not None else "。")]
+    for horizon, (count, got) in by_h.items():
+        if count:
+            parts.append(f"{horizon}线 {got}/{count}")
+    st.markdown("**胜率**")
+    st.caption(" ".join(parts) + rule + " 页面上的自选评级不跟着改，避免列表乱跳。模拟仓下单用这个门槛。")
+
+def paper_monitor():
+    books = load_books()
+    acted = apply_shocks(books)
+    save_books(books)
+    stamp = datetime.now().strftime("%H:%M")
+    if acted:
+        st.warning("重大消息已立刻卖出：" + "；".join(acted))
+        st.rerun()
+    else:
+        st.caption(f"持仓监控 {stamp} 已检查新闻。页面开着时大约每 3 分钟再查一次。没有接上 X 的公司账号接口，被盗、财报暴雷、停牌、调查这类字样用新闻标题识别。")
+
+try:
+    paper_monitor = st.fragment(run_every=180)(paper_monitor)
+except Exception:
+    pass
+
+def render_paper():
+    st.markdown('<div class="board-head"><div class="section-title">模拟仓</div><div class="muted">两笔各 100 万美元</div></div>', unsafe_allow_html=True)
+    st.caption("上面这笔只做自选，下面这笔做全市场评分靠前的标的。日线、周线、月线都可以开仓，同一只股票用级别更高的信号。每个自然日按收盘价调一次。重大消息不等到第二天。没有佣金和滑点，也不是下单建议。")
+    books = load_books()
+    with st.spinner("正在按日线、周线和月线检查两笔模拟仓"):
+        watch_rows = paper_signals(st.session_state.watchlist)
+        ranked = rank_universe(MARKET)[:12]
+        market_rows = []
+        for item in ranked:
+            row = signal_from_item(item.get("ticker"), item)
+            if row and row.get("price"):
+                market_rows.append(row)
+        have = {row["ticker"] for row in market_rows}
+        extra = [ticker for ticker in books["market"]["positions"] if ticker not in have]
+        if extra:
+            market_rows.extend(paper_signals(extra))
+    paper_rebalance(books["watch"], watch_rows, "watch")
+    paper_rebalance(books["market"], market_rows, "market")
+    apply_shocks(books)
+    save_books(books)
+    render_win_rate(books)
+    render_one_book("自选模拟", "只买自选", books["watch"], watch_rows)
+    render_one_book("全市场模拟", "评分靠前的标的", books["market"], market_rows)
+    paper_monitor()
+    if st.button("两笔都重置为 100 万美元"):
+        fresh = {"watch": empty_paper(), "market": empty_paper()}
+        save_books(fresh)
         st.rerun()
 
 # ==================== 详情页优先显示 ====================
@@ -2357,13 +2560,13 @@ else:
             st.markdown(f'<div class="qrow"><a class="row-hit bare" href="?ticker={quote(symbol)}">{body}</a></div>', unsafe_allow_html=True)
 
     with news_col:
-        st.markdown('<div class="board-head"><div class="section-title">市场要闻</div><div class="muted">最值得看</div></div>', unsafe_allow_html=True)
-        news_names = ["SPY", "QQQ", "BTC-USD"] + [item["ticker"] for item in ranked[:3]]
-        headlines = market_headlines(tuple(dict.fromkeys(news_names)))
+        st.markdown('<div class="board-head"><div class="section-title">市场要闻</div><div class="muted">自选</div></div>', unsafe_allow_html=True)
+        news_names = list(dict.fromkeys(st.session_state.watchlist))[:12]
+        headlines = market_headlines(tuple(news_names))
         if not headlines:
-            st.caption("这次没有拉到新闻。")
+            st.caption("自选里这次没有拉到新闻。")
         for item in headlines:
-            title = html.escape(item["title"])
+            title = html.escape(item.get("title_zh") or item["title"])
             link = html.escape(item["link"], quote=True)
             when = html.escape(item["time"] or "")
             tag = html.escape(show_symbol(item["ticker"]))
