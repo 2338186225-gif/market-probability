@@ -2129,6 +2129,17 @@ NEWS_ALIAS = {
 def empty_paper():
     return {"cash": PAPER_CASH, "positions": {}, "trades": [], "last_run": "", "started": date.today().isoformat(), "seen": []}
 
+def reset_book(name):
+    """现金回到 100 万美元，持仓和成交清空。本根 K 线先不再开新仓。"""
+    book = empty_paper()
+    if name == "crypto":
+        book["last_run"] = crypto_bar_slot()
+        book["rules"] = "crypto-15m-v3"
+    else:
+        book["last_run"] = cn_now().date().isoformat()
+        book["rules"] = "edge-lev-v3" if name == "edge" else "lev-v3"
+    return book
+
 def load_books():
     raw = None
     with _BOOK_LOCK:
@@ -3228,6 +3239,21 @@ def render_paper():
         f'</div>'
     )
     st.markdown(tabs, unsafe_allow_html=True)
+    names = {"watch": "自选", "market": "全市场", "edge": "择股", "crypto": "加密"}
+    if st.session_state.get("reset_ask") == key:
+        st.caption(f"确认后，{names[key]}仓的持仓和成交记录清空，现金回到 100 万美元。")
+        yes, no = st.columns(2)
+        if yes.button("确认重置", type="primary", use_container_width=True):
+            books[key] = reset_book(key)
+            save_books(books)
+            st.session_state.reset_ask = ""
+            st.rerun()
+        if no.button("取消", use_container_width=True):
+            st.session_state.reset_ask = ""
+            st.rerun()
+    elif st.button(f"重置{names[key]}仓为 100 万美元", use_container_width=True):
+        st.session_state.reset_ask = key
+        st.rerun()
     paper_at = st.session_state.get("paper_board_at") or 0
     paper_key = (tuple(st.session_state.watchlist), "lev-v2")
     fresh = (
@@ -3315,10 +3341,6 @@ def render_paper():
         else:
             st.caption("持仓检查：" + sleeve_report(books[key], signals[key]))
     paper_monitor()
-    if st.button("这笔重置为 100 万美元"):
-        books[key] = empty_paper()
-        save_books(books)
-        st.rerun()
     st.caption("四笔各 100 万美元。股票手续费双边万一，至少 1 美元。币安吃单万五。杠杆资金费：币按币安 8 小时费率，股票按年化 6.8% 计借入资金。盖不住成本的单子不开。不是下单建议。")
 
 def paper_entry():
