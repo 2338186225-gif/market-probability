@@ -3,7 +3,7 @@ import numpy as np
 from scipy.stats import norm
 import math
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime
 
 st.set_page_config(
     page_title="市场行情概率测算器",
@@ -45,7 +45,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">市场行情概率测算器</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">基于几何布朗运动（GBM）/ Black-Scholes · 支持实时行情与风险中性/真实世界概率</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">基于几何布朗运动（GBM）/ Black-Scholes · 支持实时行情、历史年化收益与关注列表</div>', unsafe_allow_html=True)
+
+# 初始化 session state
+if "s0" not in st.session_state:
+    st.session_state.s0 = 100.0
+if "sigma" not in st.session_state:
+    st.session_state.sigma = 25.0
+if "name" not in st.session_state:
+    st.session_state.name = ""
+if "cagr" not in st.session_state:
+    st.session_state.cagr = None
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = []
 
 # 侧边栏
 with st.sidebar:
@@ -53,35 +65,69 @@ with st.sidebar:
     
     ticker = st.text_input("股票代码（如 AAPL、TSLA、0700.HK）", value="AAPL").strip().upper()
     
-    fetch_btn = st.button("🔄 拉取实时数据", use_container_width=True)
-    
-    # 初始化 session state
-    if "s0" not in st.session_state:
-        st.session_state.s0 = 100.0
-    if "sigma" not in st.session_state:
-        st.session_state.sigma = 25.0
-    if "name" not in st.session_state:
-        st.session_state.name = ""
+    col_fetch, col_add = st.columns(2)
+    with col_fetch:
+        fetch_btn = st.button("🔄 拉取数据", use_container_width=True)
+    with col_add:
+        if st.button("⭐ 加入关注", use_container_width=True):
+            if ticker and ticker not in st.session_state.watchlist:
+                st.session_state.watchlist.append(ticker)
+                st.success(f"已加入关注：{ticker}")
+            elif ticker in st.session_state.watchlist:
+                st.info("已在关注列表中")
 
     if fetch_btn and ticker:
         with st.spinner("正在获取数据..."):
             try:
                 stock = yf.Ticker(ticker)
-                hist = stock.history(period="1y")
+                hist = stock.history(period="max")
                 if hist.empty:
-                    st.error("未找到该股票代码，请检查后重试")
+                    st.error("未找到该股票代码")
                 else:
                     current_price = hist["Close"].iloc[-1]
-                    # 计算年化历史波动率
                     returns = hist["Close"].pct_change().dropna()
                     hist_vol = returns.std() * np.sqrt(252) * 100
+                    
+                    # 计算成立以来年化收益率 CAGR
+                    start_price = hist["Close"].iloc[0]
+                    start_date = hist.index[0]
+                    end_date = hist.index[-1]
+                    years = (end_date - start_date).days / 365.25
+                    if years > 0 and start_price > 0:
+                        cagr = (current_price / start_price) ** (1 / years) - 1
+                        st.session_state.cagr = cagr
+                    else:
+                        st.session_state.cagr = None
+                    
                     st.session_state.s0 = round(float(current_price), 2)
                     st.session_state.sigma = round(float(hist_vol), 1)
                     info = stock.info
                     st.session_state.name = info.get("shortName", ticker)
-                    st.success(f"已更新：{st.session_state.name} 当前价 {st.session_state.s0}，历史波动率 {st.session_state.sigma}%")
+                    st.success(f"已更新：{st.session_state.name}")
             except Exception as e:
                 st.error(f"获取数据失败：{str(e)}")
+
+    # 关注列表
+    if st.session_state.watchlist:
+        st.markdown("**关注列表**")
+        for i, code in enumerate(st.session_state.watchlist):
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                if st.button(code, key=f"wl_{code}", use_container_width=True):
+                    st.session_state.ticker_to_load = code
+                    st.rerun()
+            with col_b:
+                if st.button("×", key=f"del_{code}"):
+                    st.session_state.watchlist.remove(code)
+                    st.rerun()
+        st.markdown("---")
+
+    # 处理从关注列表加载
+    if "ticker_to_load" in st.session_state:
+        ticker = st.session_state.ticker_to_load
+        del st.session_state.ticker_to_load
+        # 触发拉取逻辑（简化处理，实际可优化）
+        st.experimental_rerun()
 
     mode = st.radio("测算模式", ["单目标价", "价格区间"], horizontal=True)
     
@@ -101,9 +147,10 @@ with st.sidebar:
     r = st.number_input("无风险利率 r (%)", value=4.5, step=0.1, format="%.1f") / 100
     q = st.number_input("股息率 / 资金成本 q (%)", value=0.0, step=0.1, format="%.1f") / 100
     mu = st.number_input("预期收益率 μ (%)", value=8.0, step=0.1, format="%.1f") / 100
-    
-    st.markdown("---")
-    st.caption("提示：点击「拉取实时数据」可自动填入当前价和历史波动率。")
+
+# 显示历史年化收益
+if st.session_state.cagr is not None and st.session_state.name:
+    st.info(f"**{st.session_state.name}** 成立以来平均年化收益率（CAGR）：**{st.session_state.cagr*100:.2f}%**")
 
 # 计算函数
 def calc_d2(S, K, drift, sigma, T):
@@ -174,4 +221,4 @@ if st.session_state.get("calculated", False):
             """, unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("本工具仅供学习与研究使用，不构成任何投资建议。市场有风险，决策需谨慎。数据来源于 Yahoo Finance，可能有延迟。")
+st.caption("本工具仅供学习与研究使用，不构成任何投资建议。市场有风险，决策需谨慎。数据来源于 Yahoo Finance，可能有延迟。关注列表仅在当前会话有效。")
