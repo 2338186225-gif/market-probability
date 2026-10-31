@@ -6,30 +6,36 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
 
 st.set_page_config(
     page_title="市场行情概率测算器",
-    page_icon="📊",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# 深色主题样式
+# 白色简洁主题
 st.markdown("""
 <style>
-    .stApp { background-color: #0f1419; color: #e8eef6; }
-    .main-header { font-size: 1.8rem; font-weight: 700; color: #60a5fa; }
-    .price-big { font-size: 2.5rem; font-weight: 700; }
-    .up { color: #10b981; }
-    .down { color: #ef4444; }
-    .stock-item { 
-        background: #1a2332; border-radius: 12px; padding: 12px; margin: 6px 0; 
-        border: 1px solid #2d3a4f; cursor: pointer;
+    .stApp { background-color: #ffffff; }
+    .main-header { 
+        font-size: 1.8rem; font-weight: 700; color: #1a1a1a; 
+        border-bottom: 2px solid #e5e7eb; padding-bottom: 8px; margin-bottom: 16px;
     }
-    .stock-item:hover { border-color: #3b82f6; }
-    .tab-content { background: #1a2332; padding: 16px; border-radius: 12px; margin-top: 10px; }
-    .analysis-box { background: #111827; border-left: 3px solid #a78bfa; padding: 12px; border-radius: 0 8px 8px 0; margin: 10px 0; }
+    .stock-card {
+        background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 12px;
+        padding: 14px 16px; margin: 8px 0; transition: all 0.2s;
+    }
+    .stock-card:hover { border-color: #3b82f6; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+    .price { font-size: 1.5rem; font-weight: 700; color: #111827; }
+    .up { color: #059669; font-weight: 600; }
+    .down { color: #dc2626; font-weight: 600; }
+    .muted { color: #6b7280; font-size: 0.85rem; }
+    .section-title { font-size: 1.2rem; font-weight: 600; color: #1f2937; margin: 16px 0 8px 0; }
+    .analysis-box { 
+        background: #f0f9ff; border-left: 4px solid #3b82f6; 
+        padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 12px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -39,12 +45,11 @@ st.markdown('<div class="main-header">市场行情概率测算器</div>', unsafe
 if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = None
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = ["AMZN", "VTI", "VT", "ASML", "ASTS", "AAPL", "MSFT"]
+    st.session_state.watchlist = ["AMZN", "VTI", "VT", "ASML", "ASTS", "AAPL"]
 if "stock_cache" not in st.session_state:
     st.session_state.stock_cache = {}
 
 def get_stock_summary(ticker):
-    """获取股票基本摘要"""
     if ticker in st.session_state.stock_cache:
         return st.session_state.stock_cache[ticker]
     try:
@@ -59,251 +64,216 @@ def get_stock_summary(ticker):
         info = stock.info
         name = info.get("shortName", ticker)
         summary = {
-            "ticker": ticker,
-            "name": name,
-            "price": current,
-            "change": change,
-            "change_pct": change_pct,
-            "info": info
+            "ticker": ticker, "name": name, "price": current,
+            "change": change, "change_pct": change_pct, "info": info
         }
         st.session_state.stock_cache[ticker] = summary
         return summary
     except:
         return None
 
-# ==================== 股票列表（类似自选） ====================
-st.subheader("自选列表")
+# ==================== 自选列表 ====================
+st.markdown('<div class="section-title">自选</div>', unsafe_allow_html=True)
 
-# 添加股票
-add_col1, add_col2 = st.columns([4, 1])
+add_col1, add_col2 = st.columns([5, 1])
 with add_col1:
-    new_ticker = st.text_input("添加股票代码", placeholder="如 AMZN、0700.HK、BTC-USD", label_visibility="collapsed")
+    new_ticker = st.text_input("添加股票", placeholder="输入代码，如 AMZN、0700.HK", label_visibility="collapsed")
 with add_col2:
-    if st.button("添加", use_container_width=True) and new_ticker:
+    if st.button("添加", use_container_width=True) and new_ticker.strip():
         t = new_ticker.strip().upper()
-        if t and t not in st.session_state.watchlist:
+        if t not in st.session_state.watchlist:
             st.session_state.watchlist.append(t)
             st.rerun()
 
-# 显示列表
 for ticker in st.session_state.watchlist:
     summary = get_stock_summary(ticker)
     if summary is None:
-        st.markdown(f'<div class="stock-item"><b>{ticker}</b> · 无数据</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="stock-card"><b>{ticker}</b> · 无数据</div>', unsafe_allow_html=True)
         continue
+    
     color = "up" if summary["change"] >= 0 else "down"
     sign = "+" if summary["change"] >= 0 else ""
-    html = f'''
-    <div class="stock-item">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <div>
-                <b>{summary["ticker"]}</b><br>
-                <span style="color:#8b9bb4; font-size:0.85rem;">{summary["name"]}</span>
-            </div>
-            <div style="text-align:right;">
-                <div class="price-big" style="font-size:1.4rem;">${summary["price"]:.2f}</div>
-                <span class="{color}">{sign}{summary["change"]:.2f} ({sign}{summary["change_pct"]:.2f}%)</span>
-            </div>
-        </div>
-    </div>
-    '''
-    if st.button(f"查看 {ticker}", key=f"btn_{ticker}", use_container_width=True):
+    
+    col_left, col_right = st.columns([3, 2])
+    with col_left:
+        st.markdown(f"**{summary['ticker']}**")
+        st.markdown(f'<span class="muted">{summary["name"]}</span>', unsafe_allow_html=True)
+    with col_right:
+        st.markdown(f'<div class="price">${summary["price"]:.2f}</div>', unsafe_allow_html=True)
+        st.markdown(f'<span class="{color}">{sign}{summary["change"]:.2f} ({sign}{summary["change_pct"]:.2f}%)</span>', unsafe_allow_html=True)
+    
+    if st.button(f"查看详情", key=f"view_{ticker}", use_container_width=True):
         st.session_state.selected_ticker = ticker
         st.rerun()
-    st.markdown(html, unsafe_allow_html=True)
+    st.markdown("---")
 
-# 删除按钮（简单版）
+# 移除
 if st.session_state.watchlist:
-    to_remove = st.selectbox("移除股票", ["不移除"] + st.session_state.watchlist)
-    if to_remove != "不移除" and st.button("确认移除"):
-        st.session_state.watchlist.remove(to_remove)
-        st.rerun()
+    remove_col1, remove_col2 = st.columns([4, 1])
+    with remove_col1:
+        to_remove = st.selectbox("移除股票", ["不移除"] + st.session_state.watchlist, label_visibility="collapsed")
+    with remove_col2:
+        if to_remove != "不移除" and st.button("移除"):
+            st.session_state.watchlist.remove(to_remove)
+            st.rerun()
 
 st.markdown("---")
 
-# ==================== 详情页（二级菜单） ====================
+# ==================== 详情页 ====================
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
-    st.subheader(f"{ticker} 详情")
+    st.markdown(f'<div class="section-title">{ticker} 详情</div>', unsafe_allow_html=True)
     
     try:
         stock = yf.Ticker(ticker)
-        hist_1y = stock.history(period="1y")
+        hist = stock.history(period="1y")
         info = stock.info
         name = info.get("shortName", ticker)
         
-        # 当前价格
-        current_price = float(hist_1y["Close"].iloc[-1]) if not hist_1y.empty else 0
-        prev_close = info.get("previousClose", current_price)
-        change = current_price - prev_close
-        change_pct = (change / prev_close * 100) if prev_close else 0
-        color_class = "up" if change >= 0 else "down"
-        sign = "+" if change >= 0 else ""
-        
-        st.markdown(f'<div class="price-big">${current_price:.2f}</div>', unsafe_allow_html=True)
-        st.markdown(f'<span class="{color_class}">{sign}{change:.2f} ({sign}{change_pct:.2f}%)</span> · {name}', unsafe_allow_html=True)
-        
-        # 二级菜单
-        tab1, tab2, tab3, tab4 = st.tabs(["概览", "财务", "分析", "概率测算"])
-        
-        with tab1:
-            st.markdown('<div class="tab-content">', unsafe_allow_html=True)
-            # K线图 + 指标
-            if not hist_1y.empty:
-                df = hist_1y.tail(120).copy()  # 最近约半年
+        if hist.empty:
+            st.error("无法获取数据")
+        else:
+            current_price = float(hist["Close"].iloc[-1])
+            prev_close = info.get("previousClose", current_price)
+            change = current_price - prev_close
+            change_pct = (change / prev_close * 100) if prev_close else 0
+            color = "up" if change >= 0 else "down"
+            sign = "+" if change >= 0 else ""
+            
+            st.markdown(f'<div class="price">${current_price:.2f}</div>', unsafe_allow_html=True)
+            st.markdown(f'<span class="{color}">{sign}{change:.2f} ({sign}{change_pct:.2f}%)</span> · {name}', unsafe_allow_html=True)
+            
+            tab1, tab2, tab3, tab4 = st.tabs(["概览", "财务", "分析", "概率测算"])
+            
+            with tab1:
+                df = hist.tail(150).copy()
                 df["MA7"] = df["Close"].rolling(7).mean()
                 df["MA25"] = df["Close"].rolling(25).mean()
-                df["MA99"] = df["Close"].rolling(99).mean()
+                df["MA60"] = df["Close"].rolling(60).mean()
                 
-                # RSI
                 delta = df["Close"].diff()
                 gain = (delta.where(delta > 0, 0)).rolling(14).mean()
                 loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                rs = gain / loss
+                rs = gain / loss.replace(0, np.nan)
                 df["RSI"] = 100 - (100 / (1 + rs))
                 
-                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                                    vertical_spacing=0.03, row_heights=[0.6, 0.2, 0.2])
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                                    vertical_spacing=0.04, row_heights=[0.55, 0.2, 0.25])
                 
-                # Candlestick
                 fig.add_trace(go.Candlestick(
                     x=df.index, open=df["Open"], high=df["High"],
-                    low=df["Low"], close=df["Close"], name="K线"
+                    low=df["Low"], close=df["Close"], name="K线",
+                    increasing_line_color="#059669", decreasing_line_color="#dc2626"
                 ), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df["MA7"], name="MA7", line=dict(color="orange")), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df["MA25"], name="MA25", line=dict(color="yellow")), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df["MA99"], name="MA99", line=dict(color="purple")), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["MA7"], name="MA7", line=dict(color="#f59e0b", width=1)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["MA25"], name="MA25", line=dict(color="#3b82f6", width=1)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["MA60"], name="MA60", line=dict(color="#8b5cf6", width=1)), row=1, col=1)
                 
-                # Volume
-                colors = ["#10b981" if c >= o else "#ef4444" for c, o in zip(df["Close"], df["Open"])]
+                colors = ["#059669" if c >= o else "#dc2626" for c, o in zip(df["Close"], df["Open"])]
                 fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="成交量", marker_color=colors), row=2, col=1)
                 
-                # RSI
-                fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#a78bfa")), row=3, col=1)
-                fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
-                fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#6366f1")), row=3, col=1)
+                fig.add_hline(y=70, line_dash="dash", line_color="#ef4444", row=3, col=1)
+                fig.add_hline(y=30, line_dash="dash", line_color="#10b981", row=3, col=1)
                 
                 fig.update_layout(
-                    template="plotly_dark", height=600, 
-                    margin=dict(l=0, r=0, t=30, b=0),
+                    template="plotly_white", height=650,
+                    margin=dict(l=0, r=0, t=20, b=0),
                     xaxis_rangeslider_visible=False,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    legend=dict(orientation="h", y=1.02, x=1, xanchor="right")
                 )
                 st.plotly_chart(fig, use_container_width=True)
-            
-            # 基本信息
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("市值", f"${info.get('marketCap', 0)/1e9:.1f}B" if info.get('marketCap') else "N/A")
-            with col2:
-                st.metric("市盈率", f"{info.get('trailingPE', 'N/A')}")
-            with col3:
-                st.metric("52周高/低", f"{info.get('fiftyTwoWeekHigh', 'N/A')} / {info.get('fiftyTwoWeekLow', 'N/A')}")
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with tab2:
-            st.markdown('<div class="tab-content">', unsafe_allow_html=True)
-            st.markdown("### 最新财务摘要")
-            try:
-                financials = stock.financials
-                if not financials.empty:
-                    st.dataframe(financials.iloc[:, :2].style.format("{:.0f}"), use_container_width=True)
-                else:
-                    st.info("暂无详细财务数据")
                 
-                # 关键指标
-                st.markdown("**关键财务指标**")
-                metrics = {
-                    "营收 (TTM)": info.get("totalRevenue"),
-                    "净利润 (TTM)": info.get("netIncomeToCommon"),
-                    "毛利率": info.get("grossMargins"),
-                    "净利率": info.get("profitMargins"),
-                    "ROE": info.get("returnOnEquity"),
-                    "负债权益比": info.get("debtToEquity"),
-                }
-                for k, v in metrics.items():
-                    if v is not None:
-                        if isinstance(v, float) and v < 1:
-                            st.write(f"- {k}: {v*100:.1f}%")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("市值", f"${info.get('marketCap', 0)/1e9:.1f}B" if info.get('marketCap') else "N/A")
+                c2.metric("市盈率", f"{info.get('trailingPE', 'N/A')}")
+                c3.metric("股息率", f"{(info.get('dividendYield') or 0)*100:.2f}%" if info.get('dividendYield') else "N/A")
+                c4.metric("52周高/低", f"{info.get('fiftyTwoWeekHigh','N/A')} / {info.get('fiftyTwoWeekLow','N/A')}")
+            
+            with tab2:
+                st.markdown("### 财务摘要")
+                try:
+                    fin = stock.financials
+                    if not fin.empty:
+                        st.dataframe(fin.iloc[:, :3], use_container_width=True)
+                    else:
+                        st.info("暂无详细财务数据")
+                    
+                    st.markdown("**关键指标**")
+                    items = [
+                        ("营收(TTM)", info.get("totalRevenue")),
+                        ("净利润(TTM)", info.get("netIncomeToCommon")),
+                        ("毛利率", info.get("grossMargins")),
+                        ("净利率", info.get("profitMargins")),
+                        ("ROE", info.get("returnOnEquity")),
+                    ]
+                    for label, val in items:
+                        if val is not None:
+                            if isinstance(val, float) and abs(val) < 1:
+                                st.write(f"- {label}: {val*100:.1f}%")
+                            else:
+                                st.write(f"- {label}: {val:,.0f}")
+                except:
+                    st.info("财务数据暂不可用")
+            
+            with tab3:
+                st.markdown("### 简短分析")
+                analysis = []
+                if not hist.empty and "RSI" in df.columns:
+                    last_rsi = df["RSI"].iloc[-1]
+                    if not pd.isna(last_rsi):
+                        if last_rsi > 70:
+                            analysis.append("RSI 处于超买区域，短期注意回调风险。")
+                        elif last_rsi < 30:
+                            analysis.append("RSI 处于超卖区域，短期存在反弹可能。")
                         else:
-                            st.write(f"- {k}: {v:,.0f}" if isinstance(v, (int, float)) else f"- {k}: {v}")
-            except:
-                st.info("财务数据获取失败")
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with tab3:
-            st.markdown('<div class="tab-content">', unsafe_allow_html=True)
-            st.markdown("### AI 简短分析")
-            # 简单规则分析
-            analysis = []
-            if not hist_1y.empty:
-                last_rsi = df["RSI"].iloc[-1] if "RSI" in df.columns and not pd.isna(df["RSI"].iloc[-1]) else 50
-                if last_rsi > 70:
-                    analysis.append("RSI 处于超买区域，短期可能面临回调压力。")
-                elif last_rsi < 30:
-                    analysis.append("RSI 处于超卖区域，短期存在反弹可能。")
-                else:
-                    analysis.append("RSI 处于中性区域。")
+                            analysis.append("RSI 中性。")
                 
                 ma25 = df["MA25"].iloc[-1] if "MA25" in df.columns else current_price
                 if current_price > ma25:
                     analysis.append("价格位于 25 日均线上方，短期趋势偏多。")
                 else:
                     analysis.append("价格位于 25 日均线下方，短期趋势偏空。")
+                
+                pe = info.get("trailingPE")
+                if pe:
+                    if pe < 25:
+                        analysis.append(f"市盈率 {pe:.1f}，估值相对合理。")
+                    else:
+                        analysis.append(f"市盈率 {pe:.1f}，估值偏高。")
+                
+                if not analysis:
+                    analysis.append("数据有限，建议结合更多信息判断。")
+                
+                st.markdown('<div class="analysis-box">' + "<br>".join(analysis) + "</div>", unsafe_allow_html=True)
+                st.caption("以上分析基于公开数据规则生成，仅供参考，不构成投资建议。")
             
-            div_yield = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
-            if div_yield and div_yield > 0.02:
-                analysis.append(f"股息率约 {div_yield*100:.1f}%，具备一定分红价值。")
-            
-            pe = info.get("trailingPE")
-            if pe and pe < 20:
-                analysis.append(f"市盈率 {pe:.1f}，估值相对合理。")
-            elif pe and pe > 40:
-                analysis.append(f"市盈率 {pe:.1f}，估值偏高，需关注成长性。")
-            
-            if not analysis:
-                analysis.append("数据不足，建议结合更多指标判断。")
-            
-            st.markdown('<div class="analysis-box">' + "<br>".join(analysis) + '</div>', unsafe_allow_html=True)
-            
-            st.markdown("### 近期行情要点")
-            st.write("- 数据来源：Yahoo Finance，可能有延迟。")
-            st.write("- 技术指标仅供参考，不构成投资建议。")
-            st.write("- 建议结合基本面与市场环境综合判断。")
-            st.markdown('</div>', unsafe_allow_html=True)
+            with tab4:
+                st.markdown("### 概率测算")
+                k = st.number_input("目标价格", value=round(current_price * 1.1, 2), step=0.1)
+                days = st.number_input("交易日", value=20, min_value=1)
+                sigma_pct = st.number_input("年化波动率 %", value=25.0, step=0.5)
+                sigma = sigma_pct / 100
+                T = days / 252.0
+                
+                def calc_prob(S, K, drift, sigma, T):
+                    if S <= 0 or K <= 0 or sigma <= 0:
+                        return 0.5
+                    d2 = (math.log(S / K) + (drift - 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+                    return norm.cdf(d2)
+                
+                p_rn = calc_prob(current_price, k, 0.045, sigma, T)
+                p_rw = calc_prob(current_price, k, 0.08, sigma, T)
+                
+                c1, c2 = st.columns(2)
+                c1.metric("风险中性 · 高于目标", f"{p_rn*100:.1f}%")
+                c2.metric("真实世界 · 高于目标", f"{p_rw*100:.1f}%")
         
-        with tab4:
-            st.markdown('<div class="tab-content">', unsafe_allow_html=True)
-            st.markdown("### 概率测算")
-            # 简化版概率测算
-            s0 = current_price
-            k = st.number_input("目标价格", value=round(s0 * 1.1, 2), step=0.1)
-            days = st.number_input("交易日", value=20, min_value=1)
-            sigma_pct = st.number_input("年化波动率 %", value=25.0, step=0.5)
-            sigma = sigma_pct / 100
-            T = days / 252
+        if st.button("返回列表"):
+            st.session_state.selected_ticker = None
+            st.rerun()
             
-            def calc_prob(S, K, drift, sigma, T):
-                if S <= 0 or K <= 0 or sigma <= 0:
-                    return 0.5
-                d2 = (math.log(S / K) + (drift - 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
-                return norm.cdf(d2)
-            
-            p_rn = calc_prob(s0, k, 0.045, sigma, T)
-            p_rw = calc_prob(s0, k, 0.08, sigma, T)
-            
-            c1, c2 = st.columns(2)
-            with c1:
-                st.metric("风险中性 · 高于目标", f"{p_rn*100:.1f}%")
-            with c2:
-                st.metric("真实世界 · 高于目标", f"{p_rw*100:.1f}%")
-            st.markdown('</div>', unsafe_allow_html=True)
-        
     except Exception as e:
-        st.error(f"加载 {ticker} 失败：{str(e)}")
-    
-    if st.button("返回列表"):
-        st.session_state.selected_ticker = None
-        st.rerun()
+        st.error(f"加载失败：{str(e)}")
 
-st.caption("本工具仅供学习与研究使用，不构成任何投资建议。市场有风险，决策需谨慎。")
+st.caption("本工具仅供学习与研究使用，不构成任何投资建议。市场有风险，决策需谨慎。数据来源于 Yahoo Finance。")
