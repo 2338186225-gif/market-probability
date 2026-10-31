@@ -15,75 +15,87 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# 更清晰的白色主题
+# 浅色行情终端
 st.markdown("""
 <style>
-    .stApp { background-color: #f9fafb; }
-    .main-header { 
-        font-size: 1.9rem; font-weight: 700; color: #111827; 
-        padding-bottom: 10px; margin-bottom: 12px;
-        border-bottom: 3px solid #3b82f6;
+    .stApp { background: #f5f6f8; }
+    .block-container { max-width: 1040px; padding-top: 1.1rem; padding-bottom: 2rem; }
+    .topbar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
+    .brand { font-size: 22px; font-weight: 760; color: #111827; letter-spacing: -0.03em; }
+    .brand span { color: #1677ff; }
+    .brand-sub { color: #8b919a; font-size: 13px; }
+    .quote-card {
+        background: #fff; border: 1px solid #e7e9ee; border-radius: 16px;
+        padding: 18px 20px 8px; margin-bottom: 12px;
     }
-    .stock-card {
-        background: #ffffff; border: 1px solid #e5e7eb; border-radius: 14px;
-        padding: 16px; margin: 10px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-        transition: all 0.2s ease;
+    .quote-top { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; }
+    .quote-symbol { font-size: 20px; font-weight: 760; color: #111827; line-height: 1.2; }
+    .quote-name { font-size: 13px; font-weight: 500; color: #8b919a; margin-left: 8px; }
+    .quote-last { font-size: 34px; font-weight: 760; letter-spacing: -0.04em; line-height: 1; font-variant-numeric: tabular-nums; }
+    .quote-chg { margin-top: 6px; font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .up { color: #059669; }
+    .down { color: #dc2626; }
+    .stat-strip { display: flex; flex-wrap: wrap; gap: 8px 0; margin-top: 14px; border-top: 1px solid #f0f1f4; }
+    .stat { min-width: 120px; flex: 1; padding: 10px 12px 8px 0; }
+    .stat span { display: block; color: #8b919a; font-size: 12px; }
+    .stat b { display: block; margin-top: 2px; color: #1f2329; font-size: 14px; font-weight: 680; font-variant-numeric: tabular-nums; }
+    .board-head { display: flex; justify-content: space-between; align-items: center; margin: 4px 2px 8px; }
+    .section-title { font-size: 16px; font-weight: 750; color: #111827; }
+    .muted { color: #8b919a; font-size: 12px; }
+    .row-symbol { font-size: 15px; font-weight: 750; color: #111827; line-height: 1.2; }
+    .row-name {
+        display: block; max-width: 280px; color: #8b919a; font-size: 12px; margin-top: 2px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .stock-card:hover { border-color: #3b82f6; box-shadow: 0 4px 12px rgba(59,130,246,0.1); }
-    .price { font-size: 1.6rem; font-weight: 700; color: #111827; }
-    .up { color: #059669; font-weight: 600; }
-    .down { color: #dc2626; font-weight: 600; }
-    .muted { color: #6b7280; font-size: 0.88rem; }
-    .section-title { font-size: 1.25rem; font-weight: 650; color: #1f2937; margin: 20px 0 10px 0; }
-    .analysis-box { 
-        background: #eff6ff; border-left: 4px solid #3b82f6; 
-        padding: 14px 18px; border-radius: 0 10px 10px 0; margin: 14px 0;
-        line-height: 1.6;
-    }
-    .link-box { 
-        background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; 
-        padding: 12px; margin: 8px 0;
-    }
-    div[data-testid="stMetricValue"] { font-size: 1.3rem; }
-    div[data-testid="stVerticalBlockBorderWrapper"] {
-        background: #ffffff;
-        border-radius: 14px !important;
-        border: 1px solid #e5e7eb !important;
-        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-        padding: 2px 6px 6px 6px;
-        margin-bottom: 10px;
-    }
-    .ticker { font-size: 1.05rem; font-weight: 700; color: #111827; letter-spacing: 0.02em; }
+    .row-px { text-align: right; font-variant-numeric: tabular-nums; }
+    .row-px .px { font-size: 16px; font-weight: 750; color: #111827; }
     .chg-pill {
-        display: inline-block; margin-top: 4px; padding: 2px 8px; border-radius: 999px;
-        font-size: 0.82rem; font-weight: 650;
+        display: inline-block; margin-top: 3px; min-width: 92px; text-align: center;
+        padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 720;
+        font-variant-numeric: tabular-nums;
     }
-    .chg-up { background: #ecfdf5; color: #047857; }
-    .chg-down { background: #fef2f2; color: #b91c1c; }
-    .logo {
-        width: 32px; height: 32px; border-radius: 8px; object-fit: contain;
-        background: #f3f4f6; vertical-align: middle; margin-right: 10px;
+    .chg-up { background: #e9f9f0; color: #047857; }
+    .chg-down { background: #fdecec; color: #b91c1c; }
+    .logo-fallback {
+        display: inline-flex; align-items: center; justify-content: center;
+        border-radius: 8px; font-weight: 760; flex: 0 0 auto; margin-right: 10px;
+        position: relative; overflow: hidden;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        background: #fff; border: 1px solid #e7e9ee !important; border-radius: 12px !important;
+        box-shadow: none; padding: 2px 8px !important; margin-bottom: 8px;
+    }
+    div[data-testid="stMetric"] {
+        background: #fff; border: 1px solid #e7e9ee; border-radius: 12px; padding: 8px 12px;
+    }
+    div[data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
+    .stButton > button {
+        border-radius: 8px; font-weight: 650; border-color: #e7e9ee;
+    }
+    .analysis-box {
+        background: #f7f9fc; border-left: 3px solid #1677ff;
+        padding: 12px 14px; border-radius: 0 10px 10px 0; margin: 10px 0; line-height: 1.65; color: #1f2329;
     }
     .forecast-hero {
-        background: linear-gradient(135deg, #ffffff 0%, #eff6ff 100%);
-        border: 1px solid #dbeafe; border-radius: 18px; padding: 22px 24px; margin: 8px 0 16px 0;
+        background: #fff; border: 1px solid #e7e9ee; border-radius: 16px;
+        padding: 20px 22px; margin: 8px 0 14px;
     }
-    .forecast-kicker { color: #2563eb; font-size: 0.82rem; font-weight: 700; letter-spacing: 0.04em; }
-    .forecast-num { font-size: 3rem; font-weight: 760; color: #0f172a; line-height: 1.05; margin: 4px 0; }
-    .forecast-sub { color: #475569; font-size: 0.95rem; }
+    .forecast-kicker { color: #1677ff; font-size: 12px; font-weight: 720; }
+    .forecast-num { font-size: 42px; font-weight: 760; color: #111827; line-height: 1.05; letter-spacing: -0.04em; }
+    .forecast-sub { color: #5c6370; font-size: 14px; }
     .band {
-        display: inline-block; margin-top: 10px; background: #fff; border: 1px solid #e2e8f0;
-        border-radius: 999px; padding: 6px 12px; color: #0f172a; font-weight: 650; font-size: 0.9rem;
+        display: inline-block; margin-top: 10px; background: #f5f7fb; border-radius: 8px;
+        padding: 6px 10px; color: #1f2329; font-weight: 680; font-size: 13px;
     }
-    .stButton > button { border-radius: 10px; font-weight: 650; }
-    div[data-testid="stMetric"] {
-        background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 10px 12px;
-    }
+    .link-box { background: #f7f9fc; border: 1px solid #e7e9ee; border-radius: 10px; padding: 12px; margin: 8px 0; }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-header">市场行情概率测算器</div>', unsafe_allow_html=True)
-st.caption("自选行情、财报和模型预测。预测来自公开价格，不是买卖建议。")
+st.markdown(
+    '<div class="topbar"><div class="brand">行情<span>测算</span></div>'
+    '<div class="brand-sub">自选 · K线 · 财报 · 预测</div></div>',
+    unsafe_allow_html=True,
+)
 
 # Session state
 if "selected_ticker" not in st.session_state:
@@ -117,6 +129,73 @@ DISPLAY = {
 def show_symbol(ticker):
     return DISPLAY.get(ticker, ticker)
 
+FRIENDLY = {
+    "BTC-USD": "比特币",
+    "ETH-USD": "以太坊",
+    "BNB-USD": "币安币",
+    "HYPE32196-USD": "Hyperliquid",
+    "AMZN": "亚马逊",
+    "VTI": "先锋全美股票",
+    "VT": "先锋全球股票",
+    "ASML": "阿斯麦",
+    "ASTS": "AST SpaceMobile",
+    "AAPL": "苹果",
+}
+LOGO_BG = {
+    "BTC-USD": "#f7931a",
+    "ETH-USD": "#627eea",
+    "BNB-USD": "#f3ba2f",
+    "HYPE32196-USD": "#111827",
+    "AMZN": "#ff9900",
+    "AAPL": "#111827",
+    "VTI": "#c41230",
+    "VT": "#c41230",
+    "ASML": "#0277bd",
+    "ASTS": "#334155",
+}
+
+def pretty_name(ticker, info=None):
+    if ticker in FRIENDLY:
+        return FRIENDLY[ticker]
+    info = info or {}
+    raw = (info.get("longName") or info.get("shortName") or "").strip()
+    return raw or show_symbol(ticker)
+
+def fmt_px(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if abs(value) >= 1000:
+        return f"{value:,.2f}"
+    if abs(value) >= 1:
+        return f"{value:.2f}"
+    return f"{value:.4f}"
+
+def fmt_cap(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if value >= 1e12:
+        return f"{value/1e12:.2f}万亿"
+    if value >= 1e8:
+        return f"{value/1e8:.2f}亿"
+    if value >= 1e4:
+        return f"{value/1e4:.1f}万"
+    return f"{value:.0f}"
+
+def fmt_vol(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if value >= 1e8:
+        return f"{value/1e8:.2f}亿"
+    if value >= 1e4:
+        return f"{value/1e4:.1f}万"
+    return f"{value:.0f}"
+
 def resolve_ticker(raw):
     text = raw.strip().upper()
     return ALIASES.get(text, text)
@@ -134,7 +213,7 @@ def get_stock_summary(ticker):
         change = current - prev
         change_pct = (change / prev * 100) if prev else 0
         info = stock.info
-        name = info.get("shortName", ticker)
+        name = pretty_name(ticker, info)
         summary = {
             "ticker": ticker, "name": name, "price": current,
             "change": change, "change_pct": change_pct, "info": info,
@@ -253,11 +332,19 @@ def logo_src(ticker, website=""):
     return f"https://assets.parqet.com/logos/symbol/{symbol}"
 
 def logo_html(ticker, website="", size=32):
-    src = logo_src(ticker, website)
+    letter = show_symbol(ticker)[:1]
+    bg = LOGO_BG.get(ticker, "#e8eaef")
+    fg = "#111827" if bg in ("#f3ba2f", "#f7931a", "#ff9900") else "#ffffff"
+    img = ""
+    if not ticker.endswith("-USD"):
+        src = logo_src(ticker, website)
+        img = (
+            f'<img src="{src}" alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#fff;" '
+            f'onerror="this.remove()">'
+        )
     return (
-        f'<img class="logo" src="{src}" width="{size}" height="{size}" '
-        f'style="width:{size}px;height:{size}px;" alt="" '
-        f'onerror="this.style.visibility=\'hidden\'">'
+        f'<span class="logo-fallback" style="width:{size}px;height:{size}px;background:{bg};color:{fg};font-size:{int(size*0.42)}px;">'
+        f'{letter}{img}</span>'
     )
 
 def series_at(df, names):
@@ -462,25 +549,11 @@ def load_iv_rows(ticker, spot):
 # ==================== 详情页优先显示 ====================
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
-    st.markdown(f'<div class="section-title">{show_symbol(ticker)} 详情</div>', unsafe_allow_html=True)
-    
-    col_back, col_refresh = st.columns([1, 4])
-    with col_back:
-        if st.button("← 返回列表", type="secondary"):
-            st.session_state.selected_ticker = None
-            st.rerun()
-    with col_refresh:
-        if st.button("🔄 刷新价格", type="primary"):
-            # 清除缓存强制刷新
-            if ticker in st.session_state.stock_cache:
-                del st.session_state.stock_cache[ticker]
-            st.rerun()
-    
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        name = info.get("shortName", ticker)
-        
+        name = pretty_name(ticker, info)
+
         quick = stock.history(period="2d")
         current_price = float(quick["Close"].iloc[-1]) if not quick.empty else 0
         prev_close = info.get("previousClose", current_price)
@@ -489,20 +562,45 @@ if st.session_state.selected_ticker:
         color = "up" if change >= 0 else "down"
         sign = "+" if change >= 0 else ""
         website = info.get("website") or ""
-        
+        open_px = info.get("open") or info.get("regularMarketOpen")
+        high_px = info.get("dayHigh") or info.get("regularMarketDayHigh")
+        low_px = info.get("dayLow") or info.get("regularMarketDayLow")
+        volume = info.get("volume") or info.get("regularMarketVolume")
+        cap = info.get("marketCap")
+
+        bar_l, bar_r = st.columns([1, 6])
+        with bar_l:
+            if st.button("返回", type="secondary", use_container_width=True):
+                st.session_state.selected_ticker = None
+                st.rerun()
+        with bar_r:
+            if st.button("刷新", type="primary"):
+                if ticker in st.session_state.stock_cache:
+                    del st.session_state.stock_cache[ticker]
+                st.rerun()
+
         st.markdown(
-            f'<div style="display:flex;align-items:center;gap:10px;">'
-            f'{logo_html(ticker, website, 40)}'
-            f'<div><div class="price">${current_price:.2f}</div>'
-            f'<span class="{color}">{sign}{change:.2f} ({sign}{change_pct:.2f}%)</span> · {name}</div></div>',
+            f'<div class="quote-card"><div class="quote-top">'
+            f'<div style="display:flex;align-items:center;">{logo_html(ticker, website, 42)}'
+            f'<div><div class="quote-symbol">{show_symbol(ticker)}'
+            f'<span class="quote-name">{name}</span></div></div></div>'
+            f'<div style="text-align:right;"><div class="quote-last {color}">{fmt_px(current_price)}</div>'
+            f'<div class="quote-chg {color}">{sign}{change:.2f}&nbsp;&nbsp;{sign}{change_pct:.2f}%</div></div>'
+            f'</div><div class="stat-strip">'
+            f'<div class="stat"><span>今开</span><b>{fmt_px(open_px)}</b></div>'
+            f'<div class="stat"><span>昨收</span><b>{fmt_px(prev_close)}</b></div>'
+            f'<div class="stat"><span>最高</span><b>{fmt_px(high_px)}</b></div>'
+            f'<div class="stat"><span>最低</span><b>{fmt_px(low_px)}</b></div>'
+            f'<div class="stat"><span>成交量</span><b>{fmt_vol(volume)}</b></div>'
+            f'<div class="stat"><span>市值</span><b>{fmt_cap(cap)}</b></div>'
+            f'</div></div>',
             unsafe_allow_html=True,
         )
-        st.caption("数据来自 Yahoo Finance，存在延迟。点击「刷新价格」可手动更新。")
-        
+
         tab1, tab2, tab3, tab4 = st.tabs(["概览", "财务", "分析", "行情预测"])
         
         with tab1:
-            st.markdown("**K线周期**（可拖拽、滚轮缩放）")
+            st.markdown("**周期**")
             tf_cols = st.columns(6)
             timeframes = [("15分", "15m"), ("1小时", "1h"), ("4小时", "4h"), ("1天", "1d"), ("周线", "1wk"), ("月线", "1mo")]
             for i, (label, tf) in enumerate(timeframes):
@@ -885,47 +983,43 @@ if st.session_state.selected_ticker:
     
     st.markdown("---")
 
-# ==================== 自选列表 ====================
-st.markdown('<div class="section-title">自选</div>', unsafe_allow_html=True)
-
-pad_l, list_col, pad_r = st.columns([0.6, 2.4, 0.6])
-with list_col:
-    add_col1, add_col2 = st.columns([5, 1])
+else:
+    st.markdown('<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · 延迟行情</div></div>', unsafe_allow_html=True)
+    add_col1, add_col2 = st.columns([6, 1])
     with add_col1:
-        new_ticker = st.text_input("添加股票", placeholder="输入代码，如 AMZN、BTC、HYPE", label_visibility="collapsed")
+        new_ticker = st.text_input("添加股票", placeholder="输入代码，如 AAPL、0700.HK、BTC", label_visibility="collapsed")
     with add_col2:
         if st.button("添加", use_container_width=True) and new_ticker.strip():
             t = resolve_ticker(new_ticker)
             if t not in st.session_state.watchlist:
                 st.session_state.watchlist.append(t)
+                if t in st.session_state.stock_cache:
+                    del st.session_state.stock_cache[t]
                 st.rerun()
 
     for ticker in st.session_state.watchlist:
         summary = get_stock_summary(ticker)
         with st.container(border=True):
             if summary is None:
-                st.markdown(f"**{show_symbol(ticker)}**")
+                st.markdown(f'<div class="row-symbol">{show_symbol(ticker)}</div>', unsafe_allow_html=True)
                 st.caption("暂无行情")
                 continue
-            color = "up" if summary["change"] >= 0 else "down"
             pill = "chg-up" if summary["change"] >= 0 else "chg-down"
             sign = "+" if summary["change"] >= 0 else ""
-            name = summary["name"] or ticker
-            c_name, c_px, c_btn = st.columns([2.4, 1.5, 0.9], vertical_alignment="center")
+            name = pretty_name(summary["ticker"], summary.get("info"))
+            c_name, c_px, c_btn = st.columns([3.1, 1.5, 0.7], vertical_alignment="center")
             with c_name:
                 st.markdown(
                     f'<div style="display:flex;align-items:center;">'
-                    f'{logo_html(summary["ticker"], summary.get("website", ""), 32)}'
-                    f'<div><div class="ticker">{show_symbol(summary["ticker"])}</div>'
-                    f'<span class="muted">{name}</span></div></div>',
+                    f'{logo_html(summary["ticker"], summary.get("website", ""), 36)}'
+                    f'<div><div class="row-symbol">{show_symbol(summary["ticker"])}</div>'
+                    f'<span class="row-name" title="{name}">{name}</span></div></div>',
                     unsafe_allow_html=True,
                 )
             with c_px:
                 st.markdown(
-                    f'<div style="text-align:right;">'
-                    f'<div class="price" style="font-size:1.35rem;">${summary["price"]:.2f}</div>'
-                    f'<span class="chg-pill {pill}">{sign}{summary["change"]:.2f} ({sign}{summary["change_pct"]:.2f}%)</span>'
-                    f'</div>',
+                    f'<div class="row-px"><div class="px">{fmt_px(summary["price"])}</div>'
+                    f'<span class="chg-pill {pill}">{sign}{summary["change_pct"]:.2f}%</span></div>',
                     unsafe_allow_html=True,
                 )
             with c_btn:
@@ -934,12 +1028,14 @@ with list_col:
                     st.rerun()
 
     if st.session_state.watchlist:
-        remove_col1, remove_col2 = st.columns([4, 1])
+        remove_col1, remove_col2 = st.columns([6, 1])
         with remove_col1:
-            to_remove = st.selectbox("移除股票", ["不移除"] + st.session_state.watchlist, label_visibility="collapsed")
+            labels = ["不移除"] + [show_symbol(item) for item in st.session_state.watchlist]
+            picked = st.selectbox("移除股票", labels, label_visibility="collapsed")
         with remove_col2:
-            if to_remove != "不移除" and st.button("移除", use_container_width=True):
-                st.session_state.watchlist.remove(to_remove)
+            if picked != "不移除" and st.button("移除", use_container_width=True):
+                symbol = st.session_state.watchlist[labels.index(picked) - 1]
+                st.session_state.watchlist.remove(symbol)
                 st.rerun()
 
-st.caption("本工具仅供学习与研究使用，不构成任何投资建议。市场有风险，决策需谨慎。数据来源于 Yahoo Finance，存在延迟。")
+st.caption("仅供学习研究，不构成投资建议。行情来自 Yahoo Finance，有延迟。")
