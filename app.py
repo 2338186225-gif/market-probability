@@ -528,6 +528,119 @@ def nasdaq_quote(ticker):
         "name": data.get("companyName") or "",
     }
 
+def extended_quote(ticker):
+    if binance_symbol(ticker):
+        return None
+    cache = globals().setdefault("_EXT", {})
+    hit = cache.get(ticker)
+    if hit and time.time() - hit[0] < 120:
+        return hit[1]
+    found = None
+    try:
+        url = (
+            "https://query1.finance.yahoo.com/v8/finance/chart/"
+            + quote(ticker)
+            + "?interval=1m&range=1d&includePrePost=true"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            meta = json.loads(resp.read().decode())["chart"]["result"][0]["meta"]
+        regular_at = int(meta.get("regularMarketTime") or 0)
+        candidates = []
+        for label, prefix in (("盘前", "preMarket"), ("盘后", "postMarket")):
+            price = meta.get(prefix + "Price")
+            stamp = int(meta.get(prefix + "Time") or 0)
+            if price and stamp >= regular_at:
+                candidates.append((stamp, {
+                    "label": label,
+                    "price": float(price),
+                    "pct": float(meta.get(prefix + "ChangePercent") or 0),
+                }))
+        if candidates:
+            found = sorted(candidates)[-1][1]
+    except Exception:
+        found = None
+    if not found:
+        data = nasdaq_payload(ticker, "info") or {}
+        secondary = data.get("secondaryData") or {}
+        price = parse_num(secondary.get("lastSalePrice"))
+        if price:
+            text = str(secondary.get("lastTradeTimestamp") or "").lower()
+            found = {
+                "label": "盘前" if "pre" in text else "盘后",
+                "price": price,
+                "pct": parse_num(secondary.get("percentageChange")) or 0,
+            }
+    cache[ticker] = (time.time(), found)
+    return found
+
+def commission(ticker, notional):
+    notional = abs(float(notional or 0))
+    if binance_symbol(ticker):
+        return max(0.1, notional * 0.0005)
+    return max(1.0, notional * 0.0001)
+
+def funding_rate_8h(ticker):
+    symbol = binance_symbol(ticker)
+    if not symbol:
+        return None
+    cache = globals().setdefault("_FUND", {})
+    hit = cache.get(symbol)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    rate = 0.0001
+    try:
+        req = urllib.request.Request(
+            f"https://www.binance.com/fapi/v1/premiumIndex?symbol={symbol}",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            rate = float(json.loads(resp.read().decode()).get("lastFundingRate") or 0.0001)
+    except Exception:
+        pass
+    cache[symbol] = (time.time(), rate)
+    return rate
+
+def funding_cost(ticker, notional, lev, side, hours):
+    rate = funding_rate_8h(ticker)
+    if rate is not None:
+        pay = float(notional) * rate * (float(hours) / 8.0)
+        return -pay if side == "空" else pay
+    borrowed = float(notional) * max(0.0, 1 - 1 / max(float(lev or 1), 1.0))
+    return borrowed * 0.068 * float(hours) / 24 / 365
+
+def worth_trade(ticker, notional, lev, side, hours, expected):
+    notional = float(notional or 0)
+    if notional <= 0:
+        return False
+    cost = commission(ticker, notional) * 2 + max(funding_cost(ticker, notional, lev, side, hours), 0)
+    if extended_quote(ticker):
+        cost += notional * 0.0002
+    return float(expected or 0) > (cost / notional) * 1.5
+
+def accrue_book(book, prices):
+    now = cn_now()
+    for ticker, pos in book.get("positions", {}).items():
+        started = pos.get("funded_at")
+        if not started:
+            pos["funded_at"] = now.isoformat()
+            continue
+        then = datetime.fromisoformat(started)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        hours = (now - then).total_seconds() / 3600
+        if hours < 0.2:
+            continue
+        price = float(prices.get(ticker) or pos.get("cost") or 0)
+        notional = float(pos.get("shares") or 0) * price
+        pay = funding_cost(ticker, notional, pos.get("leverage") or 1, pos.get("side") or "多", hours)
+        if abs(pay) < 0.01:
+            continue
+        book["cash"] = float(book.get("cash") or 0) - pay
+        book["funding"] = float(book.get("funding") or 0) + pay
+        pos["funding"] = float(pos.get("funding") or 0) + pay
+        pos["funded_at"] = now.isoformat()
+
 def nasdaq_daily(ticker):
     symbol = quote(nasdaq_symbol(ticker), safe=".")
     start = (date.today() - timedelta(days=365 * 4)).isoformat()
@@ -999,6 +1112,10 @@ def quote_bar(ticker, price, change_pct, label, name, website="", prefix="", amo
     sign = "+" if change_pct >= 0 else ""
     shown = f"{prefix}{show_symbol(ticker)}"
     sub = html.escape(name)
+    ext = extended_quote(ticker)
+    if ext:
+        ext_sign = "+" if ext["pct"] >= 0 else ""
+        sub += f" · {ext['label']} {fmt_px(ext['price'])} {ext_sign}{ext['pct']:.2f}%"
     if amount:
         sub += f" | {fmt_cap(amount)}"
     score_text = f"{score:.1f}" if score is not None else "—"
@@ -1956,15 +2073,21 @@ def close_position(book, ticker, price, reason, today):
     cost = float(pos.get("cost") or 0)
     side = pos.get("side") or "多"
     pnl = (float(price) - cost) * shares if side != "空" else (cost - float(price)) * shares
+    fee = commission(ticker, shares * float(price))
+    open_fee = float(pos.get("fee") or 0)
+    paid_fund = float(pos.get("funding") or 0)
+    net = pnl - fee - open_fee - paid_fund
     margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
-    book["cash"] += margin + pnl
+    book["cash"] += margin + pnl - fee
+    book["fees"] = float(book.get("fees") or 0) + fee
     book["trades"].append({
         "date": today, "side": "平空" if side == "空" else "卖", "ticker": ticker, "shares": shares,
         "price": round(float(price), 4), "reason": reason,
         "horizon": pos.get("horizon") or "",
         "leverage": pos.get("leverage") or 1,
-        "win": pnl > 0,
-        "pnl": round(pnl, 2),
+        "win": net > 0,
+        "pnl": round(net, 2),
+        "fee": round(fee, 2),
     })
     return True
 
@@ -2112,10 +2235,11 @@ def crypto_bar_slot():
 
 def crypto_rebalance(book, rows):
     slot = crypto_bar_slot()
-    rule_id = "crypto-15m-v1"
+    rule_id = "crypto-15m-v2"
     if book.get("last_run") == slot and book.get("rules") == rule_id:
         return book
     by_ticker = {row["ticker"]: row for row in rows if row.get("price")}
+    accrue_book(book, {ticker: row.get("price") for ticker, row in by_ticker.items()})
     for ticker in list(book["positions"]):
         pos = book["positions"][ticker]
         sig = by_ticker.get(ticker)
@@ -2136,6 +2260,10 @@ def crypto_rebalance(book, rows):
             reason = "15 分钟方向反了"
         elif margin and pnl <= -0.35 * margin:
             reason = "15 分钟止损"
+        rate = funding_rate_8h(ticker)
+        paying = rate is not None and ((side == "多" and rate > 0) or (side == "空" and rate < 0))
+        if reason is None and paying and abs(rate) >= 0.0005:
+            reason = "资金费过高，先平掉"
         if reason:
             close_position(book, ticker, price, reason, slot)
     equity = float(book["cash"])
@@ -2164,16 +2292,24 @@ def crypto_rebalance(book, rows):
             continue
         price = float(row["price"])
         shares = (margin * lev) / price
-        book["cash"] -= margin
+        notional = shares * price
+        if not worth_trade(row["ticker"], notional, lev, row["side"], 8, abs(row.get("ret") or 0)):
+            continue
+        fee = commission(row["ticker"], notional)
+        if book["cash"] < margin + fee:
+            continue
+        book["cash"] -= margin + fee
+        book["fees"] = float(book.get("fees") or 0) + fee
         book["positions"][row["ticker"]] = {
             "shares": shares, "cost": price, "side": row["side"],
             "leverage": lev, "margin": margin, "horizon": "15分",
+            "fee": fee, "funding": 0, "funded_at": cn_now().isoformat(),
         }
         book["trades"].append({
             "date": slot, "side": "买" if row["side"] == "多" else "开空",
             "ticker": row["ticker"], "shares": shares, "price": round(price, 4),
-            "horizon": "15分", "leverage": lev,
-            "reason": f"15 分钟{row['side']}头，{lev} 倍，杠杆不超过 10 倍",
+            "horizon": "15分", "leverage": lev, "fee": round(fee, 2),
+            "reason": f"15 分钟{row['side']}头，{lev} 倍，已扣手续费和资金费",
         })
     book["last_run"] = slot
     book["rules"] = rule_id
@@ -2183,12 +2319,21 @@ def crypto_rebalance(book, rows):
 def paper_rebalance(book, signals, kind):
     today = cn_now().date().isoformat()
     stamp = cn_stamp()
-    rule_id = "edge-lev-v1" if kind == "edge" else "lev-v1"
+    rule_id = "edge-lev-v2" if kind == "edge" else "lev-v2"
     if book.get("last_run") == today and book.get("rules") == rule_id:
         return book
     books = load_books()
     n, wins, _ = win_record(books)
     by_ticker = {row["ticker"]: row for row in signals if row.get("price")}
+    accrue_book(book, {ticker: row.get("price") for ticker, row in by_ticker.items()})
+    for ticker, row in by_ticker.items():
+        if ticker not in book["positions"] or binance_symbol(ticker):
+            continue
+        ext = extended_quote(ticker)
+        if ext and ext.get("price"):
+            row["regular"] = row["price"]
+            row["price"] = float(ext["price"])
+            row["session"] = ext["label"]
 
     def wanted(row):
         if not row or not row.get("price"):
@@ -2329,11 +2474,31 @@ def paper_rebalance(book, signals, kind):
         margin = min(float(book["cash"]), room, total_room, equity * name_cap)
         if margin < max(1000, equity * 0.02) or price <= 0:
             continue
+        if not binance_symbol(row["ticker"]):
+            ext = extended_quote(row["ticker"])
+            if ext and ext.get("price"):
+                regular = price
+                price = float(ext["price"])
+                gap = price / regular - 1 if regular else 0
+                if (side == "多" and gap < -0.004) or (side == "空" and gap > 0.004):
+                    continue
         shares = (margin * lev) / price
-        book["cash"] -= margin
+        notional = shares * price
+        days = {"日": 1, "周": 5, "月": 21, "动量": 21}.get(horizon, 5)
+        expected = abs(float(row.get("vol") or 0.3)) * (days / 252) ** 0.5 * 0.4
+        if kind == "edge":
+            expected = max(expected, abs(float(row.get("mom") or 0)) * 0.15)
+        if not worth_trade(row["ticker"], notional, lev, side, days * 24, expected):
+            continue
+        fee = commission(row["ticker"], notional)
+        if book["cash"] < margin + fee:
+            continue
+        book["cash"] -= margin + fee
+        book["fees"] = float(book.get("fees") or 0) + fee
         book["positions"][row["ticker"]] = {
             "shares": shares, "cost": price, "side": side, "leverage": lev,
             "margin": margin, "horizon": horizon,
+            "fee": fee, "funding": 0, "funded_at": cn_now().isoformat(),
         }
         label = ((row.get("horizons") or {}).get(horizon) or {}).get("label") or row.get("label") or ""
         if kind == "edge":
@@ -2343,7 +2508,8 @@ def paper_rebalance(book, signals, kind):
         book["trades"].append({
             "date": stamp, "side": "买" if side == "多" else "开空",
             "ticker": row["ticker"], "shares": shares, "price": round(price, 4),
-            "horizon": horizon, "leverage": lev, "reason": reason + "，杠杆不超过 10 倍",
+            "horizon": horizon, "leverage": lev, "fee": round(fee, 2),
+            "reason": reason + "，已扣手续费和资金费",
         })
     book["last_run"] = today
     book["rules"] = rule_id
@@ -2428,10 +2594,18 @@ def _monitor_loop():
                 if not isinstance(books, dict) or "watch" not in books:
                     continue
                 books.setdefault("crypto", empty_paper())
-                before = json.dumps(books.get("crypto"), sort_keys=True, default=str)
+                before = json.dumps(books, sort_keys=True, default=str)
+                for name in ("watch", "market", "edge", "crypto"):
+                    book = books.get(name)
+                    if not isinstance(book, dict):
+                        continue
+                    prices = {}
+                    for ticker, pos in (book.get("positions") or {}).items():
+                        prices[ticker] = last_price(ticker) or pos.get("cost")
+                    accrue_book(book, prices)
                 crypto_rebalance(books["crypto"], crypto_market_rows())
                 acted = apply_shocks(books)
-                after = json.dumps(books.get("crypto"), sort_keys=True, default=str)
+                after = json.dumps(books, sort_keys=True, default=str)
                 if not acted and before == after:
                     continue
                 books["updated"] = datetime.now().isoformat(timespec="seconds")
@@ -2576,7 +2750,7 @@ def render_book_list(book_key, book, signals):
         f'<div><span>未实现盈亏</span><b class="{money_class(unreal)}">{unreal:+,.0f}</b></div>'
         f'<div><span>已实现盈亏</span><b class="{money_class(realized)}">{realized:+,.0f}</b></div>'
         f'</div>'
-        f'<div class="bn-name">累计盈亏 <b class="{money_class(total_pnl)}">{total_pnl:+,.0f}</b> · {html.escape(rule)}</div>',
+        f'<div class="bn-name">累计盈亏 <b class="{money_class(total_pnl)}">{total_pnl:+,.0f}</b> · 手续费 {float(book.get("fees") or 0):,.0f} · 资金费 {float(book.get("funding") or 0):+,.0f} · {html.escape(rule)}</div>',
         unsafe_allow_html=True,
     )
     cash = float(book.get("cash") or 0)
@@ -2597,12 +2771,14 @@ def render_book_list(book_key, book, signals):
         klass = money_class(pos["pnl"])
         lev = int(pos.get("leverage") or 1)
         tag = f"{pos.get('side') or '多'} · {lev}倍" if book_key == "crypto" else f"{pos.get('side') or '多'} · {lev}倍 · {pos['horizon']}线"
+        ext = extended_quote(ticker)
+        ext_text = f" · {ext['label']} &#36;{fmt_px(ext['price'])}" if ext and ext.get("price") else ""
         st.markdown(
             f'<a class="asset-row" href="?view=paper&book={book_key}&hold={quote(ticker)}" target="_self">'
             f'{logo_html(ticker, "", 36)}'
             f'<span class="asset-mid"><b>{html.escape(show_symbol(ticker))}</b>'
             f'<i>{html.escape(pretty_name(ticker))} · {html.escape(tag)}</i>'
-            f'<i>成本 &#36;{fmt_px(pos["cost"])} · 现价 &#36;{fmt_px(pos["price"])}</i>'
+            f'<i>成本 &#36;{fmt_px(pos["cost"])} · 现价 &#36;{fmt_px(pos["price"])}{ext_text}</i>'
             f'<i class="{klass}">未实现盈亏 {pos["pnl"]:+,.2f} ({pnl_pct:+.2f}%)</i></span>'
             f'<span class="asset-right"><b>{fmt_qty(pos["shares"])}</b><i>&#36;{pos["value"]:,.2f}</i></span></a>',
             unsafe_allow_html=True,
@@ -2672,7 +2848,7 @@ def render_paper():
     )
     st.markdown(tabs, unsafe_allow_html=True)
     paper_at = st.session_state.get("paper_board_at") or 0
-    paper_key = (tuple(st.session_state.watchlist), "lev-v1")
+    paper_key = (tuple(st.session_state.watchlist), "lev-v2")
     if (
         time.time() - paper_at < 1800
         and st.session_state.get("paper_watch_key") == paper_key
@@ -2749,7 +2925,7 @@ def render_paper():
         if key == "edge":
             st.caption("择股自己挑。站上 200 日均线且近一年上涨的做多，跌破均线且近一年下跌的做空。杠杆 2 到 10 倍，波动越大倍数越低。最多 6 只。")
         elif key == "crypto":
-            st.caption("加密仓看整个币池的 15 分钟线。趋势向上就做多，向下就做空。杠杆 2 到 10 倍，波动越大倍数越低。保证金最多用六成，亏到保证金的八成就平仓。")
+            st.caption("加密仓看 15 分钟线。做多做空，杠杆 2 到 10 倍。开平仓扣币安吃单手续费，持仓按资金费率计息。费盖不住预期波动就不开。资金费过高会先平掉。")
         else:
             st.caption("持仓检查：" + sleeve_report(books[key], signals[key]))
     paper_monitor()
@@ -2757,7 +2933,7 @@ def render_paper():
         books[key] = empty_paper()
         save_books(books)
         st.rerun()
-    st.caption("四笔各 100 万美元，都可以做空，杠杆不超过 10 倍。加密仓按 15 分钟检查，另外三笔按当天信号重调。没有佣金，不是下单建议。")
+    st.caption("四笔各 100 万美元。股票手续费双边万一，至少 1 美元。币安吃单万五。杠杆资金费：币按币安 8 小时费率，股票按年化 6.8% 计借入资金。盖不住成本的单子不开。不是下单建议。")
 
 def paper_entry():
     books = load_books()
@@ -2884,6 +3060,17 @@ if st.session_state.selected_ticker:
             f'</div></div>',
             unsafe_allow_html=True,
         )
+        if not binance_symbol(ticker):
+            ext = extended_quote(ticker)
+            pre = "盘前 —"
+            post = "盘后 —"
+            if ext and ext.get("price"):
+                text = f"{ext['label']} &#36;{fmt_px(ext['price'])} {ext['pct']:+.2f}%"
+                if ext["label"] == "盘前":
+                    pre = text
+                else:
+                    post = text
+            st.markdown(f'<div class="bn-name">{pre} · {post}</div>', unsafe_allow_html=True)
 
         tab1, tab2, tab3, tab4 = st.tabs(["概览", "财务", "分析", "行情预测"])
         
