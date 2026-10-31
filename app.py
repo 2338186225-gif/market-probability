@@ -64,12 +64,12 @@ st.markdown("""
     .qgrid .pct { margin: 0; justify-self: end; min-width: 72px; }
     @media (max-width: 820px) {
         .block-container { padding-left: 0.7rem !important; padding-right: 0.7rem !important; }
-        .qgrid { grid-template-columns: minmax(0, 1fr) auto auto auto; column-gap: 6px; row-gap: 0; }
-        .qgrid .score-num { display: block; font-size: 13px; }
+        .qgrid { grid-template-columns: minmax(0, 1fr) 3.2rem 5.2rem 4.5rem; column-gap: 0.35rem; row-gap: 0; }
+        .qgrid .score-num { display: block; font-size: 13px; padding-right: 0.55rem; }
         .qgrid .qleft, .qgrid .score-num, .qgrid .px, .qgrid .pct, .qhead .pct-h { grid-column: auto; grid-row: auto; }
         .qgrid .px { font-size: 14px; }
-        .qgrid .pct { min-width: 58px; padding: 4px 6px; font-size: 12px; }
-        .qhead { padding-right: 36px; }
+        .qgrid .pct { min-width: 0; padding: 4px 6px; font-size: 12px; }
+        .qhead { padding-right: 0; }
         .qhead .qleft { flex-wrap: nowrap; gap: 8px; }
         div[data-testid="stElementContainer"]:has(.add-bar) + div[data-testid="stElementContainer"] > div[data-testid="stHorizontalBlock"],
         .element-container:has(.add-bar) + .element-container > div[data-testid="stHorizontalBlock"] {
@@ -99,7 +99,9 @@ st.markdown("""
             flex: 1 1 100% !important;
         }
     }
-    .qhead { padding: 2px 40px 6px 4px; }
+    .qhead { padding: 2px 0 6px 4px; }
+    .qhead-row > .qgrid { flex: 1 1 auto; min-width: 0; }
+    .del-spacer { visibility: hidden; pointer-events: none; }
     .qhead .qleft { gap: 12px; }
     a.sort-link, a.sort-link:hover { color: #8b919a; text-decoration: none; font-size: 12px; font-weight: 500; }
     a.sort-link.on { color: #111827; font-weight: 700; }
@@ -108,10 +110,10 @@ st.markdown("""
     .qrow:hover { background: #fafafa; }
     a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; flex: 1 1 auto; min-width: 0; padding: 10px 0 10px 4px; cursor: pointer; }
     a.row-hit.bare, a.row-hit.bare:hover { padding-right: 0; }
-    a.del-hit, a.del-hit:hover {
-        position: static; transform: none; flex: 0 0 auto; white-space: nowrap;
+    .del-hit, .del-hit:hover {
+        position: static; transform: none; flex: 0 0 2.4rem; width: 2.4rem; text-align: center; white-space: nowrap;
         color: #b0b6bf; text-decoration: none; background: transparent; border: 0;
-        padding: 4px 2px 4px 6px; font-size: 12px;
+        padding: 4px 0; font-size: 12px;
     }
     div[class*="st-key-wsort_"] [data-testid="stBaseButton-secondary"],
     div[class*="st-key-wsort_"] [data-testid="stBaseButton-primary"] {
@@ -1955,12 +1957,12 @@ else:
             return f'<a class="sort-link{" on" if on else ""}" href="{href}">{label}{mark}</a>'
 
         st.markdown(
-            '<div class="qgrid qhead">'
+            '<div class="qrow qhead-row"><div class="qgrid qhead">'
             f'<div class="qleft">{sort_link("name", "名称")}{sort_link("amount", "成交额")}</div>'
             f'<div class="score-num">{sort_link("score", "评分")}</div>'
             f'<div class="px">{sort_link("price", "最新价")}</div>'
             f'<div class="pct-h">{sort_link("chg", "涨跌幅")}</div>'
-            "</div>",
+            '</div><span class="del-hit del-spacer">删除</span></div>',
             unsafe_allow_html=True,
         )
         rows = []
