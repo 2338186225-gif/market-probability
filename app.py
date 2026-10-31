@@ -1765,6 +1765,54 @@ def edge_targets(rows):
     picks.sort(key=lambda row: row.get("mom") or -1, reverse=True)
     return picks[:6]
 
+def edge_shorts(rows):
+    picks = []
+    for row in rows:
+        ticker = row.get("ticker") or ""
+        if ticker in EDGE_SKIP or not row.get("price"):
+            continue
+        mom = row.get("mom")
+        if mom is None or mom >= -0.08 or row.get("above_ma"):
+            continue
+        vol = row.get("vol")
+        if vol is not None and vol > 0.9:
+            continue
+        picks.append(row)
+    picks.sort(key=lambda row: row.get("mom") or 0)
+    return picks[:6]
+
+def clip_leverage(vol, strength):
+    vol = float(vol) if vol and vol > 0 else 0.30
+    strength = float(strength or 2)
+    if vol < 0.22 and strength >= 8:
+        return 10
+    lev = int(min(10, max(2, round(strength))))
+    if vol >= 0.8:
+        lev = min(lev, 2)
+    elif vol >= 0.5:
+        lev = min(lev, 4)
+    elif vol >= 0.35:
+        lev = min(lev, 6)
+    return max(2, min(10, lev))
+
+def best_short(row):
+    horizons = row.get("horizons") or {}
+    for horizon in ("月", "周", "日"):
+        if (horizons.get(horizon) or {}).get("label") == "回避":
+            return horizon
+    if row.get("label") == "回避":
+        return "日"
+    return None
+
+def position_margin_pnl(pos, price):
+    shares = float(pos.get("shares") or 0)
+    cost = float(pos.get("cost") or 0)
+    side = pos.get("side") or "多"
+    price = float(price or 0)
+    pnl = (price - cost) * shares if side != "空" else (cost - price) * shares
+    margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
+    return margin, pnl
+
 def crypto_market_rows():
     cache = globals().setdefault("_CRYPTO_15M", {"at": 0, "rows": []})
     if cache["rows"] and time.time() - cache["at"] < 180:
@@ -1894,132 +1942,167 @@ def crypto_rebalance(book, rows):
 
 def paper_rebalance(book, signals, kind):
     today = date.today().isoformat()
-    rule_id = "mom-v1" if kind == "edge" else "quant-v2"
+    rule_id = "edge-lev-v1" if kind == "edge" else "lev-v1"
     if book.get("last_run") == today and book.get("rules") == rule_id:
         return book
     books = load_books()
     n, wins, _ = win_record(books)
     by_ticker = {row["ticker"]: row for row in signals if row.get("price")}
+
+    def wanted(row):
+        if not row or not row.get("price"):
+            return None
+        vol = row.get("vol")
+        if kind == "edge":
+            mom = row.get("mom")
+            strength = 8 if mom is not None and abs(mom) >= 0.25 else 5 if mom is not None and abs(mom) >= 0.12 else 3
+            lev = clip_leverage(vol, strength)
+            if mom is not None and mom > 0.05 and row.get("above_ma"):
+                return "多", "动量", lev
+            if mom is not None and mom < -0.08 and not row.get("above_ma"):
+                return "空", "动量", lev
+            return None
+        horizon = best_horizon(row, n, wins)
+        if horizon:
+            label = (row.get("horizons") or {}).get(horizon, {}).get("label")
+            strength = 8 if label == "强烈买入" or row.get("label") == "强烈买入" else 5
+            return "多", horizon, clip_leverage(vol, strength)
+        horizon = best_short(row)
+        if horizon:
+            strength = 8 if row.get("label") == "回避" else 5
+            return "空", horizon, clip_leverage(vol, strength)
+        return None
+
     for ticker in list(book["positions"]):
+        pos = book["positions"][ticker]
         sig = by_ticker.get(ticker)
-        price = (sig or {}).get("price") or book["positions"][ticker].get("cost")
-        horizon = book["positions"][ticker].get("horizon") or "日"
-        reason = None
+        price = (sig or {}).get("price") or pos.get("cost")
         if kind == "watch" and ticker not in st.session_state.watchlist:
-            reason = "已移出自选"
-        elif not sig or not price:
+            close_position(book, ticker, price, "已移出自选", today)
             continue
-        else:
-            label = (sig.get("horizons") or {}).get(horizon, {}).get("label")
-            up = sig.get("up_prob")
-            cost = float(book["positions"][ticker].get("cost") or 0)
-            if kind == "edge":
-                if cost and price <= cost * 0.88:
-                    reason = "自设止损，跌破成本 12%"
-                elif not sig.get("above_ma"):
-                    reason = "跌破 200 日均线，动量仓退出"
-                elif sig.get("mom") is not None and sig.get("mom") <= 0:
-                    reason = "近一年动量转负，动量仓退出"
-            elif label in ("回避", "观望"):
-                reason = f"{horizon}线评级变为{label}"
-            elif horizon == "日" and up is not None and up < 0.4 and sig.get("label") != "强烈买入":
-                reason = f"日线仓位的20日上涨概率降至 {up * 100:.0f}%"
+        if not price:
+            continue
+        side = pos.get("side") or "多"
+        margin, pnl = position_margin_pnl(pos, price)
+        plan = wanted(sig) if sig else None
+        reason = None
+        if pos.get("margin") is None or pos.get("leverage") is None:
+            reason = "按做空和杠杆规则重开"
+        elif plan is None:
+            reason = "信号消失，先平掉"
+        elif plan[0] != side:
+            reason = "方向反了，先平掉"
+        elif margin and pnl <= -0.8 * margin:
+            reason = "亏损接近保证金，提前平仓"
+        elif margin and pnl <= -0.35 * margin:
+            reason = "杠杆止损"
+        elif kind == "edge" and side == "多":
+            cost = float(pos.get("cost") or 0)
+            if cost and price <= cost * 0.88:
+                reason = "自设止损，跌破成本 12%"
+            elif sig and not sig.get("above_ma"):
+                reason = "跌破 200 日均线，多头退出"
+            elif sig and sig.get("mom") is not None and sig.get("mom") <= 0:
+                reason = "近一年动量转负，多头退出"
+        elif kind == "edge" and side == "空" and sig:
+            mom = sig.get("mom")
+            cost = float(pos.get("cost") or 0)
+            if mom is not None and mom >= -0.02:
+                reason = "跌势减弱，空头退出"
+            elif sig.get("above_ma"):
+                reason = "站回 200 日均线，空头退出"
+            elif cost and price >= cost * 1.12:
+                reason = "空头止损，反弹超过成本 12%"
         if reason:
             close_position(book, ticker, price, reason, today)
-    equity = book["cash"]
-    for ticker, pos in book["positions"].items():
-        price = (by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0
-        equity += pos["shares"] * float(price)
-    if kind in ("market", "watch"):
-        for horizon, cap in (("日", 0.30), ("周", 0.60)):
-            while True:
-                held = []
-                for ticker, pos in book["positions"].items():
-                    if (pos.get("horizon") or "日") != horizon:
-                        continue
-                    px = float((by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0)
-                    held.append((pos["shares"] * px, ticker, px))
-                total = sum(item[0] for item in held)
-                if total <= equity * cap + 1 or not held:
-                    break
-                value, ticker, px = max(held)
-                if px <= 0:
-                    break
-                overflow = total - equity * cap
-                cut = min(int(book["positions"][ticker]["shares"]), max(1, int(overflow // px)))
-                if cut >= book["positions"][ticker]["shares"]:
-                    close_position(book, ticker, px, f"{horizon}线仓位超过总资产 {int(cap*100)}%，减回上限", today)
-                else:
-                    book["positions"][ticker]["shares"] -= cut
-                    book["cash"] += cut * px
-                    cost = float(book["positions"][ticker].get("cost") or 0)
-                    book["trades"].append({
-                        "date": today, "side": "卖", "ticker": ticker, "shares": cut,
-                        "price": round(px, 4), "horizon": horizon,
-                        "reason": f"{horizon}线仓位超过总资产 {int(cap*100)}%，减回上限",
-                        "win": px > cost, "pnl": round((px - cost) * cut, 2),
-                    })
-                equity = book["cash"]
-                for ticker, pos in book["positions"].items():
-                    px = float((by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0)
-                    equity += pos["shares"] * float(px)
-    caps = {"日": 0.30, "周": 0.60, "月": 1.0}
+
+    def book_equity_now():
+        total = float(book["cash"])
+        for ticker, pos in book["positions"].items():
+            px = float((by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0)
+            margin, pnl = position_margin_pnl(pos, px)
+            total += margin + pnl
+        return total
+
+    def margin_used(horizon=None):
+        total = 0.0
+        for pos in book["positions"].values():
+            if horizon and (pos.get("horizon") or "日") != horizon:
+                continue
+            margin, _ = position_margin_pnl(pos, pos.get("cost") or 0)
+            total += margin
+        return total
+
+    equity = book_equity_now()
+    caps = {"日": 0.30, "周": 0.60, "月": 0.80, "动量": 0.70}
+    for horizon, cap in caps.items():
+        if kind == "edge" and horizon != "动量":
+            continue
+        if kind != "edge" and horizon == "动量":
+            continue
+        while margin_used(horizon) > equity * cap + 1:
+            held = []
+            for ticker, pos in book["positions"].items():
+                if (pos.get("horizon") or "日") != horizon:
+                    continue
+                px = float((by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0)
+                margin, _ = position_margin_pnl(pos, px)
+                held.append((margin, ticker, px))
+            if not held:
+                break
+            _, ticker, px = max(held)
+            if px <= 0 or not close_position(book, ticker, px, f"{horizon}线保证金超过总资产 {int(cap*100)}%，减回上限", today):
+                break
+            equity = book_equity_now()
+
     slots = 6 if kind == "edge" else PAPER_SLOTS
     ranked = []
     if kind == "edge":
-        ranked = [("动量", row) for row in edge_targets(signals)]
+        for row in edge_targets(signals):
+            plan = wanted(row)
+            if plan:
+                ranked.append(plan + (row,))
+        for row in edge_shorts(signals):
+            plan = wanted(row)
+            if plan:
+                ranked.append(plan + (row,))
     else:
         for row in signals:
-            horizon = best_horizon(row, n, wins)
-            if horizon:
-                ranked.append((horizon, row))
-        ranked.sort(key=lambda pair: ({"月": 0, "周": 1, "日": 2}[pair[0]], -(pair[1].get("score") or -999)))
+            plan = wanted(row)
+            if plan:
+                ranked.append(plan + (row,))
+        ranked.sort(key=lambda item: (0 if item[0] == "多" else 1, {"月": 0, "周": 1, "日": 2}.get(item[1], 3), -(item[3].get("score") or -999)))
 
-    def sleeve_value(horizon):
-        total = 0.0
-        for ticker, pos in book["positions"].items():
-            if (pos.get("horizon") or "日") != horizon:
-                continue
-            px = (by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0
-            total += pos["shares"] * float(px)
-        return total
-
-    def quant_budget(horizon, vol, room):
-        vol = float(vol) if vol and vol > 0.05 else 0.30
-        risk = {"日": 0.004, "周": 0.007, "月": 0.010}[horizon]
-        name_cap = {"日": 0.08, "周": 0.12, "月": 0.20 if kind == "edge" else 0.18}[horizon]
-        weight = min(name_cap, risk / vol)
-        room_left = room
-        if kind == "edge":
-            invested = equity - book["cash"]
-            room_left = min(room, equity * 0.8 - invested)
-        return max(0.0, min(book["cash"], room_left, equity * weight))
-
-    for horizon, row in ranked:
+    for side, horizon, lev, row in ranked:
         if len(book["positions"]) >= slots or row["ticker"] in book["positions"]:
             continue
         price = float(row["price"])
-        if kind == "edge":
-            vol = float(row.get("vol") or 0.3)
-            vol = vol if vol > 0.05 else 0.3
-            invested = equity - book["cash"]
-            weight = min(0.18, 0.12 / vol)
-            budget = max(0.0, min(book["cash"], equity * 0.9 - invested, equity * weight))
-        else:
+        if side == "多" and horizon == "日":
             up = row.get("up_prob")
-            if horizon == "日" and up is not None and up < 0.55:
+            if up is not None and up < 0.55:
                 continue
-            room = equity * caps[horizon] - sleeve_value(horizon)
-            budget = quant_budget(horizon, row.get("vol"), room)
-        shares = int(budget // price) if budget > 0 else 0
-        if shares <= 0:
+        equity = book_equity_now()
+        room = equity * caps.get(horizon, 0.7) - margin_used(horizon)
+        total_room = equity * (0.70 if kind == "edge" else 0.75) - margin_used()
+        name_cap = min(0.12, 0.90 / lev)
+        margin = min(float(book["cash"]), room, total_room, equity * name_cap)
+        if margin < max(1000, equity * 0.02) or price <= 0:
             continue
-        book["cash"] -= shares * price
-        book["positions"][row["ticker"]] = {"shares": shares, "cost": price, "horizon": horizon}
+        shares = (margin * lev) / price
+        book["cash"] -= margin
+        book["positions"][row["ticker"]] = {
+            "shares": shares, "cost": price, "side": side, "leverage": lev,
+            "margin": margin, "horizon": horizon,
+        }
+        label = ((row.get("horizons") or {}).get(horizon) or {}).get("label") or row.get("label") or ""
+        if kind == "edge":
+            reason = "动量靠前且站上 200 日均线，做多" if side == "多" else "跌破均线且近一年动量为负，做空"
+        else:
+            reason = f"{horizon}线{label}，{side}头 {lev} 倍"
         book["trades"].append({
-            "date": today, "side": "买", "ticker": row["ticker"], "shares": shares,
-            "price": round(price, 4), "horizon": horizon,
-            "reason": ("动量靠前且站上 200 日均线" if kind == "edge" else f"{horizon}线{row['horizons'][horizon]['label']}，波动率调仓，综合{row.get('label')} {row.get('score')}"),
+            "date": today, "side": "买" if side == "多" else "开空",
+            "ticker": row["ticker"], "shares": shares, "price": round(price, 4),
+            "horizon": horizon, "leverage": lev, "reason": reason + "，杠杆不超过 10 倍",
         })
     book["last_run"] = today
     book["rules"] = rule_id
@@ -2198,7 +2281,7 @@ def render_holding(book_key, book, signals):
         hold_text = (
             f"{pos.get('side') or '多'} · {lev} 倍 · 15 分钟 · {fmt_qty(pos['shares'])}"
             if book_key == "crypto"
-            else f"{pos['horizon']}线开的仓 · {fmt_qty(pos['shares'])} 股"
+            else f"{pos.get('side') or '多'} · {lev} 倍 · {pos['horizon']}线 · {fmt_qty(pos['shares'])}"
         )
         st.markdown(
             f'<div class="bn-name">总价值</div>'
@@ -2260,7 +2343,7 @@ def render_book_list(book_key, book, signals):
         pnl_pct = (pos["pnl"] / basis * 100) if basis else 0
         klass = money_class(pos["pnl"])
         lev = int(pos.get("leverage") or 1)
-        tag = f"{pos.get('side') or '多'} · {lev}倍" if book_key == "crypto" else f"{pos['horizon']}线"
+        tag = f"{pos.get('side') or '多'} · {lev}倍" if book_key == "crypto" else f"{pos.get('side') or '多'} · {lev}倍 · {pos['horizon']}线"
         st.markdown(
             f'<a class="asset-row" href="?view=paper&book={book_key}&hold={quote(ticker)}" target="_self">'
             f'{logo_html(ticker, "", 36)}'
@@ -2277,12 +2360,12 @@ def sleeve_report(book, signals):
         return "还没有资产。"
     buckets = {}
     for pos in positions:
-        buckets[pos["horizon"]] = buckets.get(pos["horizon"], 0) + pos["value"]
+        buckets[pos["horizon"]] = buckets.get(pos["horizon"], 0) + (pos.get("margin") or pos["value"])
     daily = buckets.get("日", 0) / equity
     weekly = buckets.get("周", 0) / equity
     daily_text = "超过上限" if daily > 0.305 else "未超过上限"
     weekly_text = "超过上限" if weekly > 0.605 else "未超过上限"
-    return f"持仓 {len(positions)} 只。日线 {daily * 100:.0f}%，{daily_text}。周线 {weekly * 100:.0f}%，{weekly_text}。"
+    return f"持仓 {len(positions)} 只。日线保证金 {daily * 100:.0f}%，{daily_text}。周线保证金 {weekly * 100:.0f}%，{weekly_text}。可做空，杠杆不超过 10 倍。"
 
 def book_equity(book, signals):
     prices = {row["ticker"]: row["price"] for row in signals}
@@ -2314,7 +2397,7 @@ def render_paper():
     )
     st.markdown(tabs, unsafe_allow_html=True)
     paper_at = st.session_state.get("paper_board_at") or 0
-    paper_key = tuple(st.session_state.watchlist)
+    paper_key = (tuple(st.session_state.watchlist), "lev-v1")
     if (
         time.time() - paper_at < 1800
         and st.session_state.get("paper_watch_key") == paper_key
@@ -2326,8 +2409,14 @@ def render_paper():
             watch_rows = paper_signals(st.session_state.watchlist)
             ranked = rank_universe(MARKET)
             market_rows = []
-            for item in ranked[:20]:
-                row = signal_from_item(item.get("ticker"), item)
+            seen_market = set()
+            pool = list(ranked[:12]) + list(ranked[-12:])
+            for item in pool:
+                symbol = item.get("ticker")
+                if not symbol or symbol in seen_market:
+                    continue
+                seen_market.add(symbol)
+                row = signal_from_item(symbol, item)
                 if row and row.get("price"):
                     market_rows.append(row)
             have = {row["ticker"] for row in market_rows}
@@ -2383,7 +2472,7 @@ def render_paper():
     else:
         render_book_list(key, books[key], signals[key])
         if key == "edge":
-            st.caption("择股不看页面上的评级。我在股票池里自己挑：近一年涨得多、而且还在 200 日均线上面的，最多拿 6 只，单只大约一成到一成八。跌破成本 12%，或者跌破均线，就卖掉。只为多赚钱，不保证一定超过另外两笔。")
+            st.caption("择股自己挑。站上 200 日均线且近一年上涨的做多，跌破均线且近一年下跌的做空。杠杆 2 到 10 倍，波动越大倍数越低。最多 6 只。")
         elif key == "crypto":
             st.caption("加密仓看整个币池的 15 分钟线。趋势向上就做多，向下就做空。杠杆 2 到 10 倍，波动越大倍数越低。保证金最多用六成，亏到保证金的八成就平仓。")
         else:
@@ -2393,7 +2482,7 @@ def render_paper():
         books[key] = empty_paper()
         save_books(books)
         st.rerun()
-    st.caption("四笔各 100 万美元。加密仓可以做空，杠杆不超过 10 倍，每 15 分钟检查一次。没有佣金，不是下单建议。")
+    st.caption("四笔各 100 万美元，都可以做空，杠杆不超过 10 倍。加密仓按 15 分钟检查，另外三笔按当天信号重调。没有佣金，不是下单建议。")
 
 def paper_entry():
     books = load_books()
