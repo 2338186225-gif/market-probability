@@ -715,6 +715,140 @@ def build_earnings_note(stock, info):
     lines.append("以上解读依据公开财报和一致预期自动生成，不是投资建议。")
     return lines
 
+def _naive_utc(value):
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return None
+    if ts is None or pd.isna(ts):
+        return None
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    return ts
+
+def _num(value):
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+def fmt_earnings_when(ts):
+    if ts is None:
+        return "尚未披露"
+    if int(ts.hour) == 0 and int(ts.minute) == 0:
+        return ts.strftime("%Y-%m-%d")
+    local = ts.tz_localize("UTC").tz_convert("Asia/Shanghai")
+    return local.strftime("%Y-%m-%d %H:%M") + "（北京时间）"
+
+def _estimate_row(table):
+    if table is None or getattr(table, "empty", True):
+        return None
+    for label in ("0q", "+1q", "0Q", "+1Q"):
+        if label in table.index:
+            return table.loc[label]
+    return table.iloc[0]
+
+def earnings_schedule(stock, info):
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    past, future = [], []
+    try:
+        ed = stock.earnings_dates
+    except Exception:
+        ed = None
+    if ed is not None and not getattr(ed, "empty", True):
+        frame = ed.copy()
+        frame.index = pd.to_datetime(frame.index, utc=True).tz_convert("UTC").tz_localize(None)
+        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+        for ts, row in frame.iterrows():
+            act = _num(row["Reported EPS"]) if "Reported EPS" in frame.columns else None
+            est = _num(row["EPS Estimate"]) if "EPS Estimate" in frame.columns else None
+            if act is not None:
+                past.append((ts, act, est))
+            elif ts >= now - pd.Timedelta(hours=18):
+                future.append((ts, est))
+    this_ts, this_eps = (past[-1][0], past[-1][1]) if past else (None, None)
+    next_ts, next_eps = (future[0][0], future[0][1]) if future else (None, None)
+    if next_ts is None:
+        for key in ("earningsTimestampStart", "earningsTimestamp", "earningsCallTimestampStart"):
+            raw = (info or {}).get(key)
+            if not raw:
+                continue
+            guessed = _naive_utc(pd.to_datetime(raw, unit="s", errors="coerce"))
+            if guessed is not None:
+                next_ts = guessed
+                break
+    year_ago = analysts = rev_avg = rev_year = None
+    try:
+        row = _estimate_row(getattr(stock, "earnings_estimate", None))
+        if row is not None:
+            next_eps = next_eps if next_eps is not None else _num(row.get("avg"))
+            year_ago = _num(row.get("yearAgoEps"))
+            analysts = _num(row.get("numberOfAnalysts"))
+    except Exception:
+        pass
+    try:
+        row = _estimate_row(getattr(stock, "revenue_estimate", None))
+        if row is not None:
+            rev_avg = _num(row.get("avg"))
+            rev_year = _num(row.get("yearAgoRevenue"))
+    except Exception:
+        pass
+    return {
+        "this_ts": this_ts,
+        "this_eps": this_eps,
+        "next_ts": next_ts,
+        "next_eps": next_eps,
+        "year_ago": year_ago,
+        "analysts": analysts,
+        "rev_avg": rev_avg,
+        "rev_year": rev_year,
+        "now": now,
+    }
+
+def next_quarter_lines(sched):
+    lines = []
+    next_ts = sched["next_ts"]
+    next_eps = sched["next_eps"]
+    this_eps = sched["this_eps"]
+    if next_ts is None:
+        lines.append("行情源没有给出下一次财报公布日。ETF 和多数加密资产没有公司财报日程。")
+        return lines
+    days = int((next_ts.normalize() - sched["now"].normalize()).days)
+    when = fmt_earnings_when(next_ts)
+    if days > 1:
+        lines.append(f"下一季财报预计 {when} 公布，大约还有 {days} 天。")
+    elif days == 1:
+        lines.append(f"下一季财报在明天公布（{when}）。临近公布，波动通常会变大。")
+    elif days == 0:
+        lines.append(f"下一季财报就在今天（{when}）。公布前后价格容易大幅波动。")
+    else:
+        lines.append(f"记录中的下一次财报日期是 {when}。")
+    if next_eps is not None and this_eps not in (None, 0):
+        change = (next_eps / this_eps - 1) * 100
+        lines.append(f"下一季每股收益一致预期 {next_eps:.2f}，本季实际 {this_eps:.2f}，预期比本季 {change:+.1f}%。")
+        if change > 5:
+            lines.append("市场预期下一季比本季更好。公布当天要看实际数有没有超过这个预期，只是增长并不等于会涨。")
+        elif change < -5:
+            lines.append("市场预期下一季比本季回落。如果实际只是略差，价格里可能已经反映了一部分。")
+        else:
+            lines.append("预期和本季接近。这种财报更要看毛利率、费用和下季指引，而不是每股收益本身。")
+    elif next_eps is not None:
+        lines.append(f"下一季每股收益一致预期是 {next_eps:.2f}。")
+    year_ago = sched["year_ago"]
+    if next_eps is not None and year_ago not in (None, 0):
+        lines.append(f"相对去年同期每股收益 {year_ago:.2f}，一致预期同比 {(next_eps / year_ago - 1) * 100:+.1f}%。")
+    rev_avg, rev_year = sched["rev_avg"], sched["rev_year"]
+    if rev_avg:
+        yoy = f"，同比 {(rev_avg / rev_year - 1) * 100:+.1f}%" if rev_year not in (None, 0) else ""
+        lines.append(f"营收一致预期约 {format_wan(rev_avg)}{yoy}。")
+    if sched["analysts"]:
+        lines.append(f"大约 {int(sched['analysts'])} 位分析师给出了盈利预测。公布前预期还会改，现在的数字不是最终数字。")
+    if not any("预期" in line for line in lines):
+        lines.append("目前看得到公布时间，但没有可靠的一致预期，所以还不能判断下一季会被看成好于还是差于市场。")
+    return lines
+
 def earnings_view(stock, info):
     lines = build_earnings_note(stock, info)
     verdict, klass = "数据有限", "verdict-mid"
@@ -957,6 +1091,22 @@ if st.session_state.selected_ticker:
                 st.caption("新闻来自 Yahoo Finance 英文源，点标题打开原文。")
         
         with tab2:
+            st.markdown("### 财报日程")
+            try:
+                sched = earnings_schedule(stock, info)
+                d1, d2 = st.columns(2)
+                d1.metric("本季财报", fmt_earnings_when(sched["this_ts"]))
+                d2.metric("下一季公布", fmt_earnings_when(sched["next_ts"]))
+                if sched["this_eps"] is not None:
+                    st.caption(f"本季已公布每股收益 {sched['this_eps']:.2f}。日期来自行情源，临近公布时可能改期。")
+                st.markdown("### 下一季度财报")
+                nxt = next_quarter_lines(sched)
+                st.markdown(
+                    '<div class="analysis-box">' + "<br>".join(html.escape(line) for line in nxt) + "</div>",
+                    unsafe_allow_html=True,
+                )
+            except Exception:
+                st.info("财报日程暂时取不到。")
             st.markdown("### 最新财报解读")
             try:
                 verdict, klass, body = earnings_view(stock, info)
