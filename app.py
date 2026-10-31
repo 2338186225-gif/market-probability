@@ -2019,9 +2019,10 @@ def render_holding(book_key, book, signals):
     back = f"?view=paper&book={book_key}"
     st.markdown(f'<a class="watch-link" href="{back}" target="_self">返回模拟仓</a>', unsafe_allow_html=True)
     st.markdown(
-        f'<div style="display:flex;align-items:center;gap:10px;margin:12px 0;">{logo_html(ticker, "", 40)}'
+        f'<a href="?ticker={quote(ticker)}" target="_self" style="display:flex;align-items:center;gap:10px;margin:12px 0;text-decoration:none;color:#111827;">'
+        f'{logo_html(ticker, "", 40)}'
         f'<div><div class="bn-symbol">{html.escape(show_symbol(ticker))}</div>'
-        f'<div class="bn-name">{html.escape(name)}</div></div></div>',
+        f'<div class="bn-name">{html.escape(name)}</div></div></a>',
         unsafe_allow_html=True,
     )
     if not pos:
@@ -2086,12 +2087,14 @@ def render_book_list(book_key, book, signals):
         pnl_pct = (pos["pnl"] / (pos["shares"] * pos["cost"]) * 100) if pos["shares"] and pos["cost"] else 0
         klass = money_class(pos["pnl"])
         st.markdown(
-            f'<a class="asset-row" href="?view=paper&book={book_key}&hold={quote(ticker)}" target="_self">'
+            f'<div class="asset-row">'
+            f'<a href="?ticker={quote(ticker)}" target="_self" style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;text-decoration:none;color:#111827;">'
             f'{logo_html(ticker, "", 36)}'
             f'<span class="asset-mid"><b>{html.escape(show_symbol(ticker))}</b>'
             f'<i>{html.escape(pretty_name(ticker))} · {html.escape(pos["horizon"])}线</i>'
-            f'<i class="{klass}">未实现盈亏 {pos["pnl"]:+,.2f} ({pnl_pct:+.2f}%)</i></span>'
-            f'<span class="asset-right"><b>{fmt_qty(pos["shares"])}</b><i>${pos["value"]:,.2f}</i></span></a>',
+            f'<i class="{klass}">未实现盈亏 {pos["pnl"]:+,.2f} ({pnl_pct:+.2f}%)</i></span></a>'
+            f'<a class="asset-right" href="?view=paper&book={book_key}&hold={quote(ticker)}" target="_self" style="text-decoration:none;color:#111827;">'
+            f'<b>{fmt_qty(pos["shares"])}</b><i>${pos["value"]:,.2f}</i></a></div>',
             unsafe_allow_html=True,
         )
 
