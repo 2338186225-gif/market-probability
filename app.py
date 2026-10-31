@@ -139,22 +139,6 @@ st.markdown("""
     .qhead .qleft { gap: 12px; }
     a.sort-link, a.sort-link:hover { color: #8b919a; text-decoration: none; font-size: 12px; font-weight: 500; }
     a.sort-link.on { color: #111827; font-weight: 700; }
-    div[data-testid="stElementContainer"]:has(.sort-bar) + div[data-testid="stElementContainer"] > div[data-testid="stHorizontalBlock"],
-    .element-container:has(.sort-bar) + .element-container > div[data-testid="stHorizontalBlock"] {
-        flex-direction: row !important; flex-wrap: nowrap !important; gap: 0.35rem; align-items: center;
-    }
-    div[data-testid="stElementContainer"]:has(.sort-bar) + div button,
-    .element-container:has(.sort-bar) + .element-container button {
-        background: transparent !important; border: 0 !important; box-shadow: none !important;
-        color: #8b919a !important; font-size: 12px !important; font-weight: 500 !important;
-        padding: 0 0 6px !important; min-height: 0 !important; height: auto !important; line-height: 1.2 !important;
-    }
-    div[data-testid="stElementContainer"]:has(.sort-bar) + div button[kind="primary"],
-    div[data-testid="stElementContainer"]:has(.sort-bar) + div button[data-testid="stBaseButton-primary"],
-    .element-container:has(.sort-bar) + .element-container button[kind="primary"],
-    .element-container:has(.sort-bar) + .element-container button[data-testid="stBaseButton-primary"] {
-        color: #111827 !important; font-weight: 700 !important;
-    }
     .pct-h { text-align: right; }
     .qrow { display: flex; flex-wrap: nowrap; align-items: center; border-bottom: 1px solid #f2f3f5; }
     .qrow:hover { background: #fafafa; }
@@ -2877,19 +2861,22 @@ else:
                     del st.session_state.stock_cache[t]
                 st.rerun()
         active_sort = st.session_state.get("watch_sort")
-        st.markdown('<div class="sort-bar"></div>', unsafe_allow_html=True)
-        c_name, c_score, c_px, c_chg, _c_del = st.columns([5.2, 1, 1.2, 1.1, 0.7])
-        with c_name:
-            n1, n2 = st.columns(2)
-            name_cols = {"name": n1, "amount": n2, "score": c_score, "price": c_px, "chg": c_chg}
-        for key, label in (("name", "名称"), ("amount", "成交额"), ("score", "评分"), ("price", "最新价"), ("chg", "涨跌幅")):
+
+        def sort_link(key, label):
             on = active_sort == key
-            with name_cols[key]:
-                if st.button(f"{label} ↓" if on else label, key=f"wsort_{key}", type="primary" if on else "secondary", use_container_width=True):
-                    st.session_state.watch_sort = None if on else key
-                    if "sort" in st.query_params:
-                        del st.query_params["sort"]
-                    st.rerun()
+            href = "?sort=off" if on else f"?sort={key}"
+            mark = " ↓" if on else ""
+            return f'<a class="sort-link{" on" if on else ""}" href="{href}" target="_self">{label}{mark}</a>'
+
+        st.markdown(
+            '<div class="qrow qhead-row"><div class="qgrid qhead">'
+            f'<div class="qleft">{sort_link("name", "名称")}{sort_link("amount", "成交额")}</div>'
+            f'<div class="score-num">{sort_link("score", "评分")}</div>'
+            f'<div class="px">{sort_link("price", "最新价")}</div>'
+            f'<div class="pct-h">{sort_link("chg", "涨跌幅")}</div>'
+            '</div><span class="del-hit del-spacer">删除</span></div>',
+            unsafe_allow_html=True,
+        )
         rows = []
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
