@@ -57,7 +57,7 @@ st.markdown("""
     .pnl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 14px 0 8px; }
     .pnl-grid span { display: block; color: #8b919a; font-size: 12px; }
     .pnl-grid b { display: block; margin-top: 4px; font-size: 16px; font-weight: 760; }
-    .trade-line { display: flex; justify-content: space-between; gap: 12px; padding: 14px 0; border-bottom: 1px solid #f0f1f4; }
+    .trade-line { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid #f0f1f4; color: #111827; text-decoration: none; }
     .trade-line b { display: block; font-size: 16px; }
     .trade-line i { display: block; margin-top: 4px; color: #8b919a; font-style: normal; font-size: 12px; }
     .brand { font-size: 22px; font-weight: 760; color: #111827; letter-spacing: -0.03em; }
@@ -2351,6 +2351,27 @@ def render_book_list(book_key, book, signals):
             f'<i>{html.escape(pretty_name(ticker))} · {html.escape(tag)}</i>'
             f'<i class="{klass}">未实现盈亏 {pos["pnl"]:+,.2f} ({pnl_pct:+.2f}%)</i></span>'
             f'<span class="asset-right"><b>{fmt_qty(pos["shares"])}</b><i>${pos["value"]:,.2f}</i></span></a>',
+            unsafe_allow_html=True,
+        )
+    trades = list(reversed(book.get("trades") or []))[:16]
+    st.markdown('<div class="section-title" style="margin-top:18px;">成交</div>', unsafe_allow_html=True)
+    if not trades:
+        st.caption("还没有成交。")
+        return
+    for trade in trades:
+        side = trade.get("side") or ""
+        klass = "up" if side in ("买", "平空") else "down"
+        pnl = trade.get("pnl")
+        right = f"{pnl:+,.2f}" if isinstance(pnl, (int, float)) else fmt_qty(trade.get("shares") or 0)
+        lev = trade.get("leverage")
+        lev_text = f" · {int(lev)}倍" if lev else ""
+        ticker = trade.get("ticker") or ""
+        href = f"?view=paper&book={book_key}&hold={quote(ticker)}"
+        st.markdown(
+            f'<a class="trade-line" href="{href}" target="_self" style="text-decoration:none;color:#111827;">'
+            f'<div><b>{html.escape(show_symbol(ticker))} {html.escape(side)}</b>'
+            f'<i>{html.escape(str(trade.get("date") or ""))}{lev_text} · ${fmt_px(trade.get("price") or 0)} · {html.escape(str(trade.get("reason") or ""))}</i></div>'
+            f'<b class="{klass}">{right}</b></a>',
             unsafe_allow_html=True,
         )
 
