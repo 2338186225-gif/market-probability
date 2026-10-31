@@ -317,6 +317,154 @@ def kline_level(df, unit):
         notes.append(f"最近一根成交量约为近 10 根均量的 {ratio:.2f} 倍。")
     return {"unit": unit, "trend": trend, "notes": notes}
 
+def treasury_percent(symbol):
+    cache = st.session_state.setdefault("yield_cache", {})
+    if symbol in cache:
+        return cache[symbol]
+    try:
+        hist = yf.Ticker(symbol).history(period="10d")
+        value = float(hist["Close"].iloc[-1]) if hist is not None and not hist.empty else None
+    except Exception:
+        value = None
+    cache[symbol] = value
+    return value
+
+def auto_risk_free(ticker, days):
+    short = int(days) <= 63
+    symbol = "^IRX" if short else "^TNX"
+    tenor = "3个月国债" if short else "10年国债"
+    extra = ""
+    if str(ticker).endswith((".SS", ".SZ")):
+        extra = " A股没有接到同一条无风险曲线，这里用美国国债作参考。"
+    elif str(ticker).endswith(".HK"):
+        extra = " 港币联系汇率，折现率沿用美国国债。"
+    elif str(ticker).endswith("-USD"):
+        extra = " 以美元计价，折现率用美国国债。"
+    value = treasury_percent(symbol)
+    if value is None:
+        return 4.5, f"没有取到美国{tenor}，暂用 4.5%。{extra}"
+    return round(float(value), 2), f"已按美国{tenor} {float(value):.2f}% 填入，可以再改。{extra}"
+
+def analyst_view(stock, info, price):
+    rec_map = {
+        "strong_buy": "强力买入", "buy": "买入", "hold": "持有",
+        "underperform": "跑输大市", "sell": "卖出",
+    }
+    lines = []
+    score = 0
+    rec = (info or {}).get("recommendationKey")
+    opinions = (info or {}).get("numberOfAnalystOpinions")
+    mean = (info or {}).get("targetMeanPrice")
+    low = (info or {}).get("targetLowPrice")
+    high = (info or {}).get("targetHighPrice")
+    if rec:
+        lines.append("卖方综合评级：" + rec_map.get(rec, rec) + (f"，样本约 {int(opinions)} 家。" if opinions else "。"))
+        score = {"strong_buy": 1, "buy": 1, "hold": 0, "underperform": -1, "sell": -1}.get(rec, 0)
+    if mean and price:
+        gap = (float(mean) / float(price) - 1) * 100
+        span = f"区间 {float(low):.2f}–{float(high):.2f}，" if low and high else ""
+        lines.append(f"目标价{span}平均 {float(mean):.2f}，较现价 {gap:+.1f}%。")
+        if gap > 15:
+            lines.append("平均目标价明显高于现价，卖方模型里留有空间。这是他们的预测，不是价格承诺。")
+        elif gap < -10:
+            lines.append("平均目标价低于现价，卖方并不觉得这里便宜。")
+        else:
+            lines.append("目标价离现价不远，卖方定价偏中性。")
+    events = []
+    try:
+        table = stock.upgrades_downgrades
+        if table is not None and not table.empty:
+            view = table.sort_index(ascending=False).head(5)
+            action_map = {"up": "上调", "down": "下调", "main": "维持", "init": "首次覆盖", "reit": "重申"}
+            for idx, row in view.iterrows():
+                when = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
+                firm = row.get("Firm") or ""
+                action = action_map.get(str(row.get("Action") or "").lower(), row.get("Action") or "")
+                grade = row.get("ToGrade") or ""
+                events.append(f"{when}  {firm}  {action} {grade}".strip())
+    except Exception:
+        events = []
+    if not lines:
+        lines.append("这只标的暂时没有公开的卖方评级或目标价。")
+    return lines, events, score
+
+def news_read(items):
+    positive = ("beat", "beats", "upgrade", "raises", "raise", "surge", "rally", "record", "outperform", "soar", "jump", "approval", "buyback")
+    negative = ("miss", "misses", "downgrade", "cut", "cuts", "lawsuit", "probe", "investigation", "fall", "falls", "drop", "drops", "weak", "layoff", "layoffs", "slump", "warning", "fraud", "recall", "selloff")
+    if not items:
+        return "最近没有拉到相关新闻，消息面这次不参与判断。", 0
+    pos = neg = 0
+    for item in items:
+        text = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+        good = any(word in text for word in positive)
+        bad = any(word in text for word in negative)
+        if good and not bad:
+            pos += 1
+        elif bad and not good:
+            neg += 1
+    score = pos - neg
+    if pos == 0 and neg == 0:
+        tone = "标题里没有明显的超预期、上调、下调或诉讼字眼，更多是普通报道，不能单独当方向。"
+    elif score >= 2:
+        tone = "标题整体偏多。标题不是全文，也还没证明资金已经按这个方向进场。"
+    elif score <= -2:
+        tone = "标题整体偏空。要分清是一次性消息，还是基本面被下修。"
+    else:
+        tone = "多空标题交错，新闻没有形成一边倒。"
+    return f"最近 {len(items)} 条新闻里，偏多表述 {pos} 条，偏空表述 {neg} 条。{tone}", score
+
+def is_etf(info):
+    quote_type = str((info or {}).get("quoteType") or "")
+    name = f"{(info or {}).get('longName') or ''} {(info or {}).get('shortName') or ''}"
+    return quote_type.upper() == "ETF" or "ETF" in name.upper()
+
+def etf_flow_frame(ticker):
+    stock = yf.Ticker(ticker)
+    try:
+        shares = stock.get_shares_full(start="2023-06-01")
+    except Exception:
+        return None
+    if shares is None or len(shares) < 5:
+        return None
+    if isinstance(shares, pd.DataFrame):
+        shares = shares.iloc[:, 0]
+    try:
+        prices = stock.history(start="2023-06-01", interval="1d")["Close"]
+    except Exception:
+        return None
+    if prices is None or prices.empty:
+        return None
+    shares = shares.sort_index()
+    shares.index = pd.to_datetime(shares.index).tz_localize(None)
+    prices.index = pd.to_datetime(prices.index).tz_localize(None)
+    frame = pd.concat(
+        [shares.resample("ME").last().rename("shares"), prices.resample("ME").last().rename("price")],
+        axis=1,
+    ).dropna()
+    if len(frame) < 3:
+        return None
+    frame["flow"] = frame["shares"].diff() * frame["price"]
+    return frame.dropna().tail(18)
+
+def flow_read(frame):
+    if frame is None or frame.empty:
+        return "这是 ETF，但行情源没有给出历史份额，流入流出现在算不出来。", 0
+    recent = frame.tail(3)
+    net = float(recent["flow"].sum())
+    last = float(frame["flow"].iloc[-1])
+    unit = 1e8
+    if net > 0 and last > 0:
+        score = 1
+        text = "近三个月按份额变化估算为净流入，最新一个月仍在流入。申购通常表示资金在进这个 ETF，不等于里面的成分股还会涨。"
+    elif net < 0 and last < 0:
+        score = -1
+        text = "近三个月按份额变化估算为净流出，最新一个月仍在流出。赎回多的时候，短线抛压往往更直接。"
+    else:
+        score = 0
+        text = "近三个月流入和流出交错，资金方向不稳定。"
+    text += f" 近三个月合计约 {net/unit:+.1f} 亿美元，最新一个月约 {last/unit:+.1f} 亿美元。"
+    return text, score
+
 def format_wan(value):
     """将数值转换为万元显示"""
     if value is None or not isinstance(value, (int, float)):
@@ -922,6 +1070,60 @@ if st.session_state.selected_ticker:
                         unsafe_allow_html=True,
                     )
 
+            st.markdown("### 卖方观点")
+            analyst_lines, analyst_events, analyst_score = analyst_view(stock, info, current_price)
+            st.markdown('<div class="analysis-box">' + "<br>".join(html.escape(line) for line in analyst_lines) + "</div>", unsafe_allow_html=True)
+            if analyst_events:
+                st.caption("最近评级动作")
+                st.dataframe(pd.DataFrame({"记录": analyst_events}), use_container_width=True, hide_index=True)
+
+            st.markdown("### 新闻解读")
+            headlines = fetch_news(ticker, 8)
+            news_line, news_score = news_read(headlines)
+            st.markdown(f'<div class="analysis-box">{html.escape(news_line)}</div>', unsafe_allow_html=True)
+            if headlines:
+                for item in headlines[:3]:
+                    title = html.escape(item["title"])
+                    link = html.escape(item["link"], quote=True)
+                    shown = f'<a href="{link}" target="_blank">{title}</a>' if link else title
+                    st.markdown(f'<div class="news-item">{shown}<div class="muted">{html.escape(item.get("time") or "")}</div></div>', unsafe_allow_html=True)
+
+            flow_score = 0
+            if is_etf(info):
+                st.markdown("### ETF 流入流出")
+                st.caption("用每月份额变化乘以价格，估算申购和赎回。绿柱是流入，红柱是流出。这不是交易所盘口深度。")
+                flows = etf_flow_frame(ticker)
+                flow_line, flow_score = flow_read(flows)
+                st.markdown(f'<div class="analysis-box">{html.escape(flow_line)}</div>', unsafe_allow_html=True)
+                if flows is not None and not flows.empty:
+                    fig_flow = go.Figure(go.Bar(
+                        x=flows.index.strftime("%Y-%m"),
+                        y=flows["flow"] / 1e8,
+                        marker_color=["#059669" if value >= 0 else "#dc2626" for value in flows["flow"]],
+                    ))
+                    fig_flow.update_layout(template="plotly_white", height=320, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="亿美元")
+                    st.plotly_chart(fig_flow, use_container_width=True)
+
+            tech_score = 0
+            for item in known:
+                tech_score += {"多头": 1, "偏多": 0.5, "空头": -1, "偏空": -0.5}.get(item["trend"], 0)
+            news_bias = 1 if news_score >= 2 else -1 if news_score <= -2 else 0
+            total = tech_score + analyst_score + news_bias + flow_score
+            if total >= 2:
+                call, call_class = "偏多", "verdict-up"
+                call_text = "技术面、卖方目标或消息里，偏多的证据更多。这个判断只覆盖已经公布的数据，盖不住盘中突发消息。"
+            elif total <= -2:
+                call, call_class = "偏空", "verdict-down"
+                call_text = "偏空的证据更多。如果只是日线超卖、周线仍向下，把它看成反抽，而不是趋势已经反过来。"
+            else:
+                call, call_class = "中性", "verdict-mid"
+                call_text = "多空证据互相抵消，没有足够干净的方向。这种时候控制仓位，比猜下一根 K 线更重要。"
+            st.markdown("### 市场判断")
+            st.markdown(
+                f'<div class="analysis-box"><span class="verdict {call_class}">{call}</span><br>{html.escape(call_text)}</div>',
+                unsafe_allow_html=True,
+            )
+
             blocks = []
             fund = []
             pe = info.get("trailingPE")
@@ -987,7 +1189,13 @@ if st.session_state.selected_ticker:
             p1, p2, p3 = st.columns(3)
             k = p1.number_input("目标价格", value=round(float(current_price) * 1.1, 2), step=0.1, key=f"k_{ticker}")
             days = p2.number_input("交易日", value=20, min_value=1, max_value=252, key=f"days_{ticker}")
-            r_pct = p3.number_input("无风险利率 %", value=4.5, step=0.1, key=f"r_{ticker}")
+            rate_value, rate_note = auto_risk_free(ticker, days)
+            rate_stamp = f"{ticker}:{int(days) <= 63}"
+            if st.session_state.get(f"r_stamp_{ticker}") != rate_stamp or f"r_{ticker}" not in st.session_state:
+                st.session_state[f"r_{ticker}"] = rate_value
+                st.session_state[f"r_stamp_{ticker}"] = rate_stamp
+            r_pct = p3.number_input("无风险利率 %", step=0.1, key=f"r_{ticker}")
+            st.caption(rate_note)
             use_hist = st.checkbox("使用历史波动率", value=True, key=f"usevol_{ticker}")
             sigma_manual = st.number_input("自定义年化波动率 %", value=25.0, step=0.5, disabled=use_hist, key=f"sig_{ticker}")
 
