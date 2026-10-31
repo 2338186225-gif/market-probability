@@ -2017,12 +2017,13 @@ def render_holding(book_key, book, signals):
     pos = snap.get(ticker)
     name = pretty_name(ticker)
     back = f"?view=paper&book={book_key}"
+    detail = f"?ticker={quote(ticker)}&from=paper&book={book_key}"
     st.markdown(f'<a class="watch-link" href="{back}" target="_self">返回模拟仓</a>', unsafe_allow_html=True)
     st.markdown(
-        f'<a href="?ticker={quote(ticker)}" target="_self" style="display:flex;align-items:center;gap:10px;margin:12px 0;text-decoration:none;color:#111827;">'
+        f'<a href="{detail}" target="_self" style="display:flex;align-items:center;gap:10px;margin:12px 0;text-decoration:none;color:#111827;">'
         f'{logo_html(ticker, "", 40)}'
-        f'<div><div class="bn-symbol">{html.escape(show_symbol(ticker))}</div>'
-        f'<div class="bn-name">{html.escape(name)}</div></div></a>',
+        f'<div><div class="bn-symbol" style="color:#1677ff;">{html.escape(show_symbol(ticker))}</div>'
+        f'<div class="bn-name" style="color:#1677ff;text-decoration:underline;">{html.escape(name)}</div></div></a>',
         unsafe_allow_html=True,
     )
     if not pos:
@@ -2087,14 +2088,12 @@ def render_book_list(book_key, book, signals):
         pnl_pct = (pos["pnl"] / (pos["shares"] * pos["cost"]) * 100) if pos["shares"] and pos["cost"] else 0
         klass = money_class(pos["pnl"])
         st.markdown(
-            f'<div class="asset-row">'
-            f'<a href="?ticker={quote(ticker)}" target="_self" style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;text-decoration:none;color:#111827;">'
+            f'<a class="asset-row" href="?view=paper&book={book_key}&hold={quote(ticker)}" target="_self">'
             f'{logo_html(ticker, "", 36)}'
             f'<span class="asset-mid"><b>{html.escape(show_symbol(ticker))}</b>'
             f'<i>{html.escape(pretty_name(ticker))} · {html.escape(pos["horizon"])}线</i>'
-            f'<i class="{klass}">未实现盈亏 {pos["pnl"]:+,.2f} ({pnl_pct:+.2f}%)</i></span></a>'
-            f'<a class="asset-right" href="?view=paper&book={book_key}&hold={quote(ticker)}" target="_self" style="text-decoration:none;color:#111827;">'
-            f'<b>{fmt_qty(pos["shares"])}</b><i>${pos["value"]:,.2f}</i></a></div>',
+            f'<i class="{klass}">未实现盈亏 {pos["pnl"]:+,.2f} ({pnl_pct:+.2f}%)</i></span>'
+            f'<span class="asset-right"><b>{fmt_qty(pos["shares"])}</b><i>${pos["value"]:,.2f}</i></span></a>',
             unsafe_allow_html=True,
         )
 
@@ -2248,9 +2247,19 @@ if st.session_state.selected_ticker:
         c_back, c_title, c_fresh = st.columns([0.5, 6, 0.7])
         with c_back:
             if st.button("返回", type="secondary", use_container_width=True):
+                came = st.query_params.get("from")
+                if isinstance(came, list):
+                    came = came[0] if came else None
+                back_book = st.query_params.get("book")
+                if isinstance(back_book, list):
+                    back_book = back_book[0] if back_book else None
                 st.session_state.selected_ticker = None
-                if "ticker" in st.query_params:
-                    del st.query_params["ticker"]
+                for key in list(st.query_params.keys()):
+                    del st.query_params[key]
+                if came == "paper":
+                    st.query_params["view"] = "paper"
+                    st.query_params["book"] = back_book or "watch"
+                    st.query_params["hold"] = ticker
                 st.rerun()
         with c_title:
             st.markdown(
