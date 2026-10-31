@@ -44,6 +44,21 @@ st.markdown("""
         padding: 12px; margin: 8px 0;
     }
     div[data-testid="stMetricValue"] { font-size: 1.3rem; }
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        background: #ffffff;
+        border-radius: 14px !important;
+        border: 1px solid #e5e7eb !important;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        padding: 2px 6px 6px 6px;
+        margin-bottom: 10px;
+    }
+    .ticker { font-size: 1.05rem; font-weight: 700; color: #111827; letter-spacing: 0.02em; }
+    .chg-pill {
+        display: inline-block; margin-top: 4px; padding: 2px 8px; border-radius: 999px;
+        font-size: 0.82rem; font-weight: 650;
+    }
+    .chg-up { background: #ecfdf5; color: #047857; }
+    .chg-down { background: #fef2f2; color: #b91c1c; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -109,6 +124,75 @@ def format_wan(value):
     if abs(wan) >= 10000:
         return f"{wan/10000:.2f} 亿"
     return f"{wan:,.0f} 万元"
+
+FIN_CN = {
+    "Tax Effect Of Unusual Items": "非常项目的税务影响",
+    "Tax Rate For Calcs": "测算税率",
+    "Normalized EBITDA": "经调整 EBITDA",
+    "Total Unusual Items": "非常项目合计",
+    "Total Unusual Items Excluding Goodwill": "非常项目合计（不含商誉）",
+    "Net Income From Continuing Operation Net Minority Interest": "持续经营净利润",
+    "Net Income From Continuing Operations": "持续经营净利润",
+    "Reconciled Depreciation": "调节后折旧",
+    "Reconciled Cost Of Revenue": "调节后营业成本",
+    "EBITDA": "EBITDA",
+    "EBIT": "EBIT",
+    "Normalized Income": "经调整净利润",
+    "Total Revenue": "营业总收入",
+    "Operating Revenue": "营业收入",
+    "Cost Of Revenue": "营业成本",
+    "Gross Profit": "毛利润",
+    "Operating Expense": "营业费用",
+    "Operating Income": "营业利润",
+    "Net Income": "净利润",
+    "Net Income Common Stockholders": "归属于普通股股东的净利润",
+    "Net Income Including Noncontrolling Interests": "含少数股东损益的净利润",
+    "Diluted NI Availto Com Stockholders": "稀释后可供普通股股东净利润",
+    "Basic EPS": "基本每股收益",
+    "Diluted EPS": "稀释每股收益",
+    "Basic Average Shares": "基本加权平均股数",
+    "Diluted Average Shares": "稀释加权平均股数",
+    "Interest Expense": "利息支出",
+    "Interest Income": "利息收入",
+    "Net Interest Income": "净利息收入",
+    "Interest Expense Non Operating": "营业外利息支出",
+    "Interest Income Non Operating": "营业外利息收入",
+    "Pretax Income": "税前利润",
+    "Tax Provision": "所得税费用",
+    "Research And Development": "研发费用",
+    "Selling General And Administration": "销售及管理费用",
+    "Selling And Marketing Expense": "销售费用",
+    "General And Administrative Expense": "管理费用",
+    "Other Operating Expenses": "其他营业费用",
+    "Total Expenses": "费用合计",
+    "Depreciation And Amortization": "折旧与摊销",
+    "Depreciation Amortization Depletion": "折旧、摊销及损耗",
+    "Depreciation": "折旧",
+    "Amortization": "摊销",
+    "Reconciled Depreciation": "调节后折旧",
+    "Other Income Expense": "其他收益（费用）",
+    "Special Income Charges": "特殊损益",
+    "Gain On Sale Of Security": "证券出售收益",
+    "Write Off": "资产核销",
+    "Impairment Of Capital Assets": "资本性资产减值",
+    "Restructuring And Mergern Acquisition": "重组及并购费用",
+    "Minority Interests": "少数股东损益",
+    "Net Income From Continuing And Discontinued Operation": "持续及终止经营净利润",
+    "Total Operating Income As Reported": "报告营业利润",
+    "Operating Income": "营业利润",
+    "Income Before Tax": "税前利润",
+    "Net Income Continuous Operations": "持续经营净利润",
+}
+
+def to_cn(name):
+    key = str(name).strip()
+    if key in FIN_CN:
+        return FIN_CN[key]
+    # 去掉末尾截断后的常见变体
+    for en, zh in FIN_CN.items():
+        if key.startswith(en) or en.startswith(key):
+            return zh
+    return key
 
 # ==================== 详情页优先显示 ====================
 if st.session_state.selected_ticker:
@@ -215,12 +299,22 @@ if st.session_state.selected_ticker:
             try:
                 fin = stock.financials
                 if not fin.empty:
-                    # 转换为万元显示
                     fin_wan = fin.copy()
                     for col in fin_wan.columns:
-                        fin_wan[col] = fin_wan[col].apply(lambda x: x / 10000 if pd.notna(x) and isinstance(x, (int, float)) else x)
-                    st.dataframe(fin_wan.iloc[:, :3].style.format("{:,.0f}"), use_container_width=True)
-                    st.caption("以上数字单位为万元")
+                        fin_wan[col] = fin_wan[col].apply(
+                            lambda x: x / 10000 if pd.notna(x) and isinstance(x, (int, float)) else x
+                        )
+                    fin_wan.index = [to_cn(i) for i in fin_wan.index]
+                    fin_wan.columns = [
+                        c.strftime("%Y年") if hasattr(c, "strftime") else str(c)[:10]
+                        for c in fin_wan.columns
+                    ]
+                    show = fin_wan.iloc[:, :3]
+                    st.dataframe(
+                        show.style.format(lambda v: f"{v:,.0f}" if isinstance(v, (int, float)) and pd.notna(v) else "—"),
+                        use_container_width=True,
+                    )
+                    st.caption("科目已译为中文。金额单位：万元。未收录的科目会保留英文原名。")
                 else:
                     st.info("暂无详细财务数据")
                 
@@ -328,45 +422,53 @@ if st.session_state.selected_ticker:
 # ==================== 自选列表 ====================
 st.markdown('<div class="section-title">自选</div>', unsafe_allow_html=True)
 
-add_col1, add_col2 = st.columns([5, 1])
-with add_col1:
-    new_ticker = st.text_input("添加股票", placeholder="输入代码，如 AMZN、0700.HK", label_visibility="collapsed")
-with add_col2:
-    if st.button("添加", use_container_width=True) and new_ticker.strip():
-        t = new_ticker.strip().upper()
-        if t not in st.session_state.watchlist:
-            st.session_state.watchlist.append(t)
-            st.rerun()
+pad_l, list_col, pad_r = st.columns([0.6, 2.4, 0.6])
+with list_col:
+    add_col1, add_col2 = st.columns([5, 1])
+    with add_col1:
+        new_ticker = st.text_input("添加股票", placeholder="输入代码，如 AMZN、0700.HK", label_visibility="collapsed")
+    with add_col2:
+        if st.button("添加", use_container_width=True) and new_ticker.strip():
+            t = new_ticker.strip().upper()
+            if t not in st.session_state.watchlist:
+                st.session_state.watchlist.append(t)
+                st.rerun()
 
-for ticker in st.session_state.watchlist:
-    summary = get_stock_summary(ticker)
-    if summary is None:
-        st.markdown(f'<div class="stock-card"><b>{ticker}</b> · 无数据</div>', unsafe_allow_html=True)
-        continue
-    
-    color = "up" if summary["change"] >= 0 else "down"
-    sign = "+" if summary["change"] >= 0 else ""
-    
-    col_left, col_right = st.columns([3, 2])
-    with col_left:
-        st.markdown(f"**{summary['ticker']}**")
-        st.markdown(f'<span class="muted">{summary["name"]}</span>', unsafe_allow_html=True)
-    with col_right:
-        st.markdown(f'<div class="price">${summary["price"]:.2f}</div>', unsafe_allow_html=True)
-        st.markdown(f'<span class="{color}">{sign}{summary["change"]:.2f} ({sign}{summary["change_pct"]:.2f}%)</span>', unsafe_allow_html=True)
-    
-    if st.button(f"查看详情", key=f"view_{ticker}", use_container_width=True):
-        st.session_state.selected_ticker = ticker
-        st.rerun()
-    st.markdown("---")
+    for ticker in st.session_state.watchlist:
+        summary = get_stock_summary(ticker)
+        with st.container(border=True):
+            if summary is None:
+                st.markdown(f"**{ticker}**")
+                st.caption("暂无行情")
+                continue
+            color = "up" if summary["change"] >= 0 else "down"
+            pill = "chg-up" if summary["change"] >= 0 else "chg-down"
+            sign = "+" if summary["change"] >= 0 else ""
+            name = summary["name"] or ticker
+            c_name, c_px, c_btn = st.columns([2.4, 1.5, 0.9], vertical_alignment="center")
+            with c_name:
+                st.markdown(f'<div class="ticker">{summary["ticker"]}</div>', unsafe_allow_html=True)
+                st.markdown(f'<span class="muted">{name}</span>', unsafe_allow_html=True)
+            with c_px:
+                st.markdown(
+                    f'<div style="text-align:right;">'
+                    f'<div class="price" style="font-size:1.35rem;">${summary["price"]:.2f}</div>'
+                    f'<span class="chg-pill {pill}">{sign}{summary["change"]:.2f} ({sign}{summary["change_pct"]:.2f}%)</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            with c_btn:
+                if st.button("详情", key=f"view_{ticker}", use_container_width=True):
+                    st.session_state.selected_ticker = ticker
+                    st.rerun()
 
-if st.session_state.watchlist:
-    remove_col1, remove_col2 = st.columns([4, 1])
-    with remove_col1:
-        to_remove = st.selectbox("移除股票", ["不移除"] + st.session_state.watchlist, label_visibility="collapsed")
-    with remove_col2:
-        if to_remove != "不移除" and st.button("移除"):
-            st.session_state.watchlist.remove(to_remove)
-            st.rerun()
+    if st.session_state.watchlist:
+        remove_col1, remove_col2 = st.columns([4, 1])
+        with remove_col1:
+            to_remove = st.selectbox("移除股票", ["不移除"] + st.session_state.watchlist, label_visibility="collapsed")
+        with remove_col2:
+            if to_remove != "不移除" and st.button("移除", use_container_width=True):
+                st.session_state.watchlist.remove(to_remove)
+                st.rerun()
 
 st.caption("本工具仅供学习与研究使用，不构成任何投资建议。市场有风险，决策需谨慎。数据来源于 Yahoo Finance，存在延迟。")
