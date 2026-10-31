@@ -51,7 +51,14 @@ st.markdown("""
         display: block; max-width: 420px; color: #8b919a; font-size: 12px; margin-top: 2px;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; }
+    a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; padding: 12px 78px 12px 14px; cursor: pointer; }
+    a.row-hit.bare, a.row-hit.bare:hover { padding-right: 14px; }
+    a.del-hit, a.del-hit:hover {
+        position: absolute; right: 12px; top: 50%; transform: translateY(-50%); z-index: 2;
+        color: #374151; text-decoration: none; background: #fff; border: 1px solid #e5e7eb;
+        border-radius: 8px; padding: 4px 10px; font-size: 13px;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(a.row-hit) { position: relative; padding: 0 !important; }
     a.news-hit { color: #111827; text-decoration: none; font-weight: 650; font-size: 13px; line-height: 1.45; }
     a.news-hit:hover { color: #1677ff; }
     .row-px { text-align: right; font-variant-numeric: tabular-nums; }
@@ -131,6 +138,15 @@ if "timeframe" not in st.session_state:
 opened = st.query_params.get("ticker")
 if isinstance(opened, list):
     opened = opened[0] if opened else None
+drop = st.query_params.get("drop")
+if isinstance(drop, list):
+    drop = drop[0] if drop else None
+if drop:
+    if drop in st.session_state.watchlist:
+        st.session_state.watchlist.remove(drop)
+        st.session_state.stock_cache.pop(drop, None)
+    del st.query_params["drop"]
+    st.rerun()
 if opened:
     st.session_state.selected_ticker = opened
 
@@ -543,6 +559,21 @@ def rank_universe(tickers: tuple):
             ranked.append(rated)
     ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked
+
+def quote_bar(ticker, price, change_pct, label, name, website="", prefix=""):
+    pill = "chg-up" if change_pct >= 0 else "chg-down"
+    sign = "+" if change_pct >= 0 else ""
+    shown = f"{prefix}{show_symbol(ticker)}"
+    return (
+        f'<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">'
+        f'<div style="display:flex;align-items:center;min-width:0;">'
+        f'{logo_html(ticker, website, 32)}'
+        f'<div><div class="row-symbol">{shown} '
+        f'<span class="chg-pill {rate_class(label)}">{label}</span></div>'
+        f'<span class="row-name" title="{html.escape(name)}">{html.escape(name)}</span></div></div>'
+        f'<div class="row-px"><div class="px">{fmt_px(price)}</div>'
+        f'<span class="chg-pill {pill}">{sign}{change_pct:.2f}%</span></div></div>'
+    )
 
 def treasury_percent(symbol):
     cache = st.session_state.setdefault("yield_cache", {})
@@ -1778,32 +1809,20 @@ else:
                 st.rerun()
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
+            label = (ratings.get(ticker) or {}).get("label", "—")
+            if summary is None:
+                body = f'<div class="row-symbol">{show_symbol(ticker)}</div><span class="row-name">暂无行情</span>'
+            else:
+                body = quote_bar(
+                    ticker, summary["price"], summary["change_pct"], label,
+                    pretty_name(ticker, summary.get("info")), summary.get("website") or "",
+                )
             with st.container(border=True):
-                main, killer = st.columns([8, 1], vertical_alignment="center")
-                with main:
-                    if summary is None:
-                        body = f'<div class="row-symbol">{show_symbol(ticker)}</div><span class="row-name">暂无行情</span>'
-                    else:
-                        name = pretty_name(summary["ticker"], summary.get("info"))
-                        pill = "chg-up" if summary["change"] >= 0 else "chg-down"
-                        sign = "+" if summary["change"] >= 0 else ""
-                        label = (ratings.get(summary["ticker"]) or {}).get("label", "—")
-                        body = (
-                            f'<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">'
-                            f'<div style="display:flex;align-items:center;min-width:0;">'
-                            f'{logo_html(summary["ticker"], summary.get("website", ""), 32)}'
-                            f'<div><div class="row-symbol">{show_symbol(summary["ticker"])} '
-                            f'<span class="chg-pill {rate_class(label)}">{label}</span></div>'
-                            f'<span class="row-name" title="{html.escape(name)}">{html.escape(name)}</span></div></div>'
-                            f'<div class="row-px"><div class="px">{fmt_px(summary["price"])}</div>'
-                            f'<span class="chg-pill {pill}">{sign}{summary["change_pct"]:.2f}%</span></div></div>'
-                        )
-                    st.markdown(f'<a class="row-hit" href="?ticker={quote(ticker)}">{body}</a>', unsafe_allow_html=True)
-                with killer:
-                    if st.button("删除", key=f"del_{ticker}", use_container_width=True):
-                        st.session_state.watchlist.remove(ticker)
-                        st.session_state.stock_cache.pop(ticker, None)
-                        st.rerun()
+                st.markdown(
+                    f'<a class="row-hit" href="?ticker={quote(ticker)}">{body}</a>'
+                    f'<a class="del-hit" href="?drop={quote(ticker)}">删除</a>',
+                    unsafe_allow_html=True,
+                )
 
     with rank_col:
         basis = st.radio("按哪一级看前十", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
@@ -1819,28 +1838,14 @@ else:
             st.info("这次没有拉到足够行情，前十暂时空着。过一会儿再刷新。")
         for index, item in enumerate(picks, start=1):
             symbol = item["ticker"]
-            cells = item.get("by_unit") or {}
-            pills = " ".join(
-                f'<span class="chg-pill {rate_class(cells[name]["label"])}">{name}{cells[name]["label"]}</span>'
-                for name in ("日", "周", "月") if name in cells
-            )
+            summary = get_stock_summary(symbol)
+            price = summary["price"] if summary else item.get("price")
+            change_pct = summary["change_pct"] if summary else 0
+            name = pretty_name(symbol, summary.get("info") if summary else None)
+            website = (summary or {}).get("website") or ""
+            body = quote_bar(symbol, price, change_pct, item["label"], name, website, prefix=f"{index}. ")
             with st.container(border=True):
-                left, right = st.columns([5, 1], vertical_alignment="center")
-                with left:
-                    st.markdown(
-                        f'<div class="row-symbol">{index}. {show_symbol(symbol)} '
-                        f'<span class="chg-pill {rate_class(item["label"])}">{item["score"]}</span></div>'
-                        f'<div style="margin-top:4px;">{pills}</div>'
-                        f'<div class="row-px" style="text-align:left;margin-top:2px;"><span class="px" style="font-size:15px;">{fmt_px(item["price"])}</span></div>',
-                        unsafe_allow_html=True,
-                    )
-                with right:
-                    if st.button("查看", key=f"pick_{symbol}", use_container_width=True):
-                        if symbol not in st.session_state.watchlist:
-                            st.session_state.watchlist.append(symbol)
-                        st.session_state.selected_ticker = symbol
-                        st.query_params["ticker"] = symbol
-                        st.rerun()
+                st.markdown(f'<a class="row-hit bare" href="?ticker={quote(symbol)}">{body}</a>', unsafe_allow_html=True)
 
     with news_col:
         st.markdown('<div class="board-head"><div class="section-title">市场要闻</div><div class="muted">最值得看</div></div>', unsafe_allow_html=True)
