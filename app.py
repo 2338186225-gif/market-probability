@@ -48,9 +48,12 @@ st.markdown("""
     .muted { color: #8b919a; font-size: 12px; }
     .row-symbol { font-size: 15px; font-weight: 750; color: #111827; line-height: 1.2; }
     .row-name {
-        display: block; max-width: 280px; color: #8b919a; font-size: 12px; margin-top: 2px;
+        display: block; max-width: 420px; color: #8b919a; font-size: 12px; margin-top: 2px;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
+    a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; }
+    a.news-hit { color: #111827; text-decoration: none; font-weight: 650; font-size: 13px; line-height: 1.45; }
+    a.news-hit:hover { color: #1677ff; }
     .row-px { text-align: right; font-variant-numeric: tabular-nums; }
     .row-px .px { font-size: 16px; font-weight: 750; color: #111827; }
     .chg-pill {
@@ -125,6 +128,11 @@ if "stock_cache" not in st.session_state:
     st.session_state.stock_cache = {}
 if "timeframe" not in st.session_state:
     st.session_state.timeframe = "1d"
+opened = st.query_params.get("ticker")
+if isinstance(opened, list):
+    opened = opened[0] if opened else None
+if opened:
+    st.session_state.selected_ticker = opened
 
 ALIASES = {
     "BTC": "BTC-USD",
@@ -1112,6 +1120,23 @@ def fetch_news(ticker, limit=6):
         items = []
     return items
 
+@st.cache_data(ttl=900, show_spinner=False)
+def market_headlines(tickers: tuple):
+    seen = set()
+    rows = []
+    for ticker in tickers:
+        for item in fetch_news(ticker, limit=3):
+            key = item["title"].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            row = dict(item)
+            row["ticker"] = ticker
+            rows.append(row)
+            if len(rows) >= 8:
+                return rows
+    return rows
+
 def hist_vol_drift(close):
     log_returns = np.log(close / close.shift(1)).dropna()
     if len(log_returns) < 5:
@@ -1207,6 +1232,8 @@ if st.session_state.selected_ticker:
         with bar_l:
             if st.button("返回", type="secondary", use_container_width=True):
                 st.session_state.selected_ticker = None
+                if "ticker" in st.query_params:
+                    del st.query_params["ticker"]
                 st.rerun()
         with bar_r:
             if st.button("刷新", type="primary"):
@@ -1737,7 +1764,7 @@ else:
         if symbol not in ratings:
             ratings[symbol] = rate_ticker(symbol)
 
-    watch_col, rank_col = st.columns([1.7, 0.9], gap="large")
+    watch_col, rank_col, news_col = st.columns([1.75, 0.9, 0.78], gap="medium")
 
     with watch_col:
         st.markdown('<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · 延迟行情</div></div>', unsafe_allow_html=True)
@@ -1752,30 +1779,27 @@ else:
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
             with st.container(border=True):
-                if summary is None:
-                    st.markdown(f'<div class="row-symbol">{show_symbol(ticker)}</div><span class="row-name">暂无行情</span>', unsafe_allow_html=True)
-                else:
-                    name = pretty_name(summary["ticker"], summary.get("info"))
-                    pill = "chg-up" if summary["change"] >= 0 else "chg-down"
-                    sign = "+" if summary["change"] >= 0 else ""
-                    label = (ratings.get(summary["ticker"]) or {}).get("label", "—")
-                    st.markdown(
-                        f'<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">'
-                        f'<div style="display:flex;align-items:center;min-width:0;">'
-                        f'{logo_html(summary["ticker"], summary.get("website", ""), 32)}'
-                        f'<div><div class="row-symbol">{show_symbol(summary["ticker"])} '
-                        f'<span class="chg-pill {rate_class(label)}">{label}</span></div>'
-                        f'<span class="row-name" title="{html.escape(name)}">{html.escape(name)}</span></div></div>'
-                        f'<div class="row-px"><div class="px">{fmt_px(summary["price"])}</div>'
-                        f'<span class="chg-pill {pill}">{sign}{summary["change_pct"]:.2f}%</span></div></div>',
-                        unsafe_allow_html=True,
-                    )
-                b1, b2 = st.columns(2)
-                with b1:
-                    if st.button("详情", key=f"view_{ticker}", use_container_width=True):
-                        st.session_state.selected_ticker = ticker
-                        st.rerun()
-                with b2:
+                main, killer = st.columns([8, 1], vertical_alignment="center")
+                with main:
+                    if summary is None:
+                        body = f'<div class="row-symbol">{show_symbol(ticker)}</div><span class="row-name">暂无行情</span>'
+                    else:
+                        name = pretty_name(summary["ticker"], summary.get("info"))
+                        pill = "chg-up" if summary["change"] >= 0 else "chg-down"
+                        sign = "+" if summary["change"] >= 0 else ""
+                        label = (ratings.get(summary["ticker"]) or {}).get("label", "—")
+                        body = (
+                            f'<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">'
+                            f'<div style="display:flex;align-items:center;min-width:0;">'
+                            f'{logo_html(summary["ticker"], summary.get("website", ""), 32)}'
+                            f'<div><div class="row-symbol">{show_symbol(summary["ticker"])} '
+                            f'<span class="chg-pill {rate_class(label)}">{label}</span></div>'
+                            f'<span class="row-name" title="{html.escape(name)}">{html.escape(name)}</span></div></div>'
+                            f'<div class="row-px"><div class="px">{fmt_px(summary["price"])}</div>'
+                            f'<span class="chg-pill {pill}">{sign}{summary["change_pct"]:.2f}%</span></div></div>'
+                        )
+                    st.markdown(f'<a class="row-hit" href="?ticker={quote(ticker)}">{body}</a>', unsafe_allow_html=True)
+                with killer:
                     if st.button("删除", key=f"del_{ticker}", use_container_width=True):
                         st.session_state.watchlist.remove(ticker)
                         st.session_state.stock_cache.pop(ticker, None)
@@ -1789,8 +1813,8 @@ else:
         else:
             ranked_view = list(ranked)
         picks = ranked_view[:10]
-        st.markdown(f'<div class="board-head"><div class="section-title">{basis}买入</div><div class="muted">前十</div></div>', unsafe_allow_html=True)
-        st.caption("月线权重大于周线，周线大于日线。均线往上加分，涨离长期均线太远就扣分。只是多头排齐、斜率接近零的，不会并列成一样的分数。")
+        st.markdown(f'<div class="board-head"><div class="section-title">综合买入评级</div><div class="muted">{basis}前十</div></div>', unsafe_allow_html=True)
+        st.caption("月线权重最高。均线向上加分，离长期均线太远扣分。")
         if not picks:
             st.info("这次没有拉到足够行情，前十暂时空着。过一会儿再刷新。")
         for index, item in enumerate(picks, start=1):
@@ -1815,6 +1839,25 @@ else:
                         if symbol not in st.session_state.watchlist:
                             st.session_state.watchlist.append(symbol)
                         st.session_state.selected_ticker = symbol
+                        st.query_params["ticker"] = symbol
                         st.rerun()
+
+    with news_col:
+        st.markdown('<div class="board-head"><div class="section-title">市场要闻</div><div class="muted">最值得看</div></div>', unsafe_allow_html=True)
+        news_names = ["SPY", "QQQ", "BTC-USD"] + [item["ticker"] for item in ranked[:3]]
+        headlines = market_headlines(tuple(dict.fromkeys(news_names)))
+        if not headlines:
+            st.caption("这次没有拉到新闻。")
+        for item in headlines:
+            title = html.escape(item["title"])
+            link = html.escape(item["link"], quote=True)
+            when = html.escape(item["time"] or "")
+            tag = html.escape(show_symbol(item["ticker"]))
+            st.markdown(
+                f'<div style="padding:8px 0;border-bottom:1px solid #e7e9ee;">'
+                f'<a class="news-hit" href="{link}" target="_blank">{title}</a>'
+                f'<div class="muted" style="margin-top:3px;">{tag} · {when}</div></div>',
+                unsafe_allow_html=True,
+            )
 
 st.caption("仅供学习研究，不构成投资建议。行情来自 Yahoo Finance，有延迟。")
