@@ -57,7 +57,11 @@ st.markdown("""
         display: block; max-width: 420px; color: #8b919a; font-size: 12px; margin-top: 2px;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .qhead { display: flex; justify-content: space-between; color: #8b919a; font-size: 12px; padding: 8px 46px 6px 4px; }
+    .qhead { display: flex; justify-content: space-between; align-items: center; color: #8b919a; font-size: 12px; padding: 8px 46px 6px 4px; }
+    .qhead a, .qhead a:hover { color: #8b919a; text-decoration: none; }
+    .qhead a.on { color: #111827; font-weight: 700; }
+    .qh-right { display: flex; gap: 16px; }
+    .score-num { margin-left: 6px; font-size: 13px; font-weight: 760; color: #111827; font-variant-numeric: tabular-nums; }
     .qrow:hover { background: #fafafa; }
     a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; padding: 12px 46px 12px 4px; cursor: pointer; }
     a.row-hit.bare, a.row-hit.bare:hover { padding-right: 4px; }
@@ -172,6 +176,13 @@ if drop:
         st.session_state.watchlist.remove(drop)
         st.session_state.stock_cache.pop(drop, None)
     del st.query_params["drop"]
+    st.rerun()
+wsort = st.query_params.get("wsort")
+if isinstance(wsort, list):
+    wsort = wsort[0] if wsort else None
+if wsort in ("name", "amount", "price", "chg", "score"):
+    st.session_state.watch_sort = wsort
+    del st.query_params["wsort"]
     st.rerun()
 if opened:
     st.session_state.selected_ticker = opened
@@ -606,18 +617,19 @@ def rank_universe(tickers: tuple):
     ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked
 
-def quote_bar(ticker, price, change_pct, label, name, website="", prefix="", cap=None):
+def quote_bar(ticker, price, change_pct, label, name, website="", prefix="", amount=None, score=None):
     tone = "up" if change_pct >= 0 else "down"
     sign = "+" if change_pct >= 0 else ""
     shown = f"{prefix}{show_symbol(ticker)}"
     sub = html.escape(name)
-    if cap:
-        sub += f" | {fmt_cap(cap)}"
+    if amount:
+        sub += f" | {fmt_cap(amount)}"
+    score_html = f'<span class="score-num">{score:.1f}</span>' if score is not None else ""
     return (
         f'<div class="qline">'
         f'<div class="qleft">{logo_html(ticker, website, 32)}'
         f'<div><div class="row-symbol">{shown} '
-        f'<span class="chg-pill {rate_class(label)}">{label}</span></div>'
+        f'<span class="chg-pill {rate_class(label)}">{label}</span>{score_html}</div>'
         f'<span class="row-name" title="{html.escape(name)}">{sub}</span></div></div>'
         f'<div class="row-px"><span class="px">{fmt_px(price)}</span>'
         f'<span class="pct {tone}">{sign}{change_pct:.2f}%</span></div></div>'
@@ -1873,18 +1885,59 @@ else:
                 if t in st.session_state.stock_cache:
                     del st.session_state.stock_cache[t]
                 st.rerun()
-        st.markdown('<div class="qhead"><span>名称</span><span>最新价 / 涨跌幅</span></div>', unsafe_allow_html=True)
+        sort_key = st.session_state.get("watch_sort")
+        def sort_mark(key):
+            return " ↓" if sort_key == key else ""
+        def head_link(key, text):
+            klass = "on" if sort_key == key else ""
+            return f'<a class="{klass}" href="?wsort={key}">{text}{sort_mark(key)}</a>'
+        st.markdown(
+            '<div class="qhead"><span>'
+            + head_link("name", "名称") + " / " + head_link("amount", "成交额")
+            + '</span><span class="qh-right">'
+            + head_link("score", "买入评分")
+            + head_link("price", "最新价")
+            + head_link("chg", "涨跌幅")
+            + "</span></div>",
+            unsafe_allow_html=True,
+        )
+        rows = []
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
-            label = (ratings.get(ticker) or {}).get("label", "—")
+            rated = ratings.get(ticker) or {}
+            info = (summary or {}).get("info") or {}
+            volume = info.get("regularMarketVolume") or info.get("volume")
+            price = summary["price"] if summary else None
+            amount = price * float(volume) if price and volume else None
+            rows.append({
+                "ticker": ticker,
+                "summary": summary,
+                "label": rated.get("label", "—"),
+                "score": rated.get("score"),
+                "price": price or 0,
+                "change_pct": summary["change_pct"] if summary else -999,
+                "amount": amount or 0,
+            })
+        if sort_key == "name":
+            rows.sort(key=lambda row: row["ticker"])
+        elif sort_key == "amount":
+            rows.sort(key=lambda row: row["amount"], reverse=True)
+        elif sort_key == "price":
+            rows.sort(key=lambda row: row["price"], reverse=True)
+        elif sort_key == "chg":
+            rows.sort(key=lambda row: row["change_pct"], reverse=True)
+        elif sort_key == "score":
+            rows.sort(key=lambda row: row["score"] if row["score"] is not None else -999, reverse=True)
+        for row in rows:
+            ticker = row["ticker"]
+            summary = row["summary"]
             if summary is None:
                 body = f'<div class="row-symbol">{show_symbol(ticker)}</div><span class="row-name">暂无行情</span>'
-                cap = None
             else:
-                cap = (summary.get("info") or {}).get("marketCap")
                 body = quote_bar(
-                    ticker, summary["price"], summary["change_pct"], label,
-                    pretty_name(ticker, summary.get("info")), summary.get("website") or "", cap=cap,
+                    ticker, summary["price"], summary["change_pct"], row["label"],
+                    pretty_name(ticker, summary.get("info")), summary.get("website") or "",
+                    amount=row["amount"] or None, score=row["score"],
                 )
             st.markdown(
                 f'<div class="qrow"><a class="row-hit" href="?ticker={quote(ticker)}">{body}</a>'
@@ -1911,8 +1964,13 @@ else:
             change_pct = summary["change_pct"] if summary else 0
             name = pretty_name(symbol, summary.get("info") if summary else None)
             website = (summary or {}).get("website") or ""
-            cap = ((summary or {}).get("info") or {}).get("marketCap")
-            body = quote_bar(symbol, price, change_pct, item["label"], name, website, prefix=f"{index}. ", cap=cap)
+            info = (summary or {}).get("info") or {}
+            volume = info.get("regularMarketVolume") or info.get("volume")
+            amount = price * float(volume) if price and volume else None
+            body = quote_bar(
+                symbol, price, change_pct, item["label"], name, website,
+                prefix=f"{index}. ", amount=amount, score=item.get("score"),
+            )
             st.markdown(f'<div class="qrow"><a class="row-hit bare" href="?ticker={quote(symbol)}">{body}</a></div>', unsafe_allow_html=True)
 
     with news_col:
