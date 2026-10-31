@@ -57,7 +57,7 @@ st.markdown("""
         display: block; max-width: 420px; color: #8b919a; font-size: 12px; margin-top: 2px;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .qrow { position: relative; border-bottom: 1px solid #f2f3f5; }
+    .qhead { display: flex; justify-content: space-between; color: #8b919a; font-size: 12px; padding: 8px 46px 6px 4px; }
     .qrow:hover { background: #fafafa; }
     a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; padding: 12px 46px 12px 4px; cursor: pointer; }
     a.row-hit.bare, a.row-hit.bare:hover { padding-right: 4px; }
@@ -148,6 +148,15 @@ if "crypto_added" not in st.session_state:
         if symbol not in st.session_state.watchlist:
             st.session_state.watchlist.insert(0, symbol)
     st.session_state.crypto_added = True
+FROM_BINANCE = [
+    "NVDA", "TSLA", "GOOGL", "AMD", "AVGO", "MSFT", "META", "TSM", "ARM", "INTC",
+    "COST", "TXN", "QQQ", "QQQM", "SOXL", "KORU", "DRAM", "SGOV", "SNDK", "RKLB",
+]
+if "binance_list_added" not in st.session_state:
+    for symbol in FROM_BINANCE:
+        if symbol not in st.session_state.watchlist:
+            st.session_state.watchlist.append(symbol)
+    st.session_state.binance_list_added = True
 if "stock_cache" not in st.session_state:
     st.session_state.stock_cache = {}
 if "timeframe" not in st.session_state:
@@ -198,6 +207,26 @@ FRIENDLY = {
     "ASML": "阿斯麦",
     "ASTS": "AST SpaceMobile",
     "AAPL": "苹果",
+    "NVDA": "英伟达",
+    "TSLA": "特斯拉",
+    "GOOGL": "谷歌",
+    "AMD": "超威半导体",
+    "AVGO": "博通",
+    "MSFT": "微软",
+    "META": "Meta",
+    "TSM": "台积电",
+    "ARM": "安谋",
+    "INTC": "英特尔",
+    "COST": "好市多",
+    "TXN": "德州仪器",
+    "QQQ": "纳指100",
+    "QQQM": "纳指100",
+    "SOXL": "半导体三倍做多",
+    "KORU": "韩国三倍做多",
+    "DRAM": "内存ETF",
+    "SGOV": "短期美债",
+    "SNDK": "闪迪",
+    "RKLB": "Rocket Lab",
 }
 LOGO_BG = {
     "BTC-USD": "#f7931a",
@@ -1844,6 +1873,7 @@ else:
                 if t in st.session_state.stock_cache:
                     del st.session_state.stock_cache[t]
                 st.rerun()
+        st.markdown('<div class="qhead"><span>名称</span><span>最新价 / 涨跌幅</span></div>', unsafe_allow_html=True)
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
             label = (ratings.get(ticker) or {}).get("label", "—")
