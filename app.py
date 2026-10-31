@@ -253,6 +253,70 @@ def fetch_hist(ticker, timeframe):
         }).dropna()
     return hist
 
+def kline_level(df, unit):
+    windows = {"日": (7, 25, 60, 20), "周": (10, 20, 40, 12), "月": (6, 12, 24, 6)}
+    short, mid, long, lookback = windows[unit]
+    if df is None or df.empty or "Close" not in df or len(df) < short + 2:
+        return None
+    close = df["Close"].astype(float)
+    ma_short = close.rolling(short).mean()
+    ma_mid = close.rolling(mid).mean()
+    ma_long = close.rolling(long).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+    last = float(close.iloc[-1])
+    bar = df.iloc[-1]
+    notes = []
+    trend = "数据不足"
+    ms, mm, ml = ma_short.iloc[-1], ma_mid.iloc[-1], ma_long.iloc[-1]
+    if pd.notna(ms) and pd.notna(mm) and pd.notna(ml):
+        if last > ms > mm > ml:
+            trend = "多头"
+            notes.append(f"收盘站上 MA{short}、MA{mid}、MA{long}，均线多头排列。")
+        elif last < ms < mm < ml:
+            trend = "空头"
+            notes.append(f"收盘跌破 MA{short}、MA{mid}、MA{long}，均线空头排列。")
+        elif last >= mm:
+            trend = "偏多"
+            notes.append(f"收盘在 MA{mid} 之上，长短均线还没完全排齐。")
+        else:
+            trend = "偏空"
+            notes.append(f"收盘在 MA{mid} 之下，还没形成完整空头排列。")
+    candle = "阳线" if float(bar["Close"]) >= float(bar["Open"]) else "阴线"
+    notes.append(f"最近一根是{candle}，收盘 {last:.2f}。")
+    if len(df) >= 2:
+        prev = df.iloc[-2]
+        higher = float(bar["High"]) > float(prev["High"]) and float(bar["Low"]) > float(prev["Low"])
+        lower = float(bar["High"]) < float(prev["High"]) and float(bar["Low"]) < float(prev["Low"])
+        if higher:
+            notes.append("高点和低点同时抬高，这根结构向上。")
+        elif lower:
+            notes.append("高点和低点同时降低，这根结构向下。")
+    if len(close) > lookback:
+        change = last / float(close.iloc[-1 - lookback]) - 1
+        span = close.tail(lookback)
+        width = float(span.max() - span.min())
+        if width > 0:
+            pos = (last - float(span.min())) / width * 100
+            notes.append(f"近 {lookback} 根{unit}线 {change*100:+.1f}%，位于这段高低区间的 {pos:.0f}%。")
+        else:
+            notes.append(f"近 {lookback} 根{unit}线 {change*100:+.1f}%。")
+    rsi_value = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None
+    if rsi_value is not None:
+        if rsi_value >= 70:
+            zone = "超买，这个级别继续追高的余地变小"
+        elif rsi_value <= 30:
+            zone = "超卖，有技术性反弹的条件，但不是趋势已经反转"
+        else:
+            zone = "中性"
+        notes.append(f"RSI(14) {rsi_value:.1f}，{zone}。")
+    if "Volume" in df.columns and float(df["Volume"].tail(10).mean() or 0) > 0:
+        ratio = float(df["Volume"].iloc[-1]) / float(df["Volume"].tail(10).mean())
+        notes.append(f"最近一根成交量约为近 10 根均量的 {ratio:.2f} 倍。")
+    return {"unit": unit, "trend": trend, "notes": notes}
+
 def format_wan(value):
     """将数值转换为万元显示"""
     if value is None or not isinstance(value, (int, float)):
@@ -827,62 +891,38 @@ if st.session_state.selected_ticker:
                 st.info(f"财务数据暂不可用：{str(e)}")
 
         with tab3:
-            st.markdown("### 综合分析")
-            blocks = []
-            hist_analysis = fetch_hist(ticker, "1d")
-            if not hist_analysis.empty:
-                df_a = hist_analysis.copy()
-                df_a["MA7"] = df_a["Close"].rolling(7).mean()
-                df_a["MA25"] = df_a["Close"].rolling(25).mean()
-                df_a["MA60"] = df_a["Close"].rolling(60).mean()
-                delta = df_a["Close"].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                rs = gain / loss.replace(0, np.nan)
-                df_a["RSI"] = 100 - (100 / (1 + rs))
-                last = df_a.iloc[-1]
-                close = float(last["Close"])
-                tech = []
-                ma7, ma25, ma60 = last.get("MA7"), last.get("MA25"), last.get("MA60")
-                if pd.notna(ma7) and pd.notna(ma25) and pd.notna(ma60):
-                    if close > ma7 > ma25 > ma60:
-                        tech.append("均线多头排列（价格 > MA7 > MA25 > MA60），中期趋势偏强。")
-                    elif close < ma7 < ma25 < ma60:
-                        tech.append("均线空头排列，中期趋势偏弱。")
-                    else:
-                        tech.append(
-                            f"价格 {close:.2f}，MA7 {ma7:.2f}，MA25 {ma25:.2f}，MA60 {ma60:.2f}，均线纠缠，趋势不单一。"
-                        )
-                rsi = last.get("RSI")
-                if pd.notna(rsi):
-                    if rsi > 70:
-                        tech.append(f"RSI(14) {rsi:.1f}，超买，短线追高风险更大。")
-                    elif rsi < 30:
-                        tech.append(f"RSI(14) {rsi:.1f}，超卖，存在技术性反弹可能，但不等于趋势反转。")
-                    else:
-                        tech.append(f"RSI(14) {rsi:.1f}，处于中性区间。")
-                vol = df_a["Volume"].tail(20)
-                if len(vol) >= 20 and vol.mean():
-                    ratio = float(df_a["Volume"].iloc[-1]) / float(vol.mean())
-                    tech.append(f"最新成交量约为 20 日均量的 {ratio:.2f} 倍。")
-                rets = []
-                for days, name_cn in [(21, "近1月"), (63, "近3月"), (126, "近6月"), (252, "近1年")]:
-                    if len(df_a) > days:
-                        r = df_a["Close"].iloc[-1] / df_a["Close"].iloc[-1 - days] - 1
-                        rets.append(f"{name_cn} {r*100:+.1f}%")
-                if rets:
-                    tech.append("区间涨跌：" + "，".join(rets) + "。")
-                daily = df_a["Close"].pct_change().dropna()
-                if len(daily) > 20:
-                    vola = float(daily.tail(20).std() * np.sqrt(252) * 100)
-                    tech.append(f"近20日年化波动率约 {vola:.1f}%。")
-                hi = info.get("fiftyTwoWeekHigh")
-                lo = info.get("fiftyTwoWeekLow")
-                if hi and lo and hi != lo:
-                    pos = (close - lo) / (hi - lo) * 100
-                    tech.append(f"处于52周区间的 {pos:.0f}% 位置（低点 {lo}，高点 {hi}）。")
-                blocks.append(("技术面", tech))
+            st.markdown("### 日线 · 周线 · 月线")
+            st.caption("月线看大方向，周线看波段，日线看短线进出。均线按各自周期计算：日线 7/25/60，周线 10/20/40，月线 6/12/24。")
+            levels = [kline_level(fetch_hist(ticker, tf), unit) for tf, unit in (("1d", "日"), ("1wk", "周"), ("1mo", "月"))]
+            known = [item for item in levels if item]
+            bullish = sum(item["trend"] in ("多头", "偏多") for item in known)
+            bearish = sum(item["trend"] in ("空头", "偏空") for item in known)
+            if len(known) == 3 and bullish == 3:
+                headline = "三个级别同时偏多，趋势共振。短线回调只要不破坏周线，仍按上升结构看。"
+            elif len(known) == 3 and bearish == 3:
+                headline = "三个级别同时偏空。日线反弹要先看到周线走平，否则更容易是下跌中的反抽。"
+            elif bullish > bearish:
+                headline = "大级别和短级别不完全一致，偏多的级别更多。以周线、月线为准，日线只用来找进出位置。"
+            elif bearish > bullish:
+                headline = "偏空的级别更多。日线即使超卖，也要等周线不再创新低，再把它当成反转。"
+            else:
+                headline = "多空级别互相打架，趋势不干净。这种时候区间比方向更重要。"
+            st.markdown(f'<div class="analysis-box"><b>多周期结论</b><br>{headline}</div>', unsafe_allow_html=True)
+            cols = st.columns(3)
+            trend_class = {"多头": "verdict-up", "偏多": "verdict-up", "空头": "verdict-down", "偏空": "verdict-down"}
+            for col, item in zip(cols, levels):
+                with col:
+                    if not item:
+                        st.info("这个级别的历史不够。")
+                        continue
+                    klass = trend_class.get(item["trend"], "verdict-mid")
+                    text = "<br>".join(item["notes"])
+                    st.markdown(
+                        f'<div class="analysis-box"><span class="verdict {klass}">{item["unit"]}线 · {item["trend"]}</span><br>{text}</div>',
+                        unsafe_allow_html=True,
+                    )
 
+            blocks = []
             fund = []
             pe = info.get("trailingPE")
             fpe = info.get("forwardPE")
