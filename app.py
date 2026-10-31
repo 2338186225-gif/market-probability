@@ -311,7 +311,7 @@ if isinstance(page, list):
 paper_book = st.query_params.get("book")
 if isinstance(paper_book, list):
     paper_book = paper_book[0] if paper_book else None
-if paper_book not in ("watch", "market", "edge"):
+if paper_book not in ("watch", "market", "edge", "crypto"):
     paper_book = "watch"
 paper_hold = st.query_params.get("hold")
 if isinstance(paper_hold, list):
@@ -1633,7 +1633,7 @@ def load_books():
         books = {"watch": raw, "market": empty_paper()}
     else:
         books = {"watch": empty_paper(), "market": empty_paper()}
-    for key in ("watch", "market", "edge"):
+    for key in ("watch", "market", "edge", "crypto"):
         books.setdefault(key, empty_paper())
         books[key].setdefault("positions", {})
         books[key].setdefault("trades", [])
@@ -1644,7 +1644,7 @@ def load_books():
     if not current or (stamp and stamp != current.get("updated")):
         st.session_state.books = books
     else:
-        for key in ("watch", "market", "edge"):
+        for key in ("watch", "market", "edge", "crypto"):
             st.session_state.books.setdefault(key, empty_paper())
     return st.session_state.books
 
@@ -1664,7 +1664,7 @@ def win_record(books):
         if not isinstance(book, dict):
             continue
         for trade in book.get("trades") or []:
-            if not isinstance(trade, dict) or trade.get("side") != "卖" or "win" not in trade:
+            if not isinstance(trade, dict) or trade.get("side") not in ("卖", "平空") or "win" not in trade:
                 continue
             n += 1
             wins += 1 if trade.get("win") else 0
@@ -1731,15 +1731,19 @@ def close_position(book, ticker, price, reason, today):
         if pos:
             book["positions"][ticker] = pos
         return False
-    shares = int(pos["shares"])
+    shares = float(pos["shares"])
     cost = float(pos.get("cost") or 0)
-    book["cash"] += shares * float(price)
+    side = pos.get("side") or "多"
+    pnl = (float(price) - cost) * shares if side != "空" else (cost - float(price)) * shares
+    margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
+    book["cash"] += margin + pnl
     book["trades"].append({
-        "date": today, "side": "卖", "ticker": ticker, "shares": shares,
+        "date": today, "side": "平空" if side == "空" else "卖", "ticker": ticker, "shares": shares,
         "price": round(float(price), 4), "reason": reason,
         "horizon": pos.get("horizon") or "",
-        "win": float(price) > cost,
-        "pnl": round((float(price) - cost) * shares, 2),
+        "leverage": pos.get("leverage") or 1,
+        "win": pnl > 0,
+        "pnl": round(pnl, 2),
     })
     return True
 
@@ -1760,6 +1764,133 @@ def edge_targets(rows):
         picks.append(row)
     picks.sort(key=lambda row: row.get("mom") or -1, reverse=True)
     return picks[:6]
+
+def crypto_market_rows():
+    cache = globals().setdefault("_CRYPTO_15M", {"at": 0, "rows": []})
+    if cache["rows"] and time.time() - cache["at"] < 180:
+        return cache["rows"]
+    try:
+        data = yf.download(
+            list(CRYPTO_MARKET), period="5d", interval="15m", group_by="ticker",
+            auto_adjust=True, progress=False, threads=True,
+        )
+    except Exception:
+        return cache["rows"]
+    if data is None or data.empty:
+        return cache["rows"]
+    multi = isinstance(getattr(data, "columns", None), pd.MultiIndex)
+    rows = []
+    for ticker in CRYPTO_MARKET:
+        try:
+            hist = data[ticker].dropna(how="all") if multi else data
+            close = hist["Close"].dropna()
+        except Exception:
+            continue
+        if close is None or len(close) < 60:
+            continue
+        price = float(close.iloc[-1])
+        ma20 = float(close.tail(20).mean())
+        ma60 = float(close.tail(60).mean())
+        ret4 = float(close.iloc[-1] / close.iloc[-5] - 1)
+        rets = np.log(close / close.shift(1)).dropna().tail(32)
+        bar_vol = float(rets.std()) if len(rets) else 0.0
+        side = None
+        if price > ma20 > ma60 and ret4 > 0.0015:
+            side = "多"
+        elif price < ma20 < ma60 and ret4 < -0.0015:
+            side = "空"
+        if bar_vol <= 0:
+            lev = 2
+        else:
+            strength = min(4.0, abs(ret4) / bar_vol)
+            lev = int(min(10, max(2, round(strength * 2))))
+            if bar_vol > 0.02:
+                lev = min(lev, 4)
+            if bar_vol > 0.035:
+                lev = min(lev, 2)
+        rows.append({
+            "ticker": ticker, "price": price, "side": side, "leverage": lev,
+            "ret": ret4, "vol": bar_vol, "horizons": {},
+        })
+    if rows:
+        cache["at"] = time.time()
+        cache["rows"] = rows
+    return rows or cache["rows"]
+
+def crypto_bar_slot():
+    now = datetime.now()
+    minute = (now.minute // 15) * 15
+    return now.strftime("%Y-%m-%d %H:") + f"{minute:02d}"
+
+def crypto_rebalance(book, rows):
+    slot = crypto_bar_slot()
+    rule_id = "crypto-15m-v1"
+    if book.get("last_run") == slot and book.get("rules") == rule_id:
+        return book
+    by_ticker = {row["ticker"]: row for row in rows if row.get("price")}
+    for ticker in list(book["positions"]):
+        pos = book["positions"][ticker]
+        sig = by_ticker.get(ticker)
+        price = (sig or {}).get("price") or pos.get("cost")
+        if not price:
+            continue
+        shares = float(pos.get("shares") or 0)
+        cost = float(pos.get("cost") or 0)
+        side = pos.get("side") or "多"
+        pnl = (float(price) - cost) * shares if side != "空" else (cost - float(price)) * shares
+        margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
+        reason = None
+        if margin and pnl <= -0.8 * margin:
+            reason = "亏损接近保证金，提前平仓"
+        elif not sig or not sig.get("side"):
+            reason = "15 分钟趋势走平，先平掉"
+        elif sig.get("side") != side:
+            reason = "15 分钟方向反了"
+        elif margin and pnl <= -0.35 * margin:
+            reason = "15 分钟止损"
+        if reason:
+            close_position(book, ticker, price, reason, slot)
+    equity = float(book["cash"])
+    for ticker, pos in book["positions"].items():
+        price = float((by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0)
+        shares = float(pos.get("shares") or 0)
+        cost = float(pos.get("cost") or 0)
+        side = pos.get("side") or "多"
+        pnl = (price - cost) * shares if side != "空" else (cost - price) * shares
+        margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
+        equity += margin + pnl
+    ranked = [row for row in rows if row.get("side") and row.get("price")]
+    ranked.sort(key=lambda row: abs(row.get("ret") or 0) / max(row.get("vol") or 1e-6, 1e-6), reverse=True)
+    for row in ranked:
+        if len(book["positions"]) >= 4 or row["ticker"] in book["positions"]:
+            continue
+        if row.get("vol") and row["vol"] > 0.05:
+            continue
+        lev = int(min(10, max(2, row.get("leverage") or 2)))
+        used = 0.0
+        for pos in book["positions"].values():
+            used += float(pos["margin"]) if pos.get("margin") is not None else float(pos.get("shares") or 0) * float(pos.get("cost") or 0)
+        room = equity * 0.6 - used
+        margin = min(float(book["cash"]), room, equity * min(0.15, 0.8 / lev))
+        if margin < max(1000, equity * 0.02):
+            continue
+        price = float(row["price"])
+        shares = (margin * lev) / price
+        book["cash"] -= margin
+        book["positions"][row["ticker"]] = {
+            "shares": shares, "cost": price, "side": row["side"],
+            "leverage": lev, "margin": margin, "horizon": "15分",
+        }
+        book["trades"].append({
+            "date": slot, "side": "买" if row["side"] == "多" else "开空",
+            "ticker": row["ticker"], "shares": shares, "price": round(price, 4),
+            "horizon": "15分", "leverage": lev,
+            "reason": f"15 分钟{row['side']}头，{lev} 倍，杠杆不超过 10 倍",
+        })
+    book["last_run"] = slot
+    book["rules"] = rule_id
+    book["trades"] = book["trades"][-200:]
+    return book
 
 def paper_rebalance(book, signals, kind):
     today = date.today().isoformat()
@@ -1946,7 +2077,7 @@ def apply_shocks(books, price_fn=None):
                 if close_position(book, ticker, price, f"重大消息：{zh}", today):
                     book.setdefault("seen", []).append(key)
                     book["seen"] = book["seen"][-80:]
-                    acted.append(f"{'自选' if name == 'watch' else '择股' if name == 'edge' else '全市场'} {show_symbol(ticker)} 卖出 · {zh}")
+                    acted.append(f"{'自选' if name == 'watch' else '择股' if name == 'edge' else '加密' if name == 'crypto' else '全市场'} {show_symbol(ticker)} 平仓 · {zh}")
     return acted
 
 def _monitor_loop():
@@ -1960,8 +2091,12 @@ def _monitor_loop():
                     continue
                 if not isinstance(books, dict) or "watch" not in books:
                     continue
+                books.setdefault("crypto", empty_paper())
+                before = json.dumps(books.get("crypto"), sort_keys=True, default=str)
+                crypto_rebalance(books["crypto"], crypto_market_rows())
                 acted = apply_shocks(books)
-                if not acted:
+                after = json.dumps(books.get("crypto"), sort_keys=True, default=str)
+                if not acted and before == after:
                     continue
                 books["updated"] = datetime.now().isoformat(timespec="seconds")
                 PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False))
@@ -1997,10 +2132,11 @@ def book_snapshot(book, signals):
     for ticker, pos in book.get("positions", {}).items():
         price = float(prices.get(ticker) or pos.get("cost") or 0)
         cost = float(pos.get("cost") or 0)
+        side = pos.get("side") or "多"
         shares = float(pos.get("shares") or 0)
+        pnl = (price - cost) * shares if side != "空" else (cost - price) * shares
+        margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
         value = shares * price
-        pnl = value - shares * cost
-        market_value += value
         unreal += pnl
         positions.append({
             "ticker": ticker,
@@ -2009,11 +2145,14 @@ def book_snapshot(book, signals):
             "price": price,
             "value": value,
             "pnl": pnl,
+            "margin": margin,
+            "side": side,
+            "leverage": pos.get("leverage") or 1,
             "horizon": pos.get("horizon") or "日",
         })
-    realized = sum(float(trade.get("pnl") or 0) for trade in book.get("trades") or [] if trade.get("side") == "卖")
-    equity = float(book.get("cash") or 0) + market_value
-    return equity, market_value, unreal, realized, positions
+    realized = sum(float(trade.get("pnl") or 0) for trade in book.get("trades") or [] if trade.get("side") in ("卖", "平空"))
+    equity = float(book.get("cash") or 0) + sum(item["margin"] + item["pnl"] for item in positions)
+    return equity, sum(item["value"] for item in positions), unreal, realized, positions
 
 def render_win_rate(books, book_key):
     n, wins, by_h = win_record({"one": books[book_key]})
@@ -2052,8 +2191,15 @@ def render_holding(book_key, book, signals):
     if not pos:
         st.info("这笔仓位已经平掉了。")
     else:
-        pnl_pct = (pos["pnl"] / (pos["shares"] * pos["cost"]) * 100) if pos["shares"] and pos["cost"] else 0
+        basis = pos.get("margin") or (pos["shares"] * pos["cost"])
+        pnl_pct = (pos["pnl"] / basis * 100) if basis else 0
         klass = money_class(pos["pnl"])
+        lev = int(pos.get("leverage") or 1)
+        hold_text = (
+            f"{pos.get('side') or '多'} · {lev} 倍 · 15 分钟 · {fmt_qty(pos['shares'])}"
+            if book_key == "crypto"
+            else f"{pos['horizon']}线开的仓 · {fmt_qty(pos['shares'])} 股"
+        )
         st.markdown(
             f'<div class="bn-name">总价值</div>'
             f'<div class="bn-last">${pos["value"]:,.2f}</div>'
@@ -2062,7 +2208,7 @@ def render_holding(book_key, book, signals):
             f'<div><span>市价</span><b>${fmt_px(pos["price"])}</b></div>'
             f'<div><span>未实现盈亏</span><b class="{klass}">{pos["pnl"]:+,.2f}<br>{pnl_pct:+.2f}%</b></div>'
             f'</div>'
-            f'<div class="bn-name">{html.escape(pos["horizon"])}线开的仓 · {fmt_qty(pos["shares"])} 股</div>',
+            f'<div class="bn-name">{html.escape(hold_text)}</div>',
             unsafe_allow_html=True,
         )
     st.markdown('<div class="section-title" style="margin-top:18px;">历史记录</div>', unsafe_allow_html=True)
@@ -2083,6 +2229,8 @@ def render_holding(book_key, book, signals):
 def render_book_list(book_key, book, signals):
     equity, market_value, unreal, realized, positions = book_snapshot(book, signals)
     shown, rule = render_win_rate(load_books(), book_key)
+    if book_key == "crypto":
+        rule = "15 分钟做多或做空，杠杆不超过 10 倍。"
     total_pnl = unreal + realized
     st.markdown(
         f'<div class="bn-name">总资产 · 美元</div>'
@@ -2104,17 +2252,20 @@ def render_book_list(book_key, book, signals):
         unsafe_allow_html=True,
     )
     if not positions:
-        st.caption("今天没有符合条件的股票，现金还在。")
+        st.caption("这一轮没有符合条件的币，现金还在。" if book_key == "crypto" else "今天没有符合条件的股票，现金还在。")
         return
     for pos in sorted(positions, key=lambda item: item["value"], reverse=True):
         ticker = pos["ticker"]
-        pnl_pct = (pos["pnl"] / (pos["shares"] * pos["cost"]) * 100) if pos["shares"] and pos["cost"] else 0
+        basis = pos.get("margin") or (pos["shares"] * pos["cost"])
+        pnl_pct = (pos["pnl"] / basis * 100) if basis else 0
         klass = money_class(pos["pnl"])
+        lev = int(pos.get("leverage") or 1)
+        tag = f"{pos.get('side') or '多'} · {lev}倍" if book_key == "crypto" else f"{pos['horizon']}线"
         st.markdown(
             f'<a class="asset-row" href="?view=paper&book={book_key}&hold={quote(ticker)}" target="_self">'
             f'{logo_html(ticker, "", 36)}'
             f'<span class="asset-mid"><b>{html.escape(show_symbol(ticker))}</b>'
-            f'<i>{html.escape(pretty_name(ticker))} · {html.escape(pos["horizon"])}线</i>'
+            f'<i>{html.escape(pretty_name(ticker))} · {html.escape(tag)}</i>'
             f'<i class="{klass}">未实现盈亏 {pos["pnl"]:+,.2f} ({pnl_pct:+.2f}%)</i></span>'
             f'<span class="asset-right"><b>{fmt_qty(pos["shares"])}</b><i>${pos["value"]:,.2f}</i></span></a>',
             unsafe_allow_html=True,
@@ -2137,7 +2288,13 @@ def book_equity(book, signals):
     prices = {row["ticker"]: row["price"] for row in signals}
     equity = float(book.get("cash") or 0)
     for ticker, pos in book.get("positions", {}).items():
-        equity += pos["shares"] * float(prices.get(ticker) or pos.get("cost") or 0)
+        price = float(prices.get(ticker) or pos.get("cost") or 0)
+        shares = float(pos.get("shares") or 0)
+        cost = float(pos.get("cost") or 0)
+        side = pos.get("side") or "多"
+        pnl = (price - cost) * shares if side != "空" else (cost - price) * shares
+        margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
+        equity += margin + pnl
     return equity
 
 def render_paper():
@@ -2152,6 +2309,7 @@ def render_paper():
         f'<a class="{"on" if key == "watch" else ""}" href="?view=paper&book=watch" target="_self">自选</a>'
         f'<a class="{"on" if key == "market" else ""}" href="?view=paper&book=market" target="_self">全市场</a>'
         f'<a class="{"on" if key == "edge" else ""}" href="?view=paper&book=edge" target="_self">择股</a>'
+        f'<a class="{"on" if key == "crypto" else ""}" href="?view=paper&book=crypto" target="_self">加密</a>'
         f'</div>'
     )
     st.markdown(tabs, unsafe_allow_html=True)
@@ -2164,7 +2322,7 @@ def render_paper():
     ):
         signals = st.session_state.paper_signals
     else:
-        with st.spinner("正在检查三笔模拟仓"):
+        with st.spinner("正在检查模拟仓"):
             watch_rows = paper_signals(st.session_state.watchlist)
             ranked = rank_universe(MARKET)
             market_rows = []
@@ -2196,12 +2354,16 @@ def render_paper():
         st.session_state.paper_signals = signals
         st.session_state.paper_board_at = time.time()
         st.session_state.paper_watch_key = paper_key
-    paper_rebalance(books["watch"], watch_rows, "watch")
-    paper_rebalance(books["market"], market_rows, "market")
-    paper_rebalance(books["edge"], market_rows, "edge")
+    crypto_rows = crypto_market_rows()
+    signals = dict(signals)
+    signals["crypto"] = crypto_rows
+    paper_rebalance(books["watch"], signals.get("watch") or [], "watch")
+    paper_rebalance(books["market"], signals.get("market") or [], "market")
+    paper_rebalance(books["edge"], signals.get("edge") or [], "edge")
+    crypto_rebalance(books["crypto"], crypto_rows)
     apply_shocks(books)
     save_books(books)
-    equities = {name: book_equity(books[name], signals[name]) for name in ("watch", "market", "edge")}
+    equities = {name: book_equity(books[name], signals.get(name) or []) for name in ("watch", "market", "edge", "crypto")}
     st.caption(
         "累计盈亏对照：自选 "
         + f"{equities['watch'] - PAPER_CASH:+,.0f}"
@@ -2209,6 +2371,8 @@ def render_paper():
         + f"{equities['market'] - PAPER_CASH:+,.0f}"
         + " · 择股 "
         + f"{equities['edge'] - PAPER_CASH:+,.0f}"
+        + " · 加密 "
+        + f"{equities['crypto'] - PAPER_CASH:+,.0f}"
     )
     held = paper_hold and (
         paper_hold in books[key]["positions"]
@@ -2220,6 +2384,8 @@ def render_paper():
         render_book_list(key, books[key], signals[key])
         if key == "edge":
             st.caption("择股不看页面上的评级。我在股票池里自己挑：近一年涨得多、而且还在 200 日均线上面的，最多拿 6 只，单只大约一成到一成八。跌破成本 12%，或者跌破均线，就卖掉。只为多赚钱，不保证一定超过另外两笔。")
+        elif key == "crypto":
+            st.caption("加密仓看整个币池的 15 分钟线。趋势向上就做多，向下就做空。杠杆 2 到 10 倍，波动越大倍数越低。保证金最多用六成，亏到保证金的八成就平仓。")
         else:
             st.caption("持仓检查：" + sleeve_report(books[key], signals[key]))
     paper_monitor()
@@ -2227,7 +2393,7 @@ def render_paper():
         books[key] = empty_paper()
         save_books(books)
         st.rerun()
-    st.caption("三笔各 100 万美元。日线、周线的 30% 和 60% 只是上限。没有佣金，不是下单建议。")
+    st.caption("四笔各 100 万美元。加密仓可以做空，杠杆不超过 10 倍，每 15 分钟检查一次。没有佣金，不是下单建议。")
 
 def paper_entry():
     books = load_books()
@@ -2235,7 +2401,7 @@ def paper_entry():
     shown = f"{wins / n * 100:.0f}%" if n else "—"
     st.markdown(
         f'<a class="paper-entry" href="?view=paper" target="_self">'
-        f'<span class="paper-entry-main"><b>模拟仓</b><i>点这里进入 · 三笔各 100 万美元</i></span>'
+        f'<span class="paper-entry-main"><b>模拟仓</b><i>点这里进入 · 四笔各 100 万美元</i></span>'
         f'<span class="paper-entry-rate"><em>胜率</em><strong>{shown}</strong></span></a>',
         unsafe_allow_html=True,
     )
