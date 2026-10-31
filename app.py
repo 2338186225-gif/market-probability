@@ -2284,6 +2284,10 @@ def close_position(book, ticker, price, reason, today):
         "pnl": round(net, 2),
         "fee": round(fee, 2),
     })
+    if (pos.get("horizon") or "") == "15分":
+        book.setdefault("no_reentry", {})[ticker] = crypto_bar_slot()
+    else:
+        book.setdefault("no_reentry", {})[ticker] = cn_now().date().isoformat()
     return True
 
 EDGE_SKIP = {"SOXL", "KORU", "TQQQ", "SQQQ", "UVXY", "SOXS", "LABU", "LABD", "DRAM"}
@@ -2379,6 +2383,32 @@ def crypto_marks():
         cache["rows"] = out
     return out or cache["rows"]
 
+def crypto_signal(close):
+    """只判断方向和倍数，不管能不能下、下多少。"""
+    if close is None or len(close) < 60:
+        return None
+    price = float(close.iloc[-1])
+    ma20 = float(close.tail(20).mean())
+    ma60 = float(close.tail(60).mean())
+    ret4 = float(close.iloc[-1] / close.iloc[-5] - 1) if float(close.iloc[-5]) else 0.0
+    rets = np.log(close / close.shift(1)).dropna().tail(32)
+    bar_vol = float(rets.std()) if len(rets) else 0.0
+    side = None
+    if price > ma20 > ma60 and ret4 > 0.0015:
+        side = "多"
+    elif price < ma20 < ma60 and ret4 < -0.0015:
+        side = "空"
+    if bar_vol <= 0:
+        lev = 2
+    else:
+        strength = min(4.0, abs(ret4) / bar_vol)
+        lev = int(min(10, max(2, round(strength * 2))))
+        if bar_vol > 0.02:
+            lev = min(lev, 4)
+        if bar_vol > 0.035:
+            lev = min(lev, 2)
+    return {"price": price, "side": side, "leverage": lev, "ret": ret4, "vol": bar_vol}
+
 def crypto_market_rows():
     cache = globals().setdefault("_CRYPTO_15M", {"at": 0, "rows": []})
     if cache["rows"] and time.time() - cache["at"] < 180:
@@ -2391,32 +2421,12 @@ def crypto_market_rows():
                 return None
             hist = binance_klines(symbol, "15m", 80)
             close = hist["Close"].dropna() if hist is not None and not hist.empty else None
-            if close is None or len(close) < 60:
+            sig = crypto_signal(close)
+            if not sig:
                 return None
-            price = float(close.iloc[-1])
-            ma20 = float(close.tail(20).mean())
-            ma60 = float(close.tail(60).mean())
-            ret4 = float(close.iloc[-1] / close.iloc[-5] - 1)
-            rets = np.log(close / close.shift(1)).dropna().tail(32)
-            bar_vol = float(rets.std()) if len(rets) else 0.0
-            side = None
-            if price > ma20 > ma60 and ret4 > 0.0015:
-                side = "多"
-            elif price < ma20 < ma60 and ret4 < -0.0015:
-                side = "空"
-            if bar_vol <= 0:
-                lev = 2
-            else:
-                strength = min(4.0, abs(ret4) / bar_vol)
-                lev = int(min(10, max(2, round(strength * 2))))
-                if bar_vol > 0.02:
-                    lev = min(lev, 4)
-                if bar_vol > 0.035:
-                    lev = min(lev, 2)
-            return {
-                "ticker": ticker, "price": price, "side": side, "leverage": lev,
-                "ret": ret4, "vol": bar_vol, "horizons": {},
-            }
+            sig["ticker"] = ticker
+            sig["horizons"] = {}
+            return sig
         except Exception:
             return None
 
@@ -2455,6 +2465,45 @@ def crypto_bar_slot():
     floored = now.replace(minute=minute, second=0, microsecond=0)
     return floored.strftime("%Y-%m-%d %H:%M") + " +08"
 
+def entry_allowed(book, ticker, slot, vol=None, vol_cap=None):
+    """风控只回答能不能开，不负责方向。"""
+    if position_blocked(book, ticker):
+        return False
+    if str((book.get("no_reentry") or {}).get(ticker) or "") == str(slot):
+        return False
+    if vol_cap is not None and vol is not None and float(vol) > vol_cap:
+        return False
+    halt = book.get("halt_until")
+    if halt:
+        try:
+            then = datetime.fromisoformat(str(halt))
+            if then.tzinfo is None:
+                then = then.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+            if cn_now() < then:
+                return False
+        except Exception:
+            pass
+    return True
+
+def note_drawdown(book, equity):
+    equity = float(equity or 0)
+    peak = float(book.get("peak") or 0)
+    if equity > peak:
+        book["peak"] = equity
+        peak = equity
+    if peak > 0 and equity < peak * 0.85:
+        book["halt_until"] = (cn_now() + timedelta(hours=24)).isoformat()
+        return True
+    return False
+
+def order_margin(equity, cash, used, lev, sleeve=0.6, name=0.15):
+    lev = max(float(lev or 1), 1.0)
+    room = float(equity) * sleeve - float(used)
+    margin = min(float(cash), room, float(equity) * min(name, 0.8 / lev))
+    if margin < max(1000, float(equity) * 0.02):
+        return 0.0
+    return margin
+
 def crypto_rebalance(book, rows):
     slot = crypto_bar_slot()
     rule_id = "crypto-15m-v3"
@@ -2471,20 +2520,21 @@ def crypto_rebalance(book, rows):
         pnl = (price - cost) * shares if side != "空" else (cost - price) * shares
         margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
         equity += margin + pnl
+    note_drawdown(book, equity)
     ranked = [row for row in rows if row.get("side") and row.get("price")]
     ranked.sort(key=lambda row: abs(row.get("ret") or 0) / max(row.get("vol") or 1e-6, 1e-6), reverse=True)
+    slot_key = crypto_bar_slot()
     for row in ranked:
-        if len(book["positions"]) >= 4 or row["ticker"] in book["positions"] or position_blocked(book, row["ticker"]):
+        if len(book["positions"]) >= 4 or row["ticker"] in book["positions"]:
             continue
-        if row.get("vol") and row["vol"] > 0.05:
+        if not entry_allowed(book, row["ticker"], slot_key, row.get("vol"), 0.05):
             continue
         lev = int(min(10, max(2, row.get("leverage") or 2)))
         used = 0.0
         for pos in book["positions"].values():
             used += float(pos["margin"]) if pos.get("margin") is not None else float(pos.get("shares") or 0) * float(pos.get("cost") or 0)
-        room = equity * 0.6 - used
-        margin = min(float(book["cash"]), room, equity * min(0.15, 0.8 / lev))
-        if margin < max(1000, equity * 0.02):
+        margin = order_margin(equity, book["cash"], used, lev)
+        if margin <= 0:
             continue
         price = float(row["price"])
         shares = (margin * lev) / price
@@ -2511,6 +2561,124 @@ def crypto_rebalance(book, rows):
     book["rules"] = rule_id
     book["trades"] = book["trades"][-200:]
     return book
+
+def crypto_rule_backtest(limit=500):
+    """同一套进场、仓位和风控，放到最近的 15 分钟 K 线上走一遍。不含新闻。"""
+    cache = globals().setdefault("_CRYPTO_BT", {"at": 0, "row": None})
+    if cache["row"] and time.time() - cache["at"] < 3600:
+        return cache["row"]
+
+    def load(ticker):
+        symbol = binance_symbol(ticker)
+        if not symbol:
+            return None
+        try:
+            hist = binance_klines(symbol, "15m", limit)
+        except Exception:
+            return None
+        if hist is None or hist.empty or "Close" not in hist:
+            return None
+        return ticker, hist["Close"].dropna()
+
+    frames = {}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        for item in executor.map(load, CRYPTO_MARKET):
+            if item:
+                frames[item[0]] = item[1]
+    if len(frames) < 3:
+        return None
+    index = None
+    for series in frames.values():
+        index = series.index if index is None else index.intersection(series.index)
+    index = index.sort_values()
+    if len(index) < 80:
+        return None
+    closes = {ticker: series.reindex(index) for ticker, series in frames.items()}
+    cash = PAPER_CASH
+    positions = {}
+    closed = []
+    peak = cash
+    max_dd = 0.0
+    no_reentry = {}
+    for i in range(60, len(index)):
+        slot = str(index[i])
+        sigs = {}
+        for ticker, series in closes.items():
+            sig = crypto_signal(series.iloc[: i + 1])
+            if sig:
+                sigs[ticker] = sig
+        equity = cash
+        for ticker, pos in positions.items():
+            price = float(closes[ticker].iloc[i])
+            margin, pnl = position_margin_pnl(pos, price)
+            equity += margin + pnl
+        peak = max(peak, equity)
+        if peak:
+            max_dd = max(max_dd, (peak - equity) / peak)
+        halted = equity < peak * 0.85 if peak else False
+        for ticker in list(positions):
+            pos = positions[ticker]
+            price = float(closes[ticker].iloc[i])
+            margin, pnl = position_margin_pnl(pos, price)
+            if not margin or pnl > -0.4 * margin:
+                continue
+            fee = commission(ticker, pos["shares"] * price)
+            cash += margin + pnl - fee
+            net = pnl - fee - float(pos.get("fee") or 0)
+            closed.append(net > 0)
+            no_reentry[ticker] = slot
+            del positions[ticker]
+        if halted:
+            continue
+        ranked = []
+        for ticker, sig in sigs.items():
+            if sig.get("side"):
+                ranked.append((abs(sig.get("ret") or 0) / max(sig.get("vol") or 1e-6, 1e-6), ticker, sig))
+        ranked.sort(reverse=True)
+        for _, ticker, sig in ranked:
+            if ticker in positions or len(positions) >= 4 or no_reentry.get(ticker) == slot:
+                continue
+            if sig.get("vol") and sig["vol"] > 0.05:
+                continue
+            used = sum(float(pos.get("margin") or 0) for pos in positions.values())
+            equity = cash
+            for held, pos in positions.items():
+                margin, pnl = position_margin_pnl(pos, float(closes[held].iloc[i]))
+                equity += margin + pnl
+            lev = int(min(10, max(2, sig.get("leverage") or 2)))
+            margin = order_margin(equity, cash, used, lev)
+            price = float(sig["price"])
+            if margin <= 0 or price <= 0:
+                continue
+            notional = margin * lev
+            fee = commission(ticker, notional)
+            if cash < margin + fee:
+                continue
+            if abs(float(sig.get("ret") or 0)) <= (fee * 2 / notional) * 1.5:
+                continue
+            cash -= margin + fee
+            shares = notional / price
+            positions[ticker] = {
+                "shares": shares, "cost": price, "side": sig["side"],
+                "leverage": lev, "margin": margin, "fee": fee,
+            }
+    equity = cash
+    for ticker, pos in positions.items():
+        margin, pnl = position_margin_pnl(pos, float(closes[ticker].iloc[-1]))
+        equity += margin + pnl
+    wins = sum(1 for item in closed if item)
+    result = {
+        "trades": len(closed),
+        "wins": wins,
+        "win_rate": (wins / len(closed)) if closed else None,
+        "ret": equity / PAPER_CASH - 1,
+        "max_dd": max_dd,
+        "open": len(positions),
+        "bars": len(index) - 60,
+    }
+    cache["at"] = time.time()
+    cache["row"] = result
+    return result
 
 def paper_rebalance(book, signals, kind):
     today = cn_now().date().isoformat()
@@ -2579,6 +2747,7 @@ def paper_rebalance(book, signals, kind):
         return total
 
     equity = book_equity_now()
+    note_drawdown(book, equity)
     caps = {"日": 0.30, "周": 0.60, "月": 0.80, "动量": 0.70}
     for horizon, cap in caps.items():
         if kind == "edge" and horizon != "动量":
@@ -2619,7 +2788,9 @@ def paper_rebalance(book, signals, kind):
         ranked.sort(key=lambda item: (0 if item[0] == "多" else 1, {"月": 0, "周": 1, "日": 2}.get(item[1], 3), -(item[3].get("score") or -999)))
 
     for side, horizon, lev, row in ranked:
-        if len(book["positions"]) >= slots or row["ticker"] in book["positions"] or position_blocked(book, row["ticker"]):
+        if len(book["positions"]) >= slots or row["ticker"] in book["positions"]:
+            continue
+        if not entry_allowed(book, row["ticker"], cn_now().date().isoformat()):
             continue
         price = float(row["price"])
         if side == "多" and horizon == "日":
@@ -3353,7 +3524,32 @@ def render_paper():
         if key == "edge":
             st.caption("择股自己挑。站上 200 日均线且近一年上涨的做多，跌破均线且近一年下跌的做空。杠杆 2 到 10 倍，波动越大倍数越低。最多 6 只。")
         elif key == "crypto":
-            st.caption("加密仓看 15 分钟线。做多做空，杠杆 2 到 10 倍。新闻先解读方向：利空不把空单平掉，方向相反才改仓。浮亏到保证金四成会自查离场，12 小时内不再开回。")
+            halted = ""
+            halt = books[key].get("halt_until")
+            if halt:
+                try:
+                    then = datetime.fromisoformat(str(halt))
+                    if then.tzinfo is None:
+                        then = then.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                    if cn_now() < then:
+                        halted = "总资产离开高点超过 15%，24 小时内不再开新仓。"
+                except Exception:
+                    halted = ""
+            st.caption("方向、下多少、能不能下是分开的。同一根 15 分钟平掉后不再开回。浮亏到保证金四成才止损，并冷却 12 小时。" + halted)
+            if st.button("回测这条加密规则", key="bt_crypto"):
+                with st.spinner("用最近约 500 根 15 分钟 K 线回测，不含新闻"):
+                    st.session_state.crypto_bt = crypto_rule_backtest()
+                    st.session_state.crypto_bt_tried = st.session_state.crypto_bt is None
+            row = st.session_state.get("crypto_bt")
+            if isinstance(row, dict) and row.get("trades") is not None:
+                rate = "暂无已平仓" if row.get("win_rate") is None else f"{row['win_rate'] * 100:.0f}%"
+                st.caption(
+                    f"回测 {row['bars']} 根：已平 {row['trades']} 笔，胜率 {rate}，"
+                    f"收益率 {row['ret'] * 100:+.1f}%，最大回撤 {row['max_dd'] * 100:.1f}%，"
+                    f"结束时仍持有 {row['open']} 笔。这是历史模拟，不是之后的收益。"
+                )
+            elif row is None and st.session_state.get("crypto_bt_tried"):
+                st.caption("这轮回测没有拿到足够的 K 线。")
         else:
             st.caption("持仓检查：" + sleeve_report(books[key], signals[key]))
     paper_monitor()
