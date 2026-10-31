@@ -1699,7 +1699,8 @@ def close_position(book, ticker, price, reason, today):
 
 def paper_rebalance(book, signals, kind):
     today = date.today().isoformat()
-    if book.get("last_run") == today:
+    rule_id = "market-cap-v1" if kind == "market" else "watch-v1"
+    if book.get("last_run") == today and book.get("rules") == rule_id:
         return book
     books = load_books()
     n, wins, _ = win_record(books)
@@ -1726,18 +1727,74 @@ def paper_rebalance(book, signals, kind):
     for ticker, pos in book["positions"].items():
         price = (by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0
         equity += pos["shares"] * float(price)
+    if kind == "market":
+        for horizon, cap in (("日", 0.30), ("周", 0.60)):
+            while True:
+                held = []
+                for ticker, pos in book["positions"].items():
+                    if (pos.get("horizon") or "日") != horizon:
+                        continue
+                    px = float((by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0)
+                    held.append((pos["shares"] * px, ticker, px))
+                total = sum(item[0] for item in held)
+                if total <= equity * cap + 1 or not held:
+                    break
+                value, ticker, px = max(held)
+                if px <= 0:
+                    break
+                overflow = total - equity * cap
+                cut = min(int(book["positions"][ticker]["shares"]), max(1, int(overflow // px)))
+                if cut >= book["positions"][ticker]["shares"]:
+                    close_position(book, ticker, px, f"{horizon}线仓位超过总资产 {int(cap*100)}%，减回上限", today)
+                else:
+                    book["positions"][ticker]["shares"] -= cut
+                    book["cash"] += cut * px
+                    cost = float(book["positions"][ticker].get("cost") or 0)
+                    book["trades"].append({
+                        "date": today, "side": "卖", "ticker": ticker, "shares": cut,
+                        "price": round(px, 4), "horizon": horizon,
+                        "reason": f"{horizon}线仓位超过总资产 {int(cap*100)}%，减回上限",
+                        "win": px > cost, "pnl": round((px - cost) * cut, 2),
+                    })
+                equity = book["cash"]
+                for ticker, pos in book["positions"].items():
+                    px = float((by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0)
+                    equity += pos["shares"] * float(px)
     slot = equity / PAPER_SLOTS if PAPER_SLOTS else equity
+    caps = {"日": 0.30, "周": 0.60, "月": 1.0}
+    each = {"日": 0.10, "周": 0.15, "月": 0.20}
     ranked = []
     for row in signals:
         horizon = best_horizon(row, n, wins)
         if horizon:
             ranked.append((horizon, row))
-    ranked.sort(key=lambda pair: pair[1].get("score") if pair[1].get("score") is not None else -999, reverse=True)
+    if kind == "market":
+        ranked.sort(key=lambda pair: ({"月": 0, "周": 1, "日": 2}[pair[0]], -(pair[1].get("score") or -999)))
+    else:
+        ranked.sort(key=lambda pair: pair[1].get("score") if pair[1].get("score") is not None else -999, reverse=True)
+
+    def sleeve_value(horizon):
+        total = 0.0
+        for ticker, pos in book["positions"].items():
+            if (pos.get("horizon") or "日") != horizon:
+                continue
+            price = (by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0
+            total += pos["shares"] * float(price)
+        return total
+
     for horizon, row in ranked:
         if len(book["positions"]) >= PAPER_SLOTS or row["ticker"] in book["positions"]:
             continue
         price = float(row["price"])
-        shares = int(min(slot, book["cash"]) // price)
+        if kind == "market":
+            up = row.get("up_prob")
+            if horizon == "日" and up is not None and up < 0.55:
+                continue
+            room = equity * caps[horizon] - sleeve_value(horizon)
+            budget = min(book["cash"], equity * each[horizon], room)
+        else:
+            budget = min(slot, book["cash"])
+        shares = int(budget // price) if budget > 0 else 0
         if shares <= 0:
             continue
         book["cash"] -= shares * price
@@ -1748,6 +1805,7 @@ def paper_rebalance(book, signals, kind):
             "reason": f"{horizon}线{row['horizons'][horizon]['label']}，综合{row.get('label')} {row.get('score')}",
         })
     book["last_run"] = today
+    book["rules"] = rule_id
     book["trades"] = book["trades"][-200:]
     return book
 
@@ -1854,7 +1912,7 @@ def render_holding(book_key, book, signals):
     pos = snap.get(ticker)
     name = pretty_name(ticker)
     back = f"?view=paper&book={book_key}"
-    st.markdown(f'<a class="watch-link" href="{back}">返回模拟仓</a>', unsafe_allow_html=True)
+    st.markdown(f'<a class="watch-link" href="{back}" target="_self">返回模拟仓</a>', unsafe_allow_html=True)
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:10px;margin:12px 0;">{logo_html(ticker, "", 40)}'
         f'<div><div class="bn-symbol">{html.escape(show_symbol(ticker))}</div>'
@@ -1909,7 +1967,7 @@ def render_book_list(book_key, book, signals):
     )
     cash = float(book.get("cash") or 0)
     st.markdown(
-        f'<a class="asset-row" href="?view=paper&book={book_key}">'
+        f'<a class="asset-row" href="?view=paper&book={book_key}" target="_self">'
         f'<span class="logo-fallback" style="width:36px;height:36px;background:#1677ff;color:#fff;">$</span>'
         f'<span class="asset-mid"><b>现金</b><i>美元</i></span>'
         f'<span class="asset-right"><b>{cash:,.2f}</b><i>未投入</i></span></a>',
@@ -1923,7 +1981,7 @@ def render_book_list(book_key, book, signals):
         pnl_pct = (pos["pnl"] / (pos["shares"] * pos["cost"]) * 100) if pos["shares"] and pos["cost"] else 0
         klass = money_class(pos["pnl"])
         st.markdown(
-            f'<a class="asset-row" href="?view=paper&book={book_key}&hold={quote(ticker)}">'
+            f'<a class="asset-row" href="?view=paper&book={book_key}&hold={quote(ticker)}" target="_self">'
             f'{logo_html(ticker, "", 36)}'
             f'<span class="asset-mid"><b>{html.escape(show_symbol(ticker))}</b>'
             f'<i>{html.escape(pretty_name(ticker))} · {html.escape(pos["horizon"])}线</i>'
@@ -1938,8 +1996,8 @@ def render_paper():
     other = "market" if key == "watch" else "watch"
     tabs = (
         f'<div class="paper-tabs">'
-        f'<a class="{"on" if key == "watch" else ""}" href="?view=paper&book=watch">自选</a>'
-        f'<a class="{"on" if key == "market" else ""}" href="?view=paper&book=market">全市场</a>'
+        f'<a class="{"on" if key == "watch" else ""}" href="?view=paper&book=watch" target="_self">自选</a>'
+        f'<a class="{"on" if key == "market" else ""}" href="?view=paper&book=market" target="_self">全市场</a>'
         f'</div>'
     )
     st.markdown(tabs, unsafe_allow_html=True)
@@ -1969,14 +2027,14 @@ def render_paper():
         books[key] = empty_paper()
         save_books(books)
         st.rerun()
-    st.caption("另一笔是" + ("全市场" if other == "market" else "自选") + "，点上面的标签切换。各 100 万美元。没有佣金，不是下单建议。")
+    st.caption("另一笔是" + ("全市场" if other == "market" else "自选") + "，点上面的标签切换。各 100 万美元。全市场这笔：日线合计不超过总资产 30%，单只大约一成；周线合计不超过 60%，单只大约一成五；月线优先买，用来放主要仓位。没有佣金，不是下单建议。")
 
 def paper_entry():
     books = load_books()
     n, wins, _ = win_record(books)
     shown = f"{wins / n * 100:.0f}%" if n else "—"
     st.markdown(
-        f'<a class="paper-entry" href="?view=paper">'
+        f'<a class="paper-entry" href="?view=paper" target="_self">'
         f'<span class="paper-entry-main"><b>模拟仓</b><i>点这里进入 · 自选和全市场各 100 万美元</i></span>'
         f'<span class="paper-entry-rate"><em>胜率</em><strong>{shown}</strong></span></a>',
         unsafe_allow_html=True,
@@ -2141,7 +2199,7 @@ if st.session_state.selected_ticker:
                     summary = html.escape(item["summary"])
                     meta = " · ".join(part for part in (item["source"], item["time"]) if part)
                     link = html.escape(item["link"], quote=True)
-                    body = f'<a href="{link}" target="_blank">{title}</a>' if link else title
+                    body = f'<a href="{link}" target="_self">{title}</a>' if link else title
                     extra = f'<div class="muted" style="margin-top:4px;">{summary}</div>' if summary else ""
                     st.markdown(
                         f'<div class="news-item">{body}<div class="muted">{meta}</div>{extra}</div>',
@@ -2235,15 +2293,15 @@ if st.session_state.selected_ticker:
 
                 st.markdown("### 财报链接")
                 yahoo_url = f"https://finance.yahoo.com/quote/{ticker}/financials"
-                st.markdown(f'<div class="link-box"><a href="{yahoo_url}" target="_blank">Yahoo Finance 财务报表</a></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="link-box"><a href="{yahoo_url}" target="_self">Yahoo Finance 财务报表</a></div>', unsafe_allow_html=True)
                 website = info.get("website")
                 if website:
-                    st.markdown(f'<div class="link-box"><a href="{website}" target="_blank">公司官网</a></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="link-box"><a href="{website}" target="_self">公司官网</a></div>', unsafe_allow_html=True)
                 if ticker.endswith(".HK"):
                     st.markdown('<div class="link-box">港股财报可前往港交所披露易查询</div>', unsafe_allow_html=True)
                 else:
                     sec_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={info.get('symbol', ticker)}&type=10-&dateb=&owner=include&count=10"
-                    st.markdown(f'<div class="link-box"><a href="{sec_url}" target="_blank">SEC EDGAR 财报查询（美股）</a></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="link-box"><a href="{sec_url}" target="_self">SEC EDGAR 财报查询（美股）</a></div>', unsafe_allow_html=True)
             except Exception as e:
                 st.info(f"财务数据暂不可用：{str(e)}")
 
@@ -2294,7 +2352,7 @@ if st.session_state.selected_ticker:
                 for item in headlines[:3]:
                     title = html.escape(item["title"])
                     link = html.escape(item["link"], quote=True)
-                    shown = f'<a href="{link}" target="_blank">{title}</a>' if link else title
+                    shown = f'<a href="{link}" target="_self">{title}</a>' if link else title
                     st.markdown(f'<div class="news-item">{shown}<div class="muted">{html.escape(item.get("time") or "")}</div></div>', unsafe_allow_html=True)
 
             flow_score = 0
@@ -2611,7 +2669,7 @@ else:
             on = active_sort == key
             href = "?sort=off" if on else f"?sort={key}"
             mark = " ↓" if on else ""
-            return f'<a class="sort-link{" on" if on else ""}" href="{href}">{label}{mark}</a>'
+            return f'<a class="sort-link{" on" if on else ""}" href="{href}" target="_self">{label}{mark}</a>'
 
         st.markdown(
             '<div class="qrow qhead-row"><div class="qgrid qhead">'
@@ -2662,8 +2720,8 @@ else:
                     amount=row["amount"] or None, score=row["score"],
                 )
             st.markdown(
-                f'<div class="qrow"><a class="row-hit" href="?ticker={quote(ticker)}">{body}</a>'
-                f'<a class="del-hit" href="?drop={quote(ticker)}">删除</a></div>',
+                f'<div class="qrow"><a class="row-hit" href="?ticker={quote(ticker)}" target="_self">{body}</a>'
+                f'<a class="del-hit" href="?drop={quote(ticker)}" target="_self">删除</a></div>',
                 unsafe_allow_html=True,
             )
 
@@ -2692,7 +2750,7 @@ else:
                 symbol, price, change_pct, label, name, website,
                 prefix=f"{index}. ", amount=amount, score=score,
             )
-            st.markdown(f'<div class="qrow"><a class="row-hit bare" href="?ticker={quote(symbol)}">{body}</a></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="qrow"><a class="row-hit bare" href="?ticker={quote(symbol)}" target="_self">{body}</a></div>', unsafe_allow_html=True)
 
     with news_col:
         st.markdown('<div class="board-head"><div class="section-title">市场要闻</div><div class="muted">自选</div></div>', unsafe_allow_html=True)
@@ -2707,7 +2765,7 @@ else:
             tag = html.escape(show_symbol(item["ticker"]))
             st.markdown(
                 f'<div style="padding:8px 0;border-bottom:1px solid #e7e9ee;">'
-                f'<a class="news-hit" href="{link}" target="_blank">{title}</a>'
+                f'<a class="news-hit" href="{link}" target="_self">{title}</a>'
                 f'<div class="muted" style="margin-top:3px;">{tag} · {when}</div></div>',
                 unsafe_allow_html=True,
             )
