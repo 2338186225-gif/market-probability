@@ -138,8 +138,12 @@ st.markdown("""
     .qhead-row > .qgrid { flex: 1 1 auto; min-width: 0; }
     .del-spacer { visibility: hidden; pointer-events: none; }
     .qhead .qleft { gap: 12px; }
-    a.sort-link, a.sort-link:hover { color: #8b919a; text-decoration: none; font-size: 12px; font-weight: 500; }
+    a.sort-link, a.sort-link:hover { color: #8b919a; text-decoration: none; font-size: 12px; font-weight: 500; cursor: pointer; }
     a.sort-link.on { color: #111827; font-weight: 700; }
+    iframe[height="0"] { height: 0 !important; min-height: 0 !important; border: 0 !important; display: block; }
+    .qhead .score-num a.sort-link, .qhead .px a.sort-link, .qhead .pct-h a.sort-link {
+        display: block; width: 100%; padding: 6px 0;
+    }
     .pct-h { text-align: right; }
     .qrow { display: flex; flex-wrap: nowrap; align-items: center; border-bottom: 1px solid #f2f3f5; }
     .qrow:hover { background: #fafafa; }
@@ -2866,34 +2870,38 @@ else:
 
         def sort_link(key, label):
             on = active_sort == key
+            href = "?sort=off" if on else f"?sort={key}"
             mark = " ↓" if on else ""
-            click = (
-                "event.preventDefault();event.stopPropagation();"
-                "(function(el){"
-                "var key=el.getAttribute('data-sort');"
-                "var head=el.closest('.qhead-row');"
-                "var box=head.closest('[data-testid=\"stElementContainer\"]')||head.closest('.element-container');"
-                "if(!box)return;"
-                "var parent=box.parentElement;"
-                "var nodes=Array.prototype.slice.call(parent.children).filter(function(n){"
-                "return n.querySelector&&n.querySelector('.qrow')&&!n.querySelector('.qhead-row');});"
-                "if(!parent._watchOrder)parent._watchOrder=nodes.slice();"
-                "var same=head.getAttribute('data-on')===key;"
-                "head.setAttribute('data-on',same?'':key);"
-                "var list=same?parent._watchOrder.slice():nodes.slice().sort(function(a,b){"
-                "var ra=a.querySelector('.qrow'),rb=b.querySelector('.qrow');"
-                "if(key==='name')return (ra.getAttribute('data-name')||'').localeCompare(rb.getAttribute('data-name')||'');"
-                "return (parseFloat(rb.getAttribute('data-'+key))||-999)-(parseFloat(ra.getAttribute('data-'+key))||-999);"
-                "});"
-                "list.forEach(function(n){parent.appendChild(n);});"
-                "Array.prototype.forEach.call(head.querySelectorAll('a.sort-link'),function(a){a.classList.remove('on');a.textContent=a.getAttribute('data-label');});"
-                "if(!same){el.classList.add('on');el.textContent=el.getAttribute('data-label')+' ↓';}"
-                "})(this);return false;"
-            )
             return (
                 f'<a class="sort-link{" on" if on else ""}" data-sort="{key}" data-label="{label}" '
-                f'href="#" target="_self" onclick="{html.escape(click, quote=True)}">{label}{mark}</a>'
+                f'href="{href}" target="_self">{label}{mark}</a>'
             )
+
+        import streamlit.components.v1 as components
+        components.html(
+            """
+            <script>
+            (function () {
+              var doc = window.parent.document;
+              if (doc._sortHook) return;
+              doc._sortHook = true;
+              doc.addEventListener("click", function (e) {
+                var node = e.target;
+                var link = node && node.closest ? node.closest("a.sort-link") : null;
+                if (!link) return;
+                e.preventDefault();
+                e.stopPropagation();
+                var key = link.getAttribute("data-sort");
+                var url = new URL(window.parent.location.href);
+                if (url.searchParams.get("sort") === key) url.searchParams.set("sort", "off");
+                else url.searchParams.set("sort", key);
+                window.parent.location.assign(url.pathname + "?" + url.searchParams.toString());
+              }, true);
+            })();
+            </script>
+            """,
+            height=0,
+        )
 
         st.markdown(
             '<div class="qrow qhead-row"><div class="qgrid qhead">'
