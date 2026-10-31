@@ -6,7 +6,11 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from urllib.parse import urlparse
+import html
+import urllib.request
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote, urlparse
 
 st.set_page_config(
     page_title="市场行情概率测算器",
@@ -87,7 +91,13 @@ st.markdown("""
         display: inline-block; margin-top: 10px; background: #f5f7fb; border-radius: 8px;
         padding: 6px 10px; color: #1f2329; font-weight: 680; font-size: 13px;
     }
-    .link-box { background: #f7f9fc; border: 1px solid #e7e9ee; border-radius: 10px; padding: 12px; margin: 8px 0; }
+    .news-item { padding: 12px 0; border-bottom: 1px solid #f0f1f4; }
+    .news-item a { color: #111827; font-weight: 700; text-decoration: none; line-height: 1.45; }
+    .news-item a:hover { color: #1677ff; }
+    .verdict { display: inline-block; margin-bottom: 8px; padding: 3px 8px; border-radius: 6px; font-size: 12px; font-weight: 750; }
+    .verdict-up { background: #e9f9f0; color: #047857; }
+    .verdict-mid { background: #f3f4f6; color: #374151; }
+    .verdict-down { background: #fdecec; color: #b91c1c; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -473,10 +483,69 @@ def build_earnings_note(stock, info):
                 lines.append("增速转负，更可能低于市场对持续增长的预期。")
             else:
                 lines.append("增速接近持平，更接近符合预期而不是明显超预期。")
+    take_line = None
+    if rev is not None and profit is not None and len(rev) > 1 and len(profit) > 1:
+        rev_qoq = pct_change(rev.iloc[0], rev.iloc[1])
+        profit_qoq = pct_change(profit.iloc[0], profit.iloc[1])
+        if rev_qoq is not None and profit_qoq is not None:
+            if rev_qoq > 0 and profit_qoq > 0:
+                take_line = "营收和净利润同时比上一季增加，这份最新财报本身偏正面。"
+            elif rev_qoq > 0 and profit_qoq < 0:
+                take_line = "营收在增加，但净利润下降，更像增收不增利，要看成本或投入是不是暂时加大。"
+            elif rev_qoq < 0 and profit_qoq < 0:
+                take_line = "营收和净利润一起走弱，市场通常会更看下一季指引，而不是这一季的绝对金额。"
+            else:
+                take_line = "营收放缓但利润改善，可能是在控成本，规模扩张则不如上一季。"
+    if take_line:
+        lines.append(take_line)
     if not lines:
         lines.append("这只标的暂时没有完整的季度财报，无法判断是否符合市场预期。")
     lines.append("以上解读依据公开财报和一致预期自动生成，不是投资建议。")
     return lines
+
+def earnings_view(stock, info):
+    lines = build_earnings_note(stock, info)
+    verdict, klass = "数据有限", "verdict-mid"
+    for line in lines:
+        if "高于市场预期" in line:
+            verdict, klass = "高于预期", "verdict-up"
+        elif "低于市场预期" in line:
+            verdict, klass = "低于预期", "verdict-down"
+        elif "基本符合" in line or "接近符合" in line or "接近持平" in line:
+            verdict, klass = "接近预期", "verdict-mid"
+    body = [line for line in lines if not line.startswith("以上解读")]
+    return verdict, klass, body
+
+def fetch_news(ticker, limit=6):
+    items = []
+    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote(ticker)}&region=US&lang=en-US"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            root = ET.fromstring(resp.read())
+        for node in root.findall("./channel/item"):
+            title = (node.findtext("title") or "").strip()
+            if not title:
+                continue
+            pub = (node.findtext("pubDate") or "").strip()
+            when = ""
+            if pub:
+                try:
+                    when = parsedate_to_datetime(pub).strftime("%m-%d %H:%M")
+                except Exception:
+                    when = pub[:16]
+            items.append({
+                "title": title,
+                "link": (node.findtext("link") or "").strip(),
+                "summary": (node.findtext("description") or "").strip(),
+                "time": when,
+                "source": "Yahoo Finance",
+            })
+            if len(items) >= limit:
+                break
+    except Exception:
+        items = []
+    return items
 
 def hist_vol_drift(close):
     log_returns = np.log(close / close.shift(1)).dropna()
@@ -656,14 +725,37 @@ if st.session_state.selected_ticker:
                 # 确保可交互缩放
                 fig.update_xaxes(rangeslider_visible=False)
                 st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
-                
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("市值", f"${info.get('marketCap', 0)/1e9:.1f}B" if info.get('marketCap') else "N/A")
-                c2.metric("市盈率", f"{info.get('trailingPE', 'N/A')}")
-                c3.metric("股息率", f"{(info.get('dividendYield') or 0)*100:.2f}%" if info.get('dividendYield') else "N/A")
-                c4.metric("52周高/低", f"{info.get('fiftyTwoWeekHigh','N/A')} / {info.get('fiftyTwoWeekLow','N/A')}")
+
+            st.markdown("### 最新相关新闻")
+            news = fetch_news(ticker)
+            if not news:
+                st.info("暂时没有拉到这只标的的新闻。")
+            else:
+                for item in news:
+                    title = html.escape(item["title"])
+                    summary = html.escape(item["summary"])
+                    meta = " · ".join(part for part in (item["source"], item["time"]) if part)
+                    link = html.escape(item["link"], quote=True)
+                    body = f'<a href="{link}" target="_blank">{title}</a>' if link else title
+                    extra = f'<div class="muted" style="margin-top:4px;">{summary}</div>' if summary else ""
+                    st.markdown(
+                        f'<div class="news-item">{body}<div class="muted">{meta}</div>{extra}</div>',
+                        unsafe_allow_html=True,
+                    )
+                st.caption("新闻来自 Yahoo Finance 英文源，点标题打开原文。")
         
         with tab2:
+            st.markdown("### 最新财报解读")
+            try:
+                verdict, klass, body = earnings_view(stock, info)
+                text = "<br>".join(html.escape(line) for line in body)
+                st.markdown(
+                    f'<div class="analysis-box"><span class="verdict {klass}">{verdict}</span><br>{text}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.caption("根据公开财报和一致预期自动整理，不是投研报告，也不构成投资建议。")
+            except Exception:
+                st.info("这份财报暂时解读不了。")
             st.markdown("### 近几个季度对比")
             try:
                 qdf = stock.quarterly_income_stmt
@@ -704,10 +796,6 @@ if st.session_state.selected_ticker:
                         st.info("有财报，但关键科目对不上。")
                 else:
                     st.info("暂无季度财报。ETF 和部分标的通常没有公司利润表。")
-
-                st.markdown("### 最新财报解读")
-                for line in build_earnings_note(stock, info):
-                    st.markdown(f"- {line}")
 
                 st.markdown("**全年关键指标**")
                 items = [
@@ -1000,42 +1088,36 @@ else:
     for ticker in st.session_state.watchlist:
         summary = get_stock_summary(ticker)
         with st.container(border=True):
-            if summary is None:
-                st.markdown(f'<div class="row-symbol">{show_symbol(ticker)}</div>', unsafe_allow_html=True)
-                st.caption("暂无行情")
-                continue
-            pill = "chg-up" if summary["change"] >= 0 else "chg-down"
-            sign = "+" if summary["change"] >= 0 else ""
-            name = pretty_name(summary["ticker"], summary.get("info"))
-            c_name, c_px, c_btn = st.columns([3.1, 1.5, 0.7], vertical_alignment="center")
+            c_name, c_px, c_open, c_del = st.columns([3.1, 1.35, 0.62, 0.62], vertical_alignment="center")
             with c_name:
-                st.markdown(
-                    f'<div style="display:flex;align-items:center;">'
-                    f'{logo_html(summary["ticker"], summary.get("website", ""), 36)}'
-                    f'<div><div class="row-symbol">{show_symbol(summary["ticker"])}</div>'
-                    f'<span class="row-name" title="{name}">{name}</span></div></div>',
-                    unsafe_allow_html=True,
-                )
+                if summary is None:
+                    st.markdown(f'<div class="row-symbol">{show_symbol(ticker)}</div><span class="row-name">暂无行情</span>', unsafe_allow_html=True)
+                else:
+                    name = pretty_name(summary["ticker"], summary.get("info"))
+                    st.markdown(
+                        f'<div style="display:flex;align-items:center;">'
+                        f'{logo_html(summary["ticker"], summary.get("website", ""), 36)}'
+                        f'<div><div class="row-symbol">{show_symbol(summary["ticker"])}</div>'
+                        f'<span class="row-name" title="{html.escape(name)}">{html.escape(name)}</span></div></div>',
+                        unsafe_allow_html=True,
+                    )
             with c_px:
-                st.markdown(
-                    f'<div class="row-px"><div class="px">{fmt_px(summary["price"])}</div>'
-                    f'<span class="chg-pill {pill}">{sign}{summary["change_pct"]:.2f}%</span></div>',
-                    unsafe_allow_html=True,
-                )
-            with c_btn:
+                if summary is not None:
+                    pill = "chg-up" if summary["change"] >= 0 else "chg-down"
+                    sign = "+" if summary["change"] >= 0 else ""
+                    st.markdown(
+                        f'<div class="row-px"><div class="px">{fmt_px(summary["price"])}</div>'
+                        f'<span class="chg-pill {pill}">{sign}{summary["change_pct"]:.2f}%</span></div>',
+                        unsafe_allow_html=True,
+                    )
+            with c_open:
                 if st.button("详情", key=f"view_{ticker}", use_container_width=True):
                     st.session_state.selected_ticker = ticker
                     st.rerun()
-
-    if st.session_state.watchlist:
-        remove_col1, remove_col2 = st.columns([6, 1])
-        with remove_col1:
-            labels = ["不移除"] + [show_symbol(item) for item in st.session_state.watchlist]
-            picked = st.selectbox("移除股票", labels, label_visibility="collapsed")
-        with remove_col2:
-            if picked != "不移除" and st.button("移除", use_container_width=True):
-                symbol = st.session_state.watchlist[labels.index(picked) - 1]
-                st.session_state.watchlist.remove(symbol)
-                st.rerun()
+            with c_del:
+                if st.button("删除", key=f"del_{ticker}", use_container_width=True):
+                    st.session_state.watchlist.remove(ticker)
+                    st.session_state.stock_cache.pop(ticker, None)
+                    st.rerun()
 
 st.caption("仅供学习研究，不构成投资建议。行情来自 Yahoo Finance，有延迟。")
