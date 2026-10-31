@@ -64,10 +64,26 @@ st.markdown("""
         width: 32px; height: 32px; border-radius: 8px; object-fit: contain;
         background: #f3f4f6; vertical-align: middle; margin-right: 10px;
     }
+    .forecast-hero {
+        background: linear-gradient(135deg, #ffffff 0%, #eff6ff 100%);
+        border: 1px solid #dbeafe; border-radius: 18px; padding: 22px 24px; margin: 8px 0 16px 0;
+    }
+    .forecast-kicker { color: #2563eb; font-size: 0.82rem; font-weight: 700; letter-spacing: 0.04em; }
+    .forecast-num { font-size: 3rem; font-weight: 760; color: #0f172a; line-height: 1.05; margin: 4px 0; }
+    .forecast-sub { color: #475569; font-size: 0.95rem; }
+    .band {
+        display: inline-block; margin-top: 10px; background: #fff; border: 1px solid #e2e8f0;
+        border-radius: 999px; padding: 6px 12px; color: #0f172a; font-weight: 650; font-size: 0.9rem;
+    }
+    .stButton > button { border-radius: 10px; font-weight: 650; }
+    div[data-testid="stMetric"] {
+        background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 10px 12px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">市场行情概率测算器</div>', unsafe_allow_html=True)
+st.caption("自选行情、财报和模型预测。预测来自公开价格，不是买卖建议。")
 
 # Session state
 if "selected_ticker" not in st.session_state:
@@ -372,6 +388,51 @@ def gbm_paths(S0, mu, sigma, T, steps, n_sims):
         paths[t] = paths[t - 1] * np.exp((mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * z)
     return paths
 
+def binomial_touch_prob(S, K, T, mu, sigma, steps, bullish=True):
+    steps = int(max(1, min(int(steps), 160)))
+    dt = T / steps
+    u = math.exp(sigma * math.sqrt(dt))
+    d = 1.0 / u
+    growth = math.exp(mu * dt)
+    span = u - d
+    if span <= 0:
+        return 0.5
+    p = min(1.0, max(0.0, (growth - d) / span))
+    thresh = (math.log(K / S) - steps * math.log(d)) / (math.log(u) - math.log(d))
+    k_min = math.floor(thresh) + 1
+    from scipy.stats import binom
+    above = float(binom.sf(k_min - 1, steps, p))
+    return above if bullish else 1 - above
+
+def bs_option_prices(S, K, T, r, sigma):
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return max(S - K, 0.0), max(K - S, 0.0)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    disc = K * math.exp(-r * T)
+    call = S * float(norm.cdf(d1)) - disc * float(norm.cdf(d2))
+    put = disc * float(norm.cdf(-d2)) - S * float(norm.cdf(-d1))
+    return call, put
+
+def load_iv_rows(ticker, spot):
+    stock = yf.Ticker(ticker)
+    expiries = list(stock.options or [])[:4]
+    rows = []
+    for exp in expiries:
+        try:
+            calls = stock.option_chain(exp).calls
+        except Exception:
+            continue
+        if calls is None or calls.empty or "impliedVolatility" not in calls:
+            continue
+        use = calls.copy()
+        use = use[(use["impliedVolatility"] > 0.02) & (use["impliedVolatility"] < 3)]
+        if spot:
+            use = use[(use["strike"] > spot * 0.7) & (use["strike"] < spot * 1.35)]
+        for _, row in use.iterrows():
+            rows.append({"到期": str(exp), "行权价": float(row["strike"]), "隐含波动率": float(row["impliedVolatility"])})
+    return rows
+
 # ==================== 详情页优先显示 ====================
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
@@ -412,7 +473,7 @@ if st.session_state.selected_ticker:
         )
         st.caption("数据来自 Yahoo Finance，存在延迟。点击「刷新价格」可手动更新。")
         
-        tab1, tab2, tab3, tab4 = st.tabs(["概览", "财务", "分析", "概率测算"])
+        tab1, tab2, tab3, tab4 = st.tabs(["概览", "财务", "分析", "行情预测"])
         
         with tab1:
             st.markdown("**K线周期**（可拖拽、滚轮缩放）")
@@ -662,18 +723,19 @@ if st.session_state.selected_ticker:
             st.caption("分析由公开行情和财务数据自动整理，仅供参考，不构成投资建议。")
         
         with tab4:
-            st.markdown("### 概率测算")
-            st.caption("按这只股票自己的历史波动率和漂移做测算。模型假设价格服从几何布朗运动，只供学习，不是预测。")
+            st.markdown("### 行情预测")
+            st.caption("把 Black-Scholes、蒙特卡洛和二叉树放在一起。概率是模型结果，不是市场一定会这样走。")
             c_a, c_b, c_c = st.columns(3)
             with c_a:
                 lookback = st.selectbox("历史区间", ["3mo", "6mo", "1y", "2y"], index=2, key=f"lb_{ticker}")
             with c_b:
-                bullish = st.radio("方向", ["看涨：收盘高于目标", "看跌：收盘低于目标"], horizontal=True, key=f"sent_{ticker}") == "看涨：收盘高于目标"
+                bullish = st.radio("方向", ["看涨：收盘高于目标", "看跌：收盘低于目标"], key=f"sent_{ticker}") == "看涨：收盘高于目标"
             with c_c:
-                n_sims = st.select_slider("模拟路径", options=[500, 1000, 2000, 5000], value=2000, key=f"nsim_{ticker}")
-            k = st.number_input("目标价格", value=round(float(current_price) * (1.1 if bullish else 0.9), 2), step=0.1, key=f"k_{ticker}")
-            days = st.number_input("交易日", value=20, min_value=1, max_value=252, key=f"days_{ticker}")
-            r_pct = st.number_input("无风险利率 %", value=4.5, step=0.1, key=f"r_{ticker}")
+                n_sims = st.select_slider("模拟路径", options=[500, 1000, 2000, 5000], value=1000, key=f"nsim_{ticker}")
+            p1, p2, p3 = st.columns(3)
+            k = p1.number_input("目标价格", value=round(float(current_price) * 1.1, 2), step=0.1, key=f"k_{ticker}")
+            days = p2.number_input("交易日", value=20, min_value=1, max_value=252, key=f"days_{ticker}")
+            r_pct = p3.number_input("无风险利率 %", value=4.5, step=0.1, key=f"r_{ticker}")
             use_hist = st.checkbox("使用历史波动率", value=True, key=f"usevol_{ticker}")
             sigma_manual = st.number_input("自定义年化波动率 %", value=25.0, step=0.5, disabled=use_hist, key=f"sig_{ticker}")
 
@@ -691,77 +753,106 @@ if st.session_state.selected_ticker:
                 steps = max(int(days), 1)
                 r = r_pct / 100
                 bs = bs_touch_prob(current_price, k, T, r, sigma, bullish)
+                tree = binomial_touch_prob(current_price, k, T, mu, sigma, min(steps, 80), bullish)
                 paths = gbm_paths(current_price, mu, sigma, T, steps, int(n_sims))
                 finals = paths[-1]
                 mc = float(np.mean(finals > k) if bullish else np.mean(finals < k))
-                sign = ">" if bullish else "<"
-
+                blend = (bs + mc + tree) / 3
+                p10, p50, p90 = np.percentile(finals, [10, 50, 90])
+                side = "高于" if bullish else "低于"
+                st.markdown(
+                    f'<div class="forecast-hero">'
+                    f'<div class="forecast-kicker">三个模型的平均概率</div>'
+                    f'<div class="forecast-num">{blend*100:.0f}%</div>'
+                    f'<div class="forecast-sub">{days} 个交易日后，收盘{side} {k:.2f}。'
+                    f'现价 {current_price:.2f}，波动率 {sigma*100:.1f}% 。</div>'
+                    f'<div class="band">预测区间 {p10:.2f} – {p90:.2f} · 中位数 {p50:.2f}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("现价", f"{current_price:.2f}")
-                m2.metric("历史年化波动率", f"{sigma*100:.1f}%")
-                m3.metric(f"Black-Scholes {sign} 目标", f"{bs*100:.1f}%")
-                m4.metric(f"蒙特卡洛 {sign} 目标", f"{mc*100:.1f}%")
-                st.caption(f"漂移取自{lookback}日收益率年化 {mu*100:.1f}%。蒙特卡洛用这个漂移，Black-Scholes 用无风险利率。")
+                m1.metric("Black-Scholes", f"{bs*100:.1f}%")
+                m2.metric("蒙特卡洛", f"{mc*100:.1f}%")
+                m3.metric("二叉树", f"{tree*100:.1f}%")
+                m4.metric("历史漂移", f"{mu*100:.1f}%")
+                call, put = bs_option_prices(current_price, k, T, r, sigma)
+                st.caption(f"若把目标价当成行权价，欧式看涨理论价 {call:.2f}，欧式看跌理论价 {put:.2f}。这是定价，不是涨跌方向。")
+
+                qs = np.percentile(paths, [10, 25, 50, 75, 90], axis=1)
+                x = list(range(steps + 1))
+                fig_fan = go.Figure()
+                fig_fan.add_trace(go.Scatter(
+                    x=x + x[::-1], y=list(qs[4]) + list(qs[0][::-1]),
+                    fill="toself", fillcolor="rgba(59,130,246,0.12)",
+                    line=dict(width=0), name="10%–90%", hoverinfo="skip",
+                ))
+                fig_fan.add_trace(go.Scatter(
+                    x=x + x[::-1], y=list(qs[3]) + list(qs[1][::-1]),
+                    fill="toself", fillcolor="rgba(37,99,235,0.18)",
+                    line=dict(width=0), name="25%–75%", hoverinfo="skip",
+                ))
+                fig_fan.add_trace(go.Scatter(x=x, y=qs[2], name="中位数", line=dict(color="#1d4ed8", width=2.4)))
+                fig_fan.add_hline(y=k, line_dash="dash", line_color="#d97706", annotation_text="目标")
+                fig_fan.update_layout(
+                    template="plotly_white", height=420, margin=dict(l=0, r=0, t=10, b=0),
+                    yaxis_title="价格", xaxis_title="交易日",
+                    legend=dict(orientation="h", y=1.08, x=0),
+                )
+                st.plotly_chart(fig_fan, use_container_width=True)
 
                 left, right = st.columns(2)
                 with left:
-                    st.markdown("**模拟路径（抽样 80 条）**")
-                    show_n = min(80, paths.shape[1])
-                    fig_mc = go.Figure()
-                    fig_mc.add_hline(y=k, line_dash="dash", line_color="#d97706", annotation_text="目标")
-                    for i in range(show_n):
-                        ok = paths[-1, i] > k if bullish else paths[-1, i] < k
-                        fig_mc.add_trace(go.Scatter(
-                            y=paths[:, i], mode="lines",
-                            line=dict(color="rgba(4,120,87,0.18)" if ok else "rgba(185,28,28,0.15)", width=1),
-                            showlegend=False, hoverinfo="skip",
-                        ))
-                    fig_mc.update_layout(template="plotly_white", height=360, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="价格")
-                    st.plotly_chart(fig_mc, use_container_width=True)
-                with right:
                     st.markdown("**期末价格分布**")
-                    fig_h = go.Figure(go.Histogram(x=finals, nbinsx=40, marker_color="#3b82f6"))
+                    fig_h = go.Figure(go.Histogram(x=finals, nbinsx=40, marker_color="#93c5fd"))
                     fig_h.add_vline(x=k, line_dash="dash", line_color="#d97706")
-                    fig_h.update_layout(template="plotly_white", height=360, margin=dict(l=0, r=0, t=10, b=0), showlegend=False, xaxis_title="期末价格", yaxis_title="路径数")
+                    fig_h.add_vline(x=p50, line_color="#1d4ed8")
+                    fig_h.update_layout(template="plotly_white", height=320, margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
                     st.plotly_chart(fig_h, use_container_width=True)
+                with right:
+                    st.markdown("**目标价敏感度**")
+                    labels, vals = [], []
+                    for mult in (0.85, 0.95, 1.0, 1.05, 1.15, 1.25):
+                        vt = current_price * mult
+                        labels.append(f"{vt:.0f}")
+                        vals.append(bs_touch_prob(current_price, vt, T, r, sigma, bullish) * 100)
+                    fig_sens = go.Figure(go.Bar(x=labels, y=vals, marker_color="#2563eb"))
+                    fig_sens.update_layout(template="plotly_white", height=320, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="概率 %")
+                    st.plotly_chart(fig_sens, use_container_width=True)
 
-                st.markdown("**敏感度**")
-                rate_rows = []
-                for vr in (0.01, 0.02, 0.03, 0.045, 0.06):
-                    rate_rows.append({"无风险利率": f"{vr*100:.1f}%", "概率": bs_touch_prob(current_price, k, T, vr, sigma, bullish)})
-                price_rows = []
-                for mult in (0.8, 0.9, 1.0, 1.1, 1.2):
-                    vt = current_price * mult
-                    price_rows.append({"目标价": round(vt, 2), "相对现价": f"{(mult-1)*100:+.0f}%", "概率": bs_touch_prob(current_price, vt, T, r, sigma, bullish)})
-                s1, s2 = st.columns(2)
-                with s1:
-                    st.markdown("利率变化")
-                    rate_df = pd.DataFrame(rate_rows)
-                    st.dataframe(rate_df.style.format({"概率": "{:.1%}"}), use_container_width=True, hide_index=True)
-                with s2:
-                    st.markdown("目标价变化")
-                    price_df = pd.DataFrame(price_rows)
-                    st.dataframe(price_df.style.format({"概率": "{:.1%}"}), use_container_width=True, hide_index=True)
-                fig_sens = go.Figure(go.Bar(
-                    x=[str(row["目标价"]) for row in price_rows],
-                    y=[row["概率"] * 100 for row in price_rows],
-                    marker_color="#3b82f6",
-                ))
-                fig_sens.update_layout(template="plotly_white", height=280, margin=dict(l=0, r=0, t=30, b=0), title="不同目标价的概率 %", yaxis_title="%")
-                st.plotly_chart(fig_sens, use_container_width=True)
+                st.markdown("**期权隐含波动率**")
+                st.caption("有期权链时，用近月看涨期权画出波动率微笑。ETF 或部分股票可能没有。")
+                if st.button("读取隐含波动率", key=f"ivbtn_{ticker}"):
+                    with st.spinner("正在读取期权链"):
+                        st.session_state[f"ivcache_{ticker}"] = load_iv_rows(ticker, current_price)
+                iv_rows = st.session_state.get(f"ivcache_{ticker}")
+                if iv_rows:
+                    iv_df = pd.DataFrame(iv_rows)
+                    fig_iv = go.Figure()
+                    for exp, group in iv_df.groupby("到期"):
+                        group = group.sort_values("行权价")
+                        fig_iv.add_trace(go.Scatter(
+                            x=group["行权价"], y=group["隐含波动率"] * 100,
+                            mode="lines", name=str(exp),
+                        ))
+                    fig_iv.add_vline(x=current_price, line_dash="dot", line_color="#94a3b8")
+                    fig_iv.update_layout(template="plotly_white", height=360, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="隐含波动率 %", xaxis_title="行权价")
+                    st.plotly_chart(fig_iv, use_container_width=True)
+                    pivot = iv_df.pivot_table(index="到期", columns="行权价", values="隐含波动率", aggfunc="mean")
+                    if pivot.shape[0] >= 2 and pivot.shape[1] >= 2:
+                        fig_s = go.Figure(data=[go.Surface(
+                            z=pivot.values * 100, x=list(pivot.columns), y=list(range(len(pivot.index))),
+                            colorscale="Blues",
+                        )])
+                        fig_s.update_layout(
+                            template="plotly_white", height=420, margin=dict(l=0, r=0, t=10, b=0),
+                            scene=dict(xaxis_title="行权价", yaxis_title="到期序号", zaxis_title="IV %"),
+                        )
+                        st.plotly_chart(fig_s, use_container_width=True)
+                elif f"ivcache_{ticker}" in st.session_state:
+                    st.info("没有读到可用的看涨期权隐含波动率。")
 
-                stats = pd.DataFrame({
-                    "指标": ["现价", "目标价", "期末均价", "期末中位数", "最低", "最高", "5%分位", "95%分位"],
-                    "数值": [
-                        f"{current_price:.2f}", f"{k:.2f}", f"{np.mean(finals):.2f}", f"{np.median(finals):.2f}",
-                        f"{np.min(finals):.2f}", f"{np.max(finals):.2f}",
-                        f"{np.percentile(finals, 5):.2f}", f"{np.percentile(finals, 95):.2f}",
-                    ],
-                })
-                st.markdown("**期末统计**")
-                st.dataframe(stats, use_container_width=True, hide_index=True)
                 out = pd.DataFrame({"期末价格": finals})
-                st.download_button("下载模拟期末价格", data=out.to_csv(index=False), file_name=f"{ticker}_mc.csv", mime="text/csv", key=f"dl_{ticker}")
+                st.download_button("下载模拟期末价格", data=out.to_csv(index=False), file_name=f"{ticker}_forecast.csv", mime="text/csv", key=f"dl_{ticker}")
 
     except Exception as e:
         st.error(f"加载失败：{str(e)}")
