@@ -89,11 +89,37 @@ st.caption("自选行情、财报和模型预测。预测来自公开价格，�
 if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = None
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = ["AMZN", "VTI", "VT", "ASML", "ASTS", "AAPL"]
+    st.session_state.watchlist = ["BTC-USD", "ETH-USD", "BNB-USD", "HYPE32196-USD", "AMZN", "VTI", "VT", "ASML", "ASTS", "AAPL"]
+CRYPTO = ["BTC-USD", "ETH-USD", "BNB-USD", "HYPE32196-USD"]
+if "crypto_added" not in st.session_state:
+    for symbol in reversed(CRYPTO):
+        if symbol not in st.session_state.watchlist:
+            st.session_state.watchlist.insert(0, symbol)
+    st.session_state.crypto_added = True
 if "stock_cache" not in st.session_state:
     st.session_state.stock_cache = {}
 if "timeframe" not in st.session_state:
     st.session_state.timeframe = "1d"
+
+ALIASES = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "BNB": "BNB-USD",
+    "HYPE": "HYPE32196-USD",
+}
+DISPLAY = {
+    "BTC-USD": "BTC",
+    "ETH-USD": "ETH",
+    "BNB-USD": "BNB",
+    "HYPE32196-USD": "HYPE",
+}
+
+def show_symbol(ticker):
+    return DISPLAY.get(ticker, ticker)
+
+def resolve_ticker(raw):
+    text = raw.strip().upper()
+    return ALIASES.get(text, text)
 
 def get_stock_summary(ticker):
     if ticker in st.session_state.stock_cache:
@@ -436,7 +462,7 @@ def load_iv_rows(ticker, spot):
 # ==================== 详情页优先显示 ====================
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
-    st.markdown(f'<div class="section-title">{ticker} 详情</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-title">{show_symbol(ticker)} 详情</div>', unsafe_allow_html=True)
     
     col_back, col_refresh = st.columns([1, 4])
     with col_back:
@@ -866,10 +892,10 @@ pad_l, list_col, pad_r = st.columns([0.6, 2.4, 0.6])
 with list_col:
     add_col1, add_col2 = st.columns([5, 1])
     with add_col1:
-        new_ticker = st.text_input("添加股票", placeholder="输入代码，如 AMZN、0700.HK", label_visibility="collapsed")
+        new_ticker = st.text_input("添加股票", placeholder="输入代码，如 AMZN、BTC、HYPE", label_visibility="collapsed")
     with add_col2:
         if st.button("添加", use_container_width=True) and new_ticker.strip():
-            t = new_ticker.strip().upper()
+            t = resolve_ticker(new_ticker)
             if t not in st.session_state.watchlist:
                 st.session_state.watchlist.append(t)
                 st.rerun()
@@ -878,7 +904,7 @@ with list_col:
         summary = get_stock_summary(ticker)
         with st.container(border=True):
             if summary is None:
-                st.markdown(f"**{ticker}**")
+                st.markdown(f"**{show_symbol(ticker)}**")
                 st.caption("暂无行情")
                 continue
             color = "up" if summary["change"] >= 0 else "down"
@@ -890,7 +916,7 @@ with list_col:
                 st.markdown(
                     f'<div style="display:flex;align-items:center;">'
                     f'{logo_html(summary["ticker"], summary.get("website", ""), 32)}'
-                    f'<div><div class="ticker">{summary["ticker"]}</div>'
+                    f'<div><div class="ticker">{show_symbol(summary["ticker"])}</div>'
                     f'<span class="muted">{name}</span></div></div>',
                     unsafe_allow_html=True,
                 )
