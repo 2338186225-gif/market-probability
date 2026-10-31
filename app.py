@@ -1856,9 +1856,12 @@ def fetch_news(ticker, limit=6, timeout=12):
                 continue
             pub = (node.findtext("pubDate") or "").strip()
             when = ""
+            ts = None
             if pub:
                 try:
-                    when = parsedate_to_datetime(pub).strftime("%m-%d %H:%M")
+                    published = parsedate_to_datetime(pub)
+                    when = published.strftime("%m-%d %H:%M")
+                    ts = published.timestamp()
                 except Exception:
                     when = pub[:16]
             items.append({
@@ -1866,6 +1869,7 @@ def fetch_news(ticker, limit=6, timeout=12):
                 "link": (node.findtext("link") or "").strip(),
                 "summary": (node.findtext("description") or "").strip(),
                 "time": when,
+                "ts": ts,
                 "source": "Yahoo Finance",
             })
             if len(items) >= limit:
@@ -2658,7 +2662,8 @@ def mentions_asset(ticker, title):
     text = title or ""
     keys = []
     symbol = show_symbol(ticker)
-    if len(symbol) >= 3:
+    # link、dot、uni 在英文里是普通词，光出现这三个字母不算提到这只币
+    if len(symbol) >= 3 and symbol not in {"LINK", "DOT", "UNI", "ONE", "GAS", "DATA"}:
         keys.append(symbol)
     name = FRIENDLY.get(ticker)
     if name:
@@ -2766,27 +2771,52 @@ def open_aligned(book, ticker, side, price, why, stamp, horizon):
     return True
 
 BEAR_EVENT = (
-    "hack", "hacked", "exploit", "exploited", "stolen", "bankrupt", "bankruptcy",
-    "fraud", "trading halt", "halted", "delisting", "delisted", "in default",
-    "data breach", "accounting scandal", "earnings miss", "misses estimates",
-    "guidance cut", "cuts guidance", "sec charges", "lawsuit",
-    "被盗", "黑客", "破产", "欺诈", "停牌", "退市", "暴雷", "爆仓", "造假",
+    "hacked", "stolen", "bankrupt", "bankruptcy", "trading halt", "trading halted",
+    "delisting", "delisted", "data breach", "accounting scandal", "earnings miss",
+    "misses estimates", "guidance cut", "cuts guidance", "sec charges",
+    "被盗", "破产", "停牌", "退市", "暴雷", "造假", "欺诈", "黑客",
 )
 BULL_EVENT = (
     "beats estimates", "beats expectations", "raises guidance", "buyback",
-    "share repurchase", "record revenue", "wins approval", "approved",
+    "share repurchase", "record revenue", "wins approval",
     "超预期", "上调指引", "回购", "获批",
 )
+_NEG_EN = re.compile(r"(?:no|not|n't|never|denies|denied|dismisses|dismissed|without|avoids|avoided|refutes|cleared of)")
+_NEG_ZH = ("否认", "没有", "并非", "不是", "澄清", "辟谣", "不实")
+
+def _event_hit(text, phrase):
+    if re.search(r"[\u4e00-\u9fff]", phrase):
+        for match in re.finditer(re.escape(phrase), text):
+            window = text[max(0, match.start() - 8):match.start()]
+            if any(flag in window for flag in _NEG_ZH):
+                continue
+            return True
+        return False
+    pattern = re.compile(r"(?<![a-z0-9])" + re.escape(phrase.lower()) + r"(?![a-z0-9])")
+    for match in pattern.finditer(text.lower()):
+        window = text.lower()[max(0, match.start() - 40):match.start()]
+        if _NEG_EN.search(window):
+            continue
+        return True
+    return False
 
 def read_news_locally(title, summary):
-    text = f"{title} {summary}".lower()
-    bear = any(word in text for word in BEAR_EVENT)
-    bull = any(word in text for word in BULL_EVENT)
+    text = f"{title} {summary}"
+    bear = any(_event_hit(text, word) for word in BEAR_EVENT)
+    bull = any(_event_hit(text, word) for word in BULL_EVENT)
     if bear and not bull:
         return "空", "事件本身利空"
     if bull and not bear:
         return "多", "事件本身利多"
     return "忽略", "只是涨跌报道，看不出方向"
+
+def news_is_fresh(item, ticker):
+    ts = item.get("ts") if isinstance(item, dict) else None
+    if not ts:
+        return False
+    age = time.time() - float(ts)
+    limit = 8 * 3600 if str(ticker).endswith("-USD") else 36 * 3600
+    return 0 <= age <= limit
 
 def ask_grok_side(ticker, title, summary):
     token = os.environ.get("XAI_API_KEY")
@@ -2797,10 +2827,10 @@ def ask_grok_side(ticker, title, summary):
         f"标的：{name}（{show_symbol(ticker)}）。\n"
         f"标题：{title}\n正文：{summary[:500]}\n"
         "只根据这条新闻内容，判断对这个标的应该做多、做空，还是忽略。"
-        "普通涨跌、跌幅、drops、falls、plunges 一律忽略。"
+        "必须同时满足：讲的是这个标的本人，不是名单里顺带一提；事件已经发生，不是传闻、可能、消息人士称；没有被否认或澄清。"
+        "普通涨跌、跌幅、drops、falls、plunges、涨了跌了，一律忽略。"
         "被盗、破产、欺诈、停牌、退市、财报暴雷、指引下调才是做空。"
         "超预期、上调指引、回购、重大获批才是做多。"
-        "新闻讲的不是这个标的本人，就忽略。"
         '只输出 JSON：{"side":"多"|"空"|"忽略","why":"20字以内"}'
     )
     body = json.dumps({
@@ -2829,18 +2859,21 @@ def ask_grok_side(ticker, title, summary):
 def judge_news(ticker, title, summary):
     summary = re.sub(r"<[^>]+>", " ", summary or "")
     summary = re.sub(r"\s+", " ", html.unescape(summary)).strip()
-    blob = f"{title} {summary}"
-    if not mentions_asset(ticker, blob):
-        return "忽略", "不是这条标的自己的事"
+    # 标题里必须点名。正文里顺带出现的代码不算。
+    if not mentions_asset(ticker, title or ""):
+        return "忽略", "标题没有点名这个标的", False
     cache = globals().setdefault("_NEWS_JUDGE", {})
     key = (ticker, (title or "").strip().lower())
     if key in cache:
         return cache[key]
     side, why = ask_grok_side(ticker, title, summary)
+    allow_open = side in ("多", "空")
     if side not in ("多", "空", "忽略"):
         side, why = read_news_locally(title, summary)
-    cache[key] = (side, why)
-    return side, why
+        allow_open = False
+    result = (side, why, allow_open)
+    cache[key] = result
+    return result
 
 def apply_shocks(books, price_fn=None):
     price_fn = price_fn or last_price
@@ -2854,6 +2887,7 @@ def apply_shocks(books, price_fn=None):
         return []
     acted = []
     today = cn_stamp()
+    done = set()
     for ticker in held:
         try:
             items = fetch_news(ticker, limit=4, timeout=5)
@@ -2861,21 +2895,25 @@ def apply_shocks(books, price_fn=None):
             items = []
         for item in items:
             title = item.get("title") or ""
-            if not title:
+            if not title or not news_is_fresh(item, ticker):
                 continue
-            side, why = judge_news(ticker, title, item.get("summary") or "")
+            side, why, allow_open = judge_news(ticker, title, item.get("summary") or "")
             key = title.lower()
             if side not in ("多", "空"):
                 for book in books.values():
-                    if isinstance(book, dict):
+                    if isinstance(book, dict) and ticker in book.get("positions", {}):
                         book.setdefault("seen", []).append(key)
                         book["seen"] = book["seen"][-80:]
                 continue
-            try:
-                zh = to_zh(why or title)
-            except Exception:
-                zh = why or title
+            note = why if re.search(r"[\u4e00-\u9fff]", why or "") else title
+            if note == title:
+                try:
+                    note = to_zh(title)
+                except Exception:
+                    note = why or title
             for name, book in books.items():
+                if (name, ticker) in done:
+                    continue
                 if not isinstance(book, dict) or ticker not in book.get("positions", {}):
                     continue
                 if key in book.get("seen", []):
@@ -2885,16 +2923,21 @@ def apply_shocks(books, price_fn=None):
                 book.setdefault("seen", []).append(key)
                 book["seen"] = book["seen"][-80:]
                 if held_side == side:
+                    done.add((name, ticker))
                     continue
                 price = pos.get("cost")
                 fresh = price_fn(ticker)
                 if fresh:
                     price = fresh
                 horizon = pos.get("horizon") or "15分"
-                if close_position(book, ticker, price, f"新闻解读应做{side}：{zh}", today):
-                    open_aligned(book, ticker, side, price, zh, today, horizon)
-                    label = {"watch": "自选", "edge": "择股", "crypto": "加密"}.get(name, "全市场")
-                    acted.append(f"{label} {show_symbol(ticker)} 改做{side} · {zh}")
+                if not close_position(book, ticker, price, f"新闻解读应做{side}：{note}", today):
+                    continue
+                opened = open_aligned(book, ticker, side, price, note, today, horizon) if allow_open else False
+                if not opened:
+                    block_ticker(book, ticker, 6)
+                done.add((name, ticker))
+                label = {"watch": "自选", "edge": "择股", "crypto": "加密"}.get(name, "全市场")
+                acted.append(f"{label} {show_symbol(ticker)} 改做{side} · {note}")
     return acted
 
 def _monitor_loop():
@@ -3298,7 +3341,7 @@ def paper_monitor():
         st.warning("重大消息已立刻卖出：" + "；".join(acted))
         st.rerun()
     else:
-        st.caption(f"新闻监测 {stamp}。约每 3 分钟读一次持仓新闻，先判断该做多还是做空。方向和持仓一样就不动；相反才平掉并改方向。普通涨跌标题忽略。浮亏到保证金 40% 会自查离场。")
+        st.caption(f"新闻监测 {stamp}。只看标题点名的新鲜新闻：币 8 小时内，股票 36 小时内。先判断做多还是做空，方向一样不动。否认、传闻和普通涨跌忽略。关键词不够硬时只平反向仓，不立刻反手。")
 
 try:
     paper_monitor = st.fragment(run_every=180)(paper_monitor)
