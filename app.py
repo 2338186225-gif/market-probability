@@ -7,9 +7,12 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import html
+import json
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import date
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from urllib.parse import quote, urlparse
 from concurrent.futures import ThreadPoolExecutor
 
@@ -26,6 +29,7 @@ st.markdown("""
     .stApp { background: #ffffff; }
     .block-container { max-width: 100%; padding-top: 1.1rem; padding-bottom: 2rem; padding-left: 1.25rem; padding-right: 1.25rem; }
     .topbar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
+    a.paper-link, a.paper-link:hover { margin-left: auto; color: #111827; text-decoration: none; font-size: 14px; font-weight: 720; }
     .brand { font-size: 22px; font-weight: 760; color: #111827; letter-spacing: -0.03em; }
     .brand span { color: #1677ff; }
     .brand-sub { color: #8b919a; font-size: 13px; }
@@ -193,7 +197,8 @@ st.markdown("""
 
 st.markdown(
     '<div class="topbar"><div class="brand">行情<span>测算</span></div>'
-    '<div class="brand-sub">自选 · K线 · 财报 · 预测</div></div>',
+    '<div class="brand-sub">自选 · K线 · 财报 · 预测</div>'
+    '<a class="paper-link" href="?view=paper">模拟仓</a></div>',
     unsafe_allow_html=True,
 )
 
@@ -243,6 +248,9 @@ if sort_q == "off":
     del st.query_params["sort"]
 elif sort_q in ("name", "amount", "score", "price", "chg"):
     st.session_state.watch_sort = sort_q
+page = st.query_params.get("view")
+if isinstance(page, list):
+    page = page[0] if page else None
 
 ALIASES = {
     "BTC": "BTC-USD",
@@ -622,6 +630,19 @@ def rating_from_levels(levels, extra=0.0, extra_notes=None):
         notes.extend(extra_notes)
     return {"label": rating_label(score), "score": round(score, 1), "notes": notes, "by_unit": by_unit}
 
+def up_prob_20(close):
+    close = close.astype(float).dropna()
+    ret = np.log(close / close.shift(1)).dropna()
+    if len(ret) < 40:
+        return None
+    window = ret.tail(120)
+    mu = float(window.mean())
+    sigma = float(window.std())
+    if not sigma or sigma != sigma:
+        return None
+    z = (mu - 0.5 * sigma ** 2) * np.sqrt(20) / sigma
+    return float(norm.cdf(z))
+
 def rate_frame(ticker, hist):
     if hist is None or getattr(hist, "empty", True) or "Close" not in getattr(hist, "columns", []):
         return None
@@ -642,6 +663,7 @@ def rate_frame(ticker, hist):
         rated["score"] = round(float(rated["score"]) + money, 1)
         rated["notes"] = list(rated["notes"]) + [money_note]
     rated["money"] = money
+    rated["up_prob"] = up_prob_20(frame["Close"])
     rated["levels"] = levels
     rated["ticker"] = ticker
     rated["price"] = float(frame["Close"].iloc[-1])
@@ -649,6 +671,7 @@ def rate_frame(ticker, hist):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def rate_ticker(ticker: str):
+    """趋势分、放量资金和 20 日上涨概率。"""
     try:
         hist = yf.Ticker(ticker).history(period="3y", interval="1d")
     except Exception:
@@ -1484,6 +1507,160 @@ def load_iv_rows(ticker, spot):
             rows.append({"到期": str(exp), "行权价": float(row["strike"]), "隐含波动率": float(row["impliedVolatility"])})
     return rows
 
+# ==================== 模拟仓 ====================
+PAPER_PATH = Path(__file__).with_name("paper_book.json")
+PAPER_CASH = 1_000_000.0
+PAPER_SLOTS = 10
+
+def empty_paper():
+    return {"cash": PAPER_CASH, "positions": {}, "trades": [], "last_run": "", "started": date.today().isoformat()}
+
+def load_paper():
+    if "paper" not in st.session_state:
+        book = None
+        try:
+            book = json.loads(PAPER_PATH.read_text())
+        except Exception:
+            book = None
+        st.session_state.paper = book or empty_paper()
+    return st.session_state.paper
+
+def save_paper(book):
+    st.session_state.paper = book
+    try:
+        PAPER_PATH.write_text(json.dumps(book, ensure_ascii=False))
+    except Exception:
+        pass
+
+def paper_signals():
+    symbols = list(st.session_state.watchlist)
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        rated = list(executor.map(rate_ticker, symbols))
+    rows = []
+    for symbol, item in zip(symbols, rated):
+        if not item:
+            continue
+        item = merge_context(item, True)
+        rows.append({
+            "ticker": symbol,
+            "price": item.get("price"),
+            "label": item.get("label") or "—",
+            "score": item.get("score"),
+            "up_prob": item.get("up_prob"),
+        })
+    return rows
+
+def paper_rebalance(book, signals):
+    today = date.today().isoformat()
+    if book.get("last_run") == today:
+        return book
+    by_ticker = {row["ticker"]: row for row in signals if row.get("price")}
+    for ticker in list(book["positions"]):
+        sig = by_ticker.get(ticker)
+        price = (sig or {}).get("price")
+        if not price:
+            continue
+        label = (sig or {}).get("label")
+        up = (sig or {}).get("up_prob")
+        reason = None
+        if ticker not in st.session_state.watchlist:
+            reason = "已移出自选"
+        elif label not in ("买入", "强烈买入"):
+            reason = f"综合评级变为{label}"
+        elif up is not None and up < 0.4 and label != "强烈买入":
+            reason = f"20日上涨概率降至 {up * 100:.0f}%"
+        if not reason:
+            continue
+        shares = int(book["positions"].pop(ticker)["shares"])
+        book["cash"] += shares * float(price)
+        book["trades"].append({
+            "date": today, "side": "卖", "ticker": ticker, "shares": shares,
+            "price": round(float(price), 4), "reason": reason,
+        })
+    equity = book["cash"]
+    for ticker, pos in book["positions"].items():
+        price = (by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0
+        equity += pos["shares"] * float(price)
+    slot = equity / PAPER_SLOTS if PAPER_SLOTS else equity
+    buys = [
+        row for row in signals
+        if row.get("price") and row["label"] in ("买入", "强烈买入")
+        and (row.get("up_prob") is None or row["up_prob"] >= 0.5)
+    ]
+    buys.sort(key=lambda row: row.get("score") if row.get("score") is not None else -999, reverse=True)
+    for row in buys:
+        if len(book["positions"]) >= PAPER_SLOTS or row["ticker"] in book["positions"]:
+            continue
+        price = float(row["price"])
+        shares = int(min(slot, book["cash"]) // price)
+        if shares <= 0:
+            continue
+        book["cash"] -= shares * price
+        book["positions"][row["ticker"]] = {"shares": shares, "cost": price}
+        prob = f"{row['up_prob'] * 100:.0f}%" if row.get("up_prob") is not None else "—"
+        book["trades"].append({
+            "date": today, "side": "买", "ticker": row["ticker"], "shares": shares,
+            "price": round(price, 4),
+            "reason": f"综合{row['label']} {row.get('score')}，20日上涨概率 {prob}",
+        })
+    book["last_run"] = today
+    book["trades"] = book["trades"][-200:]
+    return book
+
+def render_paper():
+    st.markdown('<div class="board-head"><div class="section-title">模拟仓</div><div class="muted">100 万美元 · 只做自选 · 收盘价</div></div>', unsafe_allow_html=True)
+    st.caption("买入要同时满足：综合评级是买入或强烈买入，且按最近一年日收益估算的 20 个交易日上涨概率不低于 50%。评级掉到持有以下，或上涨概率低于 40%，就卖出。最多 10 只，每只大约用总资产的十分之一。每个自然日只调一次。没有佣金和滑点，也不是下单建议。")
+    book = load_paper()
+    with st.spinner("正在按综合评级和上涨概率检查持仓"):
+        signals = paper_signals()
+    changed = book.get("last_run") != date.today().isoformat()
+    book = paper_rebalance(book, signals)
+    save_paper(book)
+    prices = {row["ticker"]: row["price"] for row in signals}
+    labels = {row["ticker"]: row for row in signals}
+    market_value = 0.0
+    cost_value = 0.0
+    held_rows = []
+    for ticker, pos in book["positions"].items():
+        price = prices.get(ticker) or pos.get("cost") or 0
+        value = pos["shares"] * float(price)
+        cost = pos["shares"] * float(pos.get("cost") or 0)
+        market_value += value
+        cost_value += cost
+        sig = labels.get(ticker) or {}
+        held_rows.append({
+            "代码": show_symbol(ticker),
+            "股数": pos["shares"],
+            "成本": round(float(pos.get("cost") or 0), 2),
+            "现价": round(float(price), 2),
+            "市值": round(value, 2),
+            "浮动盈亏": round(value - cost, 2),
+            "评级": sig.get("label") or "—",
+            "20日上涨概率": f"{sig['up_prob'] * 100:.0f}%" if sig.get("up_prob") is not None else "—",
+        })
+    equity = book["cash"] + market_value
+    pnl = equity - PAPER_CASH
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("总资产", f"{equity:,.0f}")
+    c2.metric("现金", f"{book['cash']:,.0f}")
+    c3.metric("持仓市值", f"{market_value:,.0f}")
+    c4.metric("累计盈亏", f"{pnl:,.0f}", f"{pnl / PAPER_CASH * 100:+.2f}%")
+    if changed:
+        st.caption(f"今天已按收盘价调仓。起始日 {book.get('started') or '—'}。")
+    else:
+        st.caption("今天已经调过仓，刷新不会重复买卖。")
+    if held_rows:
+        st.dataframe(pd.DataFrame(held_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("今天没有符合条件的买入，仓位是空的。现金仍是 100 万美元。")
+    trades = list(reversed(book.get("trades") or []))[:30]
+    if trades:
+        st.markdown("**最近成交**")
+        st.dataframe(pd.DataFrame(trades), use_container_width=True, hide_index=True)
+    if st.button("重置为 100 万美元"):
+        save_paper(empty_paper())
+        st.rerun()
+
 # ==================== 详情页优先显示 ====================
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
@@ -2036,6 +2213,9 @@ if st.session_state.selected_ticker:
         st.error(f"加载失败：{str(e)}")
     
     st.markdown("---")
+
+elif page == "paper":
+    render_paper()
 
 else:
     with st.spinner("正在扫描美股龙头和主流加密货币，按买入评级取前十"):
