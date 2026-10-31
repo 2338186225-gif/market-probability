@@ -2286,6 +2286,8 @@ def close_position(book, ticker, price, reason, today):
     })
     if (pos.get("horizon") or "") == "15分":
         book.setdefault("no_reentry", {})[ticker] = crypto_bar_slot()
+        # 平掉的空头/多头 4 小时内不许信号再开回去，避免开空、平空来回打手续费。
+        block_ticker(book, ticker, 4)
     else:
         book.setdefault("no_reentry", {})[ticker] = cn_now().date().isoformat()
     return True
@@ -3228,10 +3230,21 @@ def apply_shocks(books, price_fn=None):
                 if fresh:
                     price = fresh
                 horizon = pos.get("horizon") or "15分"
+                if horizon == "15分":
+                    opened_at = None
+                    for trade in reversed(book.get("trades") or []):
+                        if trade.get("ticker") == ticker and trade.get("side") in ("买", "开空"):
+                            opened_at = str(trade.get("date") or "")
+                            break
+                    if opened_at == crypto_bar_slot():
+                        done.add((name, ticker))
+                        continue
                 if not close_position(book, ticker, price, f"新闻解读应做{side}：{note}", today):
                     continue
-                opened = open_aligned(book, ticker, side, price, note, today, horizon) if allow_open else False
-                if not opened:
+                opened = False
+                if horizon != "15分" and allow_open:
+                    opened = open_aligned(book, ticker, side, price, note, today, horizon)
+                if not opened and horizon != "15分":
                     block_ticker(book, ticker, 6)
                 done.add((name, ticker))
                 label = {"watch": "自选", "edge": "择股", "crypto": "加密"}.get(name, "全市场")
@@ -3641,7 +3654,7 @@ def render_paper():
                         halted = "总资产离开高点超过 15%，24 小时内不再开新仓。"
                 except Exception:
                     halted = ""
-            st.caption("同方向、走势相关性达到 0.75 的币，保证金合并计算，合计不超过总资产的 25%。同一根 15 分钟平掉后不再开回。浮亏到保证金四成才止损。" + halted)
+            st.caption("同方向、走势相关性达到 0.75 的币，保证金合并计算，合计不超过总资产的 25%。刚开的仓，这一根 15 分钟内新闻不能马上平。平掉之后 4 小时内不许再开，避免开空平空来回打手续费。" + halted)
             if st.button("回测这条加密规则", key="bt_crypto"):
                 with st.spinner("前 70% 选阈值，后 30% 单独验收。下一根才成交。"):
                     result = crypto_rule_backtest()
