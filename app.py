@@ -23,7 +23,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stApp { background: #f5f6f8; }
-    .block-container { max-width: 1040px; padding-top: 1.1rem; padding-bottom: 2rem; }
+    .block-container { max-width: 1320px; padding-top: 1.1rem; padding-bottom: 2rem; }
     .topbar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
     .brand { font-size: 22px; font-weight: 760; color: #111827; letter-spacing: -0.03em; }
     .brand span { color: #1677ff; }
@@ -1637,7 +1637,6 @@ else:
     for symbol in st.session_state.watchlist:
         if symbol not in ratings:
             ratings[symbol] = rate_ticker(symbol)
-    picks = ranked[:10]
     basis = st.radio("按哪一级看前十", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
     unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
     if unit:
@@ -1645,41 +1644,12 @@ else:
     else:
         ranked_view = ranked
     picks = ranked_view[:10]
-    st.markdown(f'<div class="board-head"><div class="section-title">{basis}买入评级前十</div><div class="muted">美股龙头 · 主流加密货币</div></div>', unsafe_allow_html=True)
-    st.caption("多头不是套话：这一级收盘价在短、中、长均线之上，并且短均线高于中均线、中均线高于长均线。日线是 7/25/60 日，周线是 10/20/40 周，月线是 6/12/24 月。之前只显示了日线那一句，所以看起来全是日线多头。")
-    if not picks:
-        st.info("这次没有拉到足够行情，前十暂时空着。过一会儿再刷新。")
-    for index, item in enumerate(picks, start=1):
-        symbol = item["ticker"]
-        cells = item.get("by_unit") or {}
-        pills = " ".join(
-            f'<span class="chg-pill {rate_class(cells[name]["label"])}">{name}线{cells[name]["label"]}</span>'
-            for name in ("日", "周", "月") if name in cells
-        )
-        reasons = "<br>".join(html.escape(cells[name]["why"]) for name in ("日", "周", "月") if name in cells)
-        with st.container(border=True):
-            left, mid, right = st.columns([3.4, 1.2, 0.7], vertical_alignment="center")
-            with left:
-                st.markdown(
-                    f'<div class="row-symbol">{index}. {show_symbol(symbol)} <span class="chg-pill {rate_class(item["label"])}">综合{item["label"]}</span></div>'
-                    f'<div style="margin-top:6px;">{pills}</div>'
-                    f'<div class="row-name" style="max-width:none;white-space:normal;overflow:visible;">{reasons}</div>',
-                    unsafe_allow_html=True,
-                )
-            with mid:
-                st.markdown(f'<div class="row-px"><div class="px">{fmt_px(item["price"])}</div><div class="muted">综合 {item["score"]} 分</div></div>', unsafe_allow_html=True)
-            with right:
-                if st.button("查看", key=f"pick_{symbol}", use_container_width=True):
-                    if symbol not in st.session_state.watchlist:
-                        st.session_state.watchlist.append(symbol)
-                    st.session_state.selected_ticker = symbol
-                    st.rerun()
 
-    st.markdown('<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · 延迟行情</div></div>', unsafe_allow_html=True)
-    add_col1, add_col2 = st.columns([6, 1])
-    with add_col1:
-        new_ticker = st.text_input("添加股票", placeholder="输入代码，如 AAPL、0700.HK、BTC", label_visibility="collapsed")
-    with add_col2:
+    watch_col, rank_col = st.columns([1, 1.45], gap="medium")
+
+    with watch_col:
+        st.markdown('<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · 延迟行情</div></div>', unsafe_allow_html=True)
+        new_ticker = st.text_input("添加股票", placeholder="代码，如 AAPL、BTC", label_visibility="collapsed")
         if st.button("添加", use_container_width=True) and new_ticker.strip():
             t = resolve_ticker(new_ticker)
             if t not in st.session_state.watchlist:
@@ -1687,42 +1657,67 @@ else:
                 if t in st.session_state.stock_cache:
                     del st.session_state.stock_cache[t]
                 st.rerun()
-
-    for ticker in st.session_state.watchlist:
-        summary = get_stock_summary(ticker)
-        with st.container(border=True):
-            c_name, c_px, c_open, c_del = st.columns([3.1, 1.35, 0.62, 0.62], vertical_alignment="center")
-            with c_name:
+        for ticker in st.session_state.watchlist:
+            summary = get_stock_summary(ticker)
+            with st.container(border=True):
                 if summary is None:
                     st.markdown(f'<div class="row-symbol">{show_symbol(ticker)}</div><span class="row-name">暂无行情</span>', unsafe_allow_html=True)
                 else:
                     name = pretty_name(summary["ticker"], summary.get("info"))
-                    st.markdown(
-                        f'<div style="display:flex;align-items:center;">'
-                        f'{logo_html(summary["ticker"], summary.get("website", ""), 36)}'
-                        f'<div><div class="row-symbol">{show_symbol(summary["ticker"])} '
-                        f'<span class="chg-pill {rate_class((ratings.get(summary["ticker"]) or {}).get("label", "观望"))}">'
-                        f'{(ratings.get(summary["ticker"]) or {}).get("label", "—")}</span></div>'
-                        f'<span class="row-name" title="{html.escape(name)}">{html.escape(name)}</span></div></div>',
-                        unsafe_allow_html=True,
-                    )
-            with c_px:
-                if summary is not None:
                     pill = "chg-up" if summary["change"] >= 0 else "chg-down"
                     sign = "+" if summary["change"] >= 0 else ""
+                    label = (ratings.get(summary["ticker"]) or {}).get("label", "—")
                     st.markdown(
+                        f'<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">'
+                        f'<div style="display:flex;align-items:center;min-width:0;">'
+                        f'{logo_html(summary["ticker"], summary.get("website", ""), 32)}'
+                        f'<div><div class="row-symbol">{show_symbol(summary["ticker"])} '
+                        f'<span class="chg-pill {rate_class(label)}">{label}</span></div>'
+                        f'<span class="row-name" title="{html.escape(name)}">{html.escape(name)}</span></div></div>'
                         f'<div class="row-px"><div class="px">{fmt_px(summary["price"])}</div>'
-                        f'<span class="chg-pill {pill}">{sign}{summary["change_pct"]:.2f}%</span></div>',
+                        f'<span class="chg-pill {pill}">{sign}{summary["change_pct"]:.2f}%</span></div></div>',
                         unsafe_allow_html=True,
                     )
-            with c_open:
-                if st.button("详情", key=f"view_{ticker}", use_container_width=True):
-                    st.session_state.selected_ticker = ticker
-                    st.rerun()
-            with c_del:
-                if st.button("删除", key=f"del_{ticker}", use_container_width=True):
-                    st.session_state.watchlist.remove(ticker)
-                    st.session_state.stock_cache.pop(ticker, None)
-                    st.rerun()
+                b1, b2 = st.columns(2)
+                with b1:
+                    if st.button("详情", key=f"view_{ticker}", use_container_width=True):
+                        st.session_state.selected_ticker = ticker
+                        st.rerun()
+                with b2:
+                    if st.button("删除", key=f"del_{ticker}", use_container_width=True):
+                        st.session_state.watchlist.remove(ticker)
+                        st.session_state.stock_cache.pop(ticker, None)
+                        st.rerun()
+
+    with rank_col:
+        st.markdown(f'<div class="board-head"><div class="section-title">{basis}买入评级前十</div><div class="muted">美股龙头 · 主流加密货币</div></div>', unsafe_allow_html=True)
+        st.caption("多头：收盘在短、中、长均线之上，且短均线高于中均线、中均线高于长均线。日线 7/25/60，周线 10/20/40，月线 6/12/24。")
+        if not picks:
+            st.info("这次没有拉到足够行情，前十暂时空着。过一会儿再刷新。")
+        for index, item in enumerate(picks, start=1):
+            symbol = item["ticker"]
+            cells = item.get("by_unit") or {}
+            pills = " ".join(
+                f'<span class="chg-pill {rate_class(cells[name]["label"])}">{name}线{cells[name]["label"]}</span>'
+                for name in ("日", "周", "月") if name in cells
+            )
+            reasons = "<br>".join(html.escape(cells[name]["why"]) for name in ("日", "周", "月") if name in cells)
+            with st.container(border=True):
+                left, right = st.columns([4.2, 0.8], vertical_alignment="center")
+                with left:
+                    st.markdown(
+                        f'<div style="display:flex;justify-content:space-between;gap:8px;">'
+                        f'<div class="row-symbol">{index}. {show_symbol(symbol)} <span class="chg-pill {rate_class(item["label"])}">综合{item["label"]}</span></div>'
+                        f'<div class="row-px"><div class="px">{fmt_px(item["price"])}</div><div class="muted">综合 {item["score"]} 分</div></div></div>'
+                        f'<div style="margin-top:6px;">{pills}</div>'
+                        f'<div class="row-name" style="max-width:none;white-space:normal;overflow:visible;">{reasons}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with right:
+                    if st.button("查看", key=f"pick_{symbol}", use_container_width=True):
+                        if symbol not in st.session_state.watchlist:
+                            st.session_state.watchlist.append(symbol)
+                        st.session_state.selected_ticker = symbol
+                        st.rerun()
 
 st.caption("仅供学习研究，不构成投资建议。行情来自 Yahoo Finance，有延迟。")
