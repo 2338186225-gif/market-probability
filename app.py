@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import html
 import json
+import os
 import re
 import threading
 import time
@@ -2445,7 +2446,7 @@ def crypto_rebalance(book, rows):
     ranked = [row for row in rows if row.get("side") and row.get("price")]
     ranked.sort(key=lambda row: abs(row.get("ret") or 0) / max(row.get("vol") or 1e-6, 1e-6), reverse=True)
     for row in ranked:
-        if len(book["positions"]) >= 4 or row["ticker"] in book["positions"]:
+        if len(book["positions"]) >= 4 or row["ticker"] in book["positions"] or position_blocked(book, row["ticker"]):
             continue
         if row.get("vol") and row["vol"] > 0.05:
             continue
@@ -2590,7 +2591,7 @@ def paper_rebalance(book, signals, kind):
         ranked.sort(key=lambda item: (0 if item[0] == "多" else 1, {"月": 0, "周": 1, "日": 2}.get(item[1], 3), -(item[3].get("score") or -999)))
 
     for side, horizon, lev, row in ranked:
-        if len(book["positions"]) >= slots or row["ticker"] in book["positions"]:
+        if len(book["positions"]) >= slots or row["ticker"] in book["positions"] or position_blocked(book, row["ticker"]):
             continue
         price = float(row["price"])
         if side == "多" and horizon == "日":
@@ -2693,6 +2694,154 @@ def last_price(ticker):
         return None
     return None
 
+def position_blocked(book, ticker):
+    until = (book.get("block_until") or {}).get(ticker)
+    if not until:
+        return False
+    try:
+        then = datetime.fromisoformat(str(until))
+    except Exception:
+        return False
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    return cn_now() < then
+
+def block_ticker(book, ticker, hours=12):
+    book.setdefault("block_until", {})[ticker] = (cn_now() + timedelta(hours=hours)).isoformat()
+
+def review_drawdown(book, prices, stamp):
+    """浮亏达到保证金四成才离场，并暂停该标的 12 小时，避免平完又开回去。"""
+    notes = []
+    if not isinstance(book, dict):
+        return notes
+    for ticker in list(book.get("positions") or {}):
+        pos = book["positions"].get(ticker)
+        if not isinstance(pos, dict):
+            continue
+        price = (prices or {}).get(ticker) or pos.get("cost")
+        margin, pnl = position_margin_pnl(pos, price)
+        if margin <= 0 or pnl > -0.4 * margin:
+            continue
+        pct = pnl / margin * 100
+        if close_position(book, ticker, price, f"大额亏损自查：浮亏 {pnl:,.0f}，占保证金 {pct:.0f}%，先离场", stamp):
+            block_ticker(book, ticker, 12)
+            notes.append(f"{show_symbol(ticker)} 大额亏损自查后离场")
+    return notes
+
+def open_aligned(book, ticker, side, price, why, stamp, horizon):
+    if not isinstance(book, dict) or ticker in book.get("positions", {}) or position_blocked(book, ticker):
+        return False
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return False
+    if price <= 0:
+        return False
+    equity = float(book.get("cash") or 0)
+    for pos in book.get("positions", {}).values():
+        margin, pnl = position_margin_pnl(pos, pos.get("cost") or 0)
+        equity += margin + pnl
+    lev = 2
+    margin = min(float(book.get("cash") or 0), max(equity, 0) * 0.08)
+    if margin < 1000:
+        return False
+    shares = (margin * lev) / price
+    notional = shares * price
+    fee = commission(ticker, notional)
+    if book["cash"] < margin + fee:
+        return False
+    book["cash"] -= margin + fee
+    book["fees"] = float(book.get("fees") or 0) + fee
+    book["positions"][ticker] = {
+        "shares": shares, "cost": price, "side": side, "leverage": lev,
+        "margin": margin, "horizon": horizon,
+        "fee": fee, "funding": 0, "funded_at": cn_now().isoformat(),
+    }
+    book["trades"].append({
+        "date": stamp, "side": "买" if side == "多" else "开空",
+        "ticker": ticker, "shares": shares, "price": round(price, 4),
+        "horizon": horizon, "leverage": lev, "fee": round(fee, 2),
+        "reason": f"新闻解读做{side}：{why}",
+    })
+    return True
+
+BEAR_EVENT = (
+    "hack", "hacked", "exploit", "exploited", "stolen", "bankrupt", "bankruptcy",
+    "fraud", "trading halt", "halted", "delisting", "delisted", "in default",
+    "data breach", "accounting scandal", "earnings miss", "misses estimates",
+    "guidance cut", "cuts guidance", "sec charges", "lawsuit",
+    "被盗", "黑客", "破产", "欺诈", "停牌", "退市", "暴雷", "爆仓", "造假",
+)
+BULL_EVENT = (
+    "beats estimates", "beats expectations", "raises guidance", "buyback",
+    "share repurchase", "record revenue", "wins approval", "approved",
+    "超预期", "上调指引", "回购", "获批",
+)
+
+def read_news_locally(title, summary):
+    text = f"{title} {summary}".lower()
+    bear = any(word in text for word in BEAR_EVENT)
+    bull = any(word in text for word in BULL_EVENT)
+    if bear and not bull:
+        return "空", "事件本身利空"
+    if bull and not bear:
+        return "多", "事件本身利多"
+    return "忽略", "只是涨跌报道，看不出方向"
+
+def ask_grok_side(ticker, title, summary):
+    token = os.environ.get("XAI_API_KEY")
+    if not token:
+        return None, ""
+    name = pretty_name(ticker)
+    prompt = (
+        f"标的：{name}（{show_symbol(ticker)}）。\n"
+        f"标题：{title}\n正文：{summary[:500]}\n"
+        "只根据这条新闻内容，判断对这个标的应该做多、做空，还是忽略。"
+        "普通涨跌、跌幅、drops、falls、plunges 一律忽略。"
+        "被盗、破产、欺诈、停牌、退市、财报暴雷、指引下调才是做空。"
+        "超预期、上调指引、回购、重大获批才是做多。"
+        "新闻讲的不是这个标的本人，就忽略。"
+        '只输出 JSON：{"side":"多"|"空"|"忽略","why":"20字以内"}'
+    )
+    body = json.dumps({
+        "model": "grok-4-1-fast-non-reasoning",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.x.ai/v1/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        content = data["choices"][0]["message"]["content"]
+        found = re.search(r"\{.*\}", content, re.S)
+        parsed = json.loads(found.group(0) if found else content)
+    except Exception:
+        return None, ""
+    side = parsed.get("side")
+    if side not in ("多", "空", "忽略"):
+        return None, ""
+    return side, str(parsed.get("why") or "")[:40]
+
+def judge_news(ticker, title, summary):
+    summary = re.sub(r"<[^>]+>", " ", summary or "")
+    summary = re.sub(r"\s+", " ", html.unescape(summary)).strip()
+    blob = f"{title} {summary}"
+    if not mentions_asset(ticker, blob):
+        return "忽略", "不是这条标的自己的事"
+    cache = globals().setdefault("_NEWS_JUDGE", {})
+    key = (ticker, (title or "").strip().lower())
+    if key in cache:
+        return cache[key]
+    side, why = ask_grok_side(ticker, title, summary)
+    if side not in ("多", "空", "忽略"):
+        side, why = read_news_locally(title, summary)
+    cache[key] = (side, why)
+    return side, why
+
 def apply_shocks(books, price_fn=None):
     price_fn = price_fn or last_price
     held = []
@@ -2712,26 +2861,40 @@ def apply_shocks(books, price_fn=None):
             items = []
         for item in items:
             title = item.get("title") or ""
-            if not title or not mentions_asset(ticker, title) or not shock_headline(title):
+            if not title:
                 continue
+            side, why = judge_news(ticker, title, item.get("summary") or "")
             key = title.lower()
+            if side not in ("多", "空"):
+                for book in books.values():
+                    if isinstance(book, dict):
+                        book.setdefault("seen", []).append(key)
+                        book["seen"] = book["seen"][-80:]
+                continue
             try:
-                zh = to_zh(title)
+                zh = to_zh(why or title)
             except Exception:
-                zh = title
+                zh = why or title
             for name, book in books.items():
                 if not isinstance(book, dict) or ticker not in book.get("positions", {}):
                     continue
                 if key in book.get("seen", []):
                     continue
-                price = book["positions"][ticker].get("cost")
+                pos = book["positions"][ticker]
+                held_side = pos.get("side") or "多"
+                book.setdefault("seen", []).append(key)
+                book["seen"] = book["seen"][-80:]
+                if held_side == side:
+                    continue
+                price = pos.get("cost")
                 fresh = price_fn(ticker)
                 if fresh:
                     price = fresh
-                if close_position(book, ticker, price, f"重大消息：{zh}", today):
-                    book.setdefault("seen", []).append(key)
-                    book["seen"] = book["seen"][-80:]
-                    acted.append(f"{'自选' if name == 'watch' else '择股' if name == 'edge' else '加密' if name == 'crypto' else '全市场'} {show_symbol(ticker)} 平仓 · {zh}")
+                horizon = pos.get("horizon") or "15分"
+                if close_position(book, ticker, price, f"新闻解读应做{side}：{zh}", today):
+                    open_aligned(book, ticker, side, price, zh, today, horizon)
+                    label = {"watch": "自选", "edge": "择股", "crypto": "加密"}.get(name, "全市场")
+                    acted.append(f"{label} {show_symbol(ticker)} 改做{side} · {zh}")
     return acted
 
 def _monitor_loop():
@@ -2755,6 +2918,7 @@ def _monitor_loop():
                     for ticker, pos in (book.get("positions") or {}).items():
                         prices[ticker] = last_price(ticker) or pos.get("cost")
                     accrue_book(book, prices)
+                    review_drawdown(book, prices, cn_stamp())
                 crypto_rebalance(books["crypto"], crypto_market_rows())
                 acted = apply_shocks(books)
                 after = json.dumps(books, sort_keys=True, default=str)
@@ -3068,6 +3232,16 @@ def render_paper():
             "edge": book_rows_from_book(books.get("edge")),
             "crypto": book_rows_from_book(books.get("crypto")),
         }
+    loss_stamp = cn_stamp()
+    for name in ("watch", "market", "edge", "crypto"):
+        book = books.get(name)
+        if not isinstance(book, dict):
+            continue
+        px = {}
+        for row in signals.get(name) or []:
+            if isinstance(row, dict) and row.get("ticker") and row.get("price"):
+                px[row["ticker"]] = row["price"]
+        review_drawdown(book, px, loss_stamp)
     try:
         save_books(books)
     except Exception:
@@ -3094,7 +3268,7 @@ def render_paper():
         if key == "edge":
             st.caption("择股自己挑。站上 200 日均线且近一年上涨的做多，跌破均线且近一年下跌的做空。杠杆 2 到 10 倍，波动越大倍数越低。最多 6 只。")
         elif key == "crypto":
-            st.caption("加密仓看 15 分钟线。做多做空，杠杆 2 到 10 倍。开平仓扣币安吃单手续费，持仓按资金费率计息。费盖不住预期波动就不开。只有这只币自己的重大新闻才会平仓。")
+            st.caption("加密仓看 15 分钟线。做多做空，杠杆 2 到 10 倍。新闻先解读方向：利空不把空单平掉，方向相反才改仓。浮亏到保证金四成会自查离场，12 小时内不再开回。")
         else:
             st.caption("持仓检查：" + sleeve_report(books[key], signals[key]))
     paper_monitor()
@@ -3124,7 +3298,7 @@ def paper_monitor():
         st.warning("重大消息已立刻卖出：" + "；".join(acted))
         st.rerun()
     else:
-        st.caption(f"新闻监测 {stamp}。大约每 3 分钟查一次。只有持仓标的自己的重大新闻才平仓：被盗、破产、欺诈、停牌、退市、财报暴雷。跌了、调查这类标题不平。")
+        st.caption(f"新闻监测 {stamp}。约每 3 分钟读一次持仓新闻，先判断该做多还是做空。方向和持仓一样就不动；相反才平掉并改方向。普通涨跌标题忽略。浮亏到保证金 40% 会自查离场。")
 
 try:
     paper_monitor = st.fragment(run_every=180)(paper_monitor)
