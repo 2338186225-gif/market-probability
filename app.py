@@ -60,6 +60,9 @@ st.markdown("""
     }
     .chg-up { background: #e9f9f0; color: #047857; }
     .chg-down { background: #fdecec; color: #b91c1c; }
+    .rate-buy { background: #e9f9f0; color: #047857; }
+    .rate-hold { background: #f3f4f6; color: #374151; }
+    .rate-avoid { background: #fdecec; color: #b91c1c; }
     .logo-fallback {
         display: inline-flex; align-items: center; justify-content: center;
         border-radius: 8px; font-weight: 760; flex: 0 0 auto; margin-right: 10px;
@@ -316,6 +319,63 @@ def kline_level(df, unit):
         ratio = float(df["Volume"].iloc[-1]) / float(df["Volume"].tail(10).mean())
         notes.append(f"最近一根成交量约为近 10 根均量的 {ratio:.2f} 倍。")
     return {"unit": unit, "trend": trend, "notes": notes}
+
+LEVEL_POINTS = {"多头": 2.0, "偏多": 1.0, "震荡": 0.0, "偏空": -1.0, "空头": -2.0, "数据不足": 0.0}
+LEVEL_WEIGHT = {"日": 0.7, "周": 1.0, "月": 1.3}
+DISCOVER = [
+    "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "TSM",
+    "ASML", "AMD", "NFLX", "QQQ", "BTC-USD", "ETH-USD", "VTI", "ASTS",
+]
+
+def rating_label(score):
+    if score >= 4:
+        return "强烈买入"
+    if score >= 2:
+        return "买入"
+    if score >= 0.5:
+        return "持有"
+    if score >= -1:
+        return "观望"
+    return "回避"
+
+def rate_class(label):
+    if label in ("强烈买入", "买入"):
+        return "rate-buy"
+    if label == "回避":
+        return "rate-avoid"
+    return "rate-hold"
+
+def rating_from_levels(levels, extra=0.0, extra_notes=None):
+    score = float(extra)
+    notes = []
+    for item in levels or []:
+        if not item:
+            continue
+        delta = LEVEL_POINTS.get(item["trend"], 0) * LEVEL_WEIGHT.get(item["unit"], 1)
+        score += delta
+        notes.append(f"{item['unit']}线目前是{item['trend']}，这一项 {delta:+.1f} 分。")
+        if item["unit"] == "日" and any("超买" in line for line in item["notes"]):
+            score -= 1
+            notes.append("日线已经超买，买入评级再减 1 分，避免追在短线高点。")
+    if extra_notes:
+        notes.extend(extra_notes)
+    return {"label": rating_label(score), "score": round(score, 1), "notes": notes}
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def rate_ticker(ticker: str):
+    try:
+        hist = yf.Ticker(ticker).history(period="5y", interval="1d")
+    except Exception:
+        return None
+    if hist is None or hist.empty or len(hist) < 80:
+        return None
+    weekly = hist.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+    monthly = hist.resample("ME").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+    levels = [kline_level(hist.tail(320), "日"), kline_level(weekly, "周"), kline_level(monthly, "月")]
+    rated = rating_from_levels(levels)
+    rated["ticker"] = ticker
+    rated["price"] = float(hist["Close"].iloc[-1])
+    return rated
 
 def treasury_percent(symbol):
     cache = st.session_state.setdefault("yield_cache", {})
@@ -982,6 +1042,7 @@ if st.session_state.selected_ticker:
         low_px = info.get("dayLow") or info.get("regularMarketDayLow")
         volume = info.get("volume") or info.get("regularMarketVolume")
         cap = info.get("marketCap")
+        structure = rate_ticker(ticker) or {"label": "观望", "score": 0, "notes": ["历史不够，先不给买入评级。"]}
 
         bar_l, bar_r = st.columns([1, 6])
         with bar_l:
@@ -998,7 +1059,8 @@ if st.session_state.selected_ticker:
             f'<div class="quote-card"><div class="quote-top">'
             f'<div style="display:flex;align-items:center;">{logo_html(ticker, website, 42)}'
             f'<div><div class="quote-symbol">{show_symbol(ticker)}'
-            f'<span class="quote-name">{name}</span></div></div></div>'
+            f'<span class="quote-name">{name}</span></div>'
+            f'<div style="margin-top:6px;"><span class="chg-pill {rate_class(structure["label"])}">{structure["label"]}</span></div></div></div>'
             f'<div style="text-align:right;"><div class="quote-last {color}">{fmt_px(current_price)}</div>'
             f'<div class="quote-chg {color}">{sign}{change:.2f}&nbsp;&nbsp;{sign}{change_pct:.2f}%</div></div>'
             f'</div><div class="stat-strip">'
@@ -1258,6 +1320,30 @@ if st.session_state.selected_ticker:
             for item in known:
                 tech_score += {"多头": 1, "偏多": 0.5, "空头": -1, "偏空": -0.5}.get(item["trend"], 0)
             news_bias = 1 if news_score >= 2 else -1 if news_score <= -2 else 0
+            extra_notes = []
+            extra = analyst_score * 0.8 + news_bias * 0.5 + flow_score * 0.4
+            if analyst_score > 0:
+                extra_notes.append("卖方评级偏买入，加分。")
+            elif analyst_score < 0:
+                extra_notes.append("卖方评级偏空，减分。")
+            if news_bias > 0:
+                extra_notes.append("最近新闻标题偏多，少量加分。标题不是全文。")
+            elif news_bias < 0:
+                extra_notes.append("最近新闻标题偏空，减分。")
+            if flow_score > 0:
+                extra_notes.append("ETF 近期估算为净流入，加分。")
+            elif flow_score < 0:
+                extra_notes.append("ETF 近期估算为净流出，减分。")
+            buy_rated = rating_from_levels(levels, extra, extra_notes)
+            buy_class = {"强烈买入": "verdict-up", "买入": "verdict-up", "回避": "verdict-down"}.get(buy_rated["label"], "verdict-mid")
+            buy_text = "<br>".join(html.escape(line) for line in buy_rated["notes"])
+            st.markdown("### 买入评级")
+            st.markdown(
+                f'<div class="analysis-box"><span class="verdict {buy_class}">{buy_rated["label"]} · {buy_rated["score"]}</span><br>{buy_text}'
+                f'<br>达到 2 分是买入，4 分是强烈买入。这是公开行情的打分，不是下单建议。</div>',
+                unsafe_allow_html=True,
+            )
+
             total = tech_score + analyst_score + news_bias + flow_score
             if total >= 2:
                 call, call_class = "偏多", "verdict-up"
@@ -1470,6 +1556,36 @@ if st.session_state.selected_ticker:
     st.markdown("---")
 
 else:
+    scan_list = list(dict.fromkeys(DISCOVER + list(st.session_state.watchlist)))
+    ratings = {}
+    with st.spinner("正在按日线、周线、月线扫描买入评级"):
+        for symbol in scan_list:
+            ratings[symbol] = rate_ticker(symbol)
+    ranked = sorted((item for item in ratings.values() if item), key=lambda item: item["score"], reverse=True)
+    picks = [item for item in ranked if item["label"] in ("强烈买入", "买入")]
+    st.markdown('<div class="board-head"><div class="section-title">高买入评级</div><div class="muted">日线、周线、月线</div></div>', unsafe_allow_html=True)
+    if not picks:
+        st.caption("这批股票里现在没有达到买入。下面是相对更强的几只，评级仍按实际分数显示。")
+        picks = ranked[:3]
+    for item in picks[:6]:
+        symbol = item["ticker"]
+        with st.container(border=True):
+            left, mid, right = st.columns([3.2, 1.3, 0.8], vertical_alignment="center")
+            with left:
+                st.markdown(
+                    f'<div class="row-symbol">{show_symbol(symbol)} <span class="chg-pill {rate_class(item["label"])}">{item["label"]}</span></div>'
+                    f'<span class="row-name">{html.escape(item["notes"][0] if item["notes"] else "")}</span>',
+                    unsafe_allow_html=True,
+                )
+            with mid:
+                st.markdown(f'<div class="row-px"><div class="px">{fmt_px(item["price"])}</div><div class="muted">{item["score"]} 分</div></div>', unsafe_allow_html=True)
+            with right:
+                if st.button("查看", key=f"pick_{symbol}", use_container_width=True):
+                    if symbol not in st.session_state.watchlist:
+                        st.session_state.watchlist.append(symbol)
+                    st.session_state.selected_ticker = symbol
+                    st.rerun()
+
     st.markdown('<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · 延迟行情</div></div>', unsafe_allow_html=True)
     add_col1, add_col2 = st.columns([6, 1])
     with add_col1:
@@ -1495,7 +1611,9 @@ else:
                     st.markdown(
                         f'<div style="display:flex;align-items:center;">'
                         f'{logo_html(summary["ticker"], summary.get("website", ""), 36)}'
-                        f'<div><div class="row-symbol">{show_symbol(summary["ticker"])}</div>'
+                        f'<div><div class="row-symbol">{show_symbol(summary["ticker"])} '
+                        f'<span class="chg-pill {rate_class((ratings.get(summary["ticker"]) or {}).get("label", "观望"))}">'
+                        f'{(ratings.get(summary["ticker"]) or {}).get("label", "—")}</span></div>'
                         f'<span class="row-name" title="{html.escape(name)}">{html.escape(name)}</span></div></div>',
                         unsafe_allow_html=True,
                     )
