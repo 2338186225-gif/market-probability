@@ -2383,20 +2383,22 @@ def crypto_marks():
         cache["rows"] = out
     return out or cache["rows"]
 
-def crypto_signal(close):
+def crypto_signal(close, edge=0.0015):
     """只判断方向和倍数，不管能不能下、下多少。"""
     if close is None or len(close) < 60:
         return None
     price = float(close.iloc[-1])
     ma20 = float(close.tail(20).mean())
     ma60 = float(close.tail(60).mean())
-    ret4 = float(close.iloc[-1] / close.iloc[-5] - 1) if float(close.iloc[-5]) else 0.0
-    rets = np.log(close / close.shift(1)).dropna().tail(32)
-    bar_vol = float(rets.std()) if len(rets) else 0.0
+    prev = float(close.iloc[-5])
+    ret4 = float(close.iloc[-1] / prev - 1) if prev else 0.0
+    rets = np.log(close / close.shift(1)).dropna().tail(48)
+    bar_vol = float(rets.tail(32).std()) if len(rets) else 0.0
     side = None
-    if price > ma20 > ma60 and ret4 > 0.0015:
+    edge = abs(float(edge or 0.0015))
+    if price > ma20 > ma60 and ret4 > edge:
         side = "多"
-    elif price < ma20 < ma60 and ret4 < -0.0015:
+    elif price < ma20 < ma60 and ret4 < -edge:
         side = "空"
     if bar_vol <= 0:
         lev = 2
@@ -2407,11 +2409,39 @@ def crypto_signal(close):
             lev = min(lev, 4)
         if bar_vol > 0.035:
             lev = min(lev, 2)
-    return {"price": price, "side": side, "leverage": lev, "ret": ret4, "vol": bar_vol}
+    return {
+        "price": price, "side": side, "leverage": lev, "ret": ret4, "vol": bar_vol,
+        "rets": [round(float(item), 6) for item in rets],
+    }
 
-def crypto_market_rows():
-    cache = globals().setdefault("_CRYPTO_15M", {"at": 0, "rows": []})
-    if cache["rows"] and time.time() - cache["at"] < 180:
+def returns_corr(left, right):
+    if not left or not right:
+        return 0.0
+    width = min(len(left), len(right), 48)
+    if width < 20:
+        return 0.0
+    xs = np.array(list(left)[-width:], dtype=float)
+    ys = np.array(list(right)[-width:], dtype=float)
+    if float(xs.std()) < 1e-8 or float(ys.std()) < 1e-8:
+        return 0.0
+    return float(np.corrcoef(xs, ys)[0, 1])
+
+def same_bet_margin(positions, rows, ticker, side):
+    """同方向、近 48 根相关性达到 0.75 的持仓，保证金算在一起。"""
+    mine = (rows.get(ticker) or {}).get("rets") or ()
+    used = 0.0
+    for held, pos in positions.items():
+        if held == ticker or (pos.get("side") or "多") != side:
+            continue
+        other = (rows.get(held) or {}).get("rets") or ()
+        if returns_corr(mine, other) >= 0.75:
+            used += float(pos.get("margin") or 0)
+    return used
+
+def crypto_market_rows(edge=0.0015):
+    edge = abs(float(edge or 0.0015))
+    cache = globals().setdefault("_CRYPTO_15M", {"at": 0, "rows": [], "edge": None})
+    if cache["rows"] and cache.get("edge") == edge and time.time() - cache["at"] < 180:
         return cache["rows"]
 
     def one(ticker):
@@ -2421,7 +2451,7 @@ def crypto_market_rows():
                 return None
             hist = binance_klines(symbol, "15m", 80)
             close = hist["Close"].dropna() if hist is not None and not hist.empty else None
-            sig = crypto_signal(close)
+            sig = crypto_signal(close, edge)
             if not sig:
                 return None
             sig["ticker"] = ticker
@@ -2437,8 +2467,9 @@ def crypto_market_rows():
                 rows.append(row)
     if rows:
         cache["at"] = time.time()
+        cache["edge"] = edge
         cache["rows"] = rows
-    return rows or cache["rows"]
+    return rows or (cache["rows"] if cache.get("edge") == edge else [])
 
 def cn_now():
     return datetime.now(ZoneInfo("Asia/Shanghai"))
@@ -2529,12 +2560,17 @@ def crypto_rebalance(book, rows):
             continue
         if not entry_allowed(book, row["ticker"], slot_key, row.get("vol"), 0.05):
             continue
+        need = abs(float(book.get("entry_edge") or 0.0015))
+        if abs(float(row.get("ret") or 0)) < need:
+            continue
         lev = int(min(10, max(2, row.get("leverage") or 2)))
         used = 0.0
         for pos in book["positions"].values():
             used += float(pos["margin"]) if pos.get("margin") is not None else float(pos.get("shares") or 0) * float(pos.get("cost") or 0)
         margin = order_margin(equity, book["cash"], used, lev)
-        if margin <= 0:
+        group = same_bet_margin(book["positions"], by_ticker, row["ticker"], row["side"])
+        margin = min(margin, equity * 0.25 - group)
+        if margin < max(1000, equity * 0.02):
             continue
         price = float(row["price"])
         shares = (margin * lev) / price
@@ -2562,10 +2598,10 @@ def crypto_rebalance(book, rows):
     book["trades"] = book["trades"][-200:]
     return book
 
-def crypto_rule_backtest(limit=500):
-    """同一套进场、仓位和风控，放到最近的 15 分钟 K 线上走一遍。不含新闻。"""
+def crypto_rule_backtest(limit=1000):
+    """前 70% 的 K 线只用来选阈值，后 30% 没参与选择。下一根收盘才成交，含 0.05% 滑点。"""
     cache = globals().setdefault("_CRYPTO_BT", {"at": 0, "row": None})
-    if cache["row"] and time.time() - cache["at"] < 3600:
+    if cache["row"] and cache["row"].get("test") and time.time() - cache["at"] < 3600:
         return cache["row"]
 
     def load(ticker):
@@ -2591,90 +2627,157 @@ def crypto_rule_backtest(limit=500):
     for series in frames.values():
         index = series.index if index is None else index.intersection(series.index)
     index = index.sort_values()
-    if len(index) < 80:
+    if len(index) < 200:
         return None
-    closes = {ticker: series.reindex(index) for ticker, series in frames.items()}
-    cash = PAPER_CASH
-    positions = {}
-    closed = []
-    peak = cash
-    max_dd = 0.0
-    no_reentry = {}
-    for i in range(60, len(index)):
-        slot = str(index[i])
-        sigs = {}
-        for ticker, series in closes.items():
-            sig = crypto_signal(series.iloc[: i + 1])
-            if sig:
-                sigs[ticker] = sig
-        equity = cash
-        for ticker, pos in positions.items():
-            price = float(closes[ticker].iloc[i])
-            margin, pnl = position_margin_pnl(pos, price)
-            equity += margin + pnl
-        peak = max(peak, equity)
-        if peak:
-            max_dd = max(max_dd, (peak - equity) / peak)
-        halted = equity < peak * 0.85 if peak else False
-        for ticker in list(positions):
-            pos = positions[ticker]
-            price = float(closes[ticker].iloc[i])
-            margin, pnl = position_margin_pnl(pos, price)
-            if not margin or pnl > -0.4 * margin:
-                continue
-            fee = commission(ticker, pos["shares"] * price)
-            cash += margin + pnl - fee
-            net = pnl - fee - float(pos.get("fee") or 0)
-            closed.append(net > 0)
-            no_reentry[ticker] = slot
-            del positions[ticker]
-        if halted:
-            continue
-        ranked = []
-        for ticker, sig in sigs.items():
-            if sig.get("side"):
-                ranked.append((abs(sig.get("ret") or 0) / max(sig.get("vol") or 1e-6, 1e-6), ticker, sig))
-        ranked.sort(reverse=True)
-        for _, ticker, sig in ranked:
-            if ticker in positions or len(positions) >= 4 or no_reentry.get(ticker) == slot:
-                continue
-            if sig.get("vol") and sig["vol"] > 0.05:
-                continue
-            used = sum(float(pos.get("margin") or 0) for pos in positions.values())
+    prepared = {}
+    for ticker, series in frames.items():
+        aligned = series.reindex(index).to_numpy(dtype=float)
+        logret = np.zeros_like(aligned)
+        logret[1:] = np.diff(np.log(np.maximum(aligned, 1e-12)))
+        prepared[ticker] = (aligned, logret)
+
+    def signal_at(ticker, i, edge):
+        close, logret = prepared[ticker]
+        if i < 60 or close[i - 4] <= 0:
+            return None
+        ma20 = float(close[i - 19:i + 1].mean())
+        ma60 = float(close[i - 59:i + 1].mean())
+        ret4 = float(close[i] / close[i - 4] - 1)
+        window = logret[max(1, i - 47):i + 1]
+        bar_vol = float(window[-32:].std(ddof=1)) if len(window) > 2 else 0.0
+        side = None
+        if close[i] > ma20 > ma60 and ret4 > edge:
+            side = "多"
+        elif close[i] < ma20 < ma60 and ret4 < -edge:
+            side = "空"
+        if bar_vol <= 0:
+            lev = 2
+        else:
+            strength = min(4.0, abs(ret4) / bar_vol)
+            lev = int(min(10, max(2, round(strength * 2))))
+            if bar_vol > 0.02:
+                lev = min(lev, 4)
+            if bar_vol > 0.035:
+                lev = min(lev, 2)
+        return {
+            "price": float(close[i]), "side": side, "leverage": lev,
+            "ret": ret4, "vol": bar_vol, "rets": [round(float(x), 6) for x in window],
+        }
+
+    def run_window(edge, start, stop):
+        cash = float(PAPER_CASH)
+        positions = {}
+        pending = []
+        pending_rows = {}
+        closed = []
+        peak = cash
+        max_dd = 0.0
+        no_reentry = {}
+        start = max(60, start)
+        stop = min(len(index) - 1, stop)
+        for i in range(start, stop):
+            slot = str(index[i])
+            for ticker, sig in pending:
+                if ticker in positions or len(positions) >= 4 or no_reentry.get(ticker) == slot:
+                    continue
+                raw = float(prepared[ticker][0][i])
+                price = raw * (1.0005 if sig["side"] == "多" else 0.9995)
+                equity_now = cash
+                for held, pos in positions.items():
+                    margin, pnl = position_margin_pnl(pos, float(prepared[held][0][i]))
+                    equity_now += margin + pnl
+                used = sum(float(pos.get("margin") or 0) for pos in positions.values())
+                margin = order_margin(equity_now, cash, used, sig["leverage"])
+                margin = min(margin, equity_now * 0.25 - same_bet_margin(positions, pending_rows, ticker, sig["side"]))
+                if margin < max(1000, equity_now * 0.02) or price <= 0:
+                    continue
+                notional = margin * int(sig["leverage"])
+                fee = commission(ticker, notional)
+                if cash < margin + fee or abs(float(sig.get("ret") or 0)) <= (fee * 2 / notional) * 1.5:
+                    continue
+                cash -= margin + fee
+                positions[ticker] = {
+                    "shares": notional / price, "cost": price, "side": sig["side"],
+                    "leverage": int(sig["leverage"]), "margin": margin, "fee": fee,
+                }
+            pending = []
+            pending_rows = {}
             equity = cash
-            for held, pos in positions.items():
-                margin, pnl = position_margin_pnl(pos, float(closes[held].iloc[i]))
+            for ticker, pos in positions.items():
+                margin, pnl = position_margin_pnl(pos, float(prepared[ticker][0][i]))
                 equity += margin + pnl
-            lev = int(min(10, max(2, sig.get("leverage") or 2)))
-            margin = order_margin(equity, cash, used, lev)
-            price = float(sig["price"])
-            if margin <= 0 or price <= 0:
+            peak = max(peak, equity)
+            if peak:
+                max_dd = max(max_dd, (peak - equity) / peak)
+            for ticker in list(positions):
+                pos = positions[ticker]
+                price = float(prepared[ticker][0][i])
+                margin, pnl = position_margin_pnl(pos, price)
+                if not margin or pnl > -0.4 * margin:
+                    continue
+                fee = commission(ticker, pos["shares"] * price)
+                cash += margin + pnl - fee
+                closed.append(pnl - fee - float(pos.get("fee") or 0) > 0)
+                no_reentry[ticker] = slot
+                del positions[ticker]
+            if equity < peak * 0.85:
                 continue
-            notional = margin * lev
-            fee = commission(ticker, notional)
-            if cash < margin + fee:
-                continue
-            if abs(float(sig.get("ret") or 0)) <= (fee * 2 / notional) * 1.5:
-                continue
-            cash -= margin + fee
-            shares = notional / price
-            positions[ticker] = {
-                "shares": shares, "cost": price, "side": sig["side"],
-                "leverage": lev, "margin": margin, "fee": fee,
-            }
-    equity = cash
-    for ticker, pos in positions.items():
-        margin, pnl = position_margin_pnl(pos, float(closes[ticker].iloc[-1]))
-        equity += margin + pnl
-    wins = sum(1 for item in closed if item)
+            sigs = {}
+            for ticker in prepared:
+                sig = signal_at(ticker, i, edge)
+                if sig:
+                    sigs[ticker] = sig
+            ranked = []
+            for ticker, sig in sigs.items():
+                if sig.get("side"):
+                    ranked.append((abs(sig["ret"]) / max(sig["vol"], 1e-6), ticker, sig))
+            ranked.sort(reverse=True)
+            pending_rows = sigs
+            for _, ticker, sig in ranked:
+                if ticker in positions or no_reentry.get(ticker) == slot:
+                    continue
+                if sig.get("vol") and sig["vol"] > 0.05:
+                    continue
+                pending.append((ticker, sig))
+        equity = cash
+        last = max(start, stop - 1)
+        for ticker, pos in positions.items():
+            margin, pnl = position_margin_pnl(pos, float(prepared[ticker][0][last]))
+            equity += margin + pnl
+        wins = sum(1 for item in closed if item)
+        return {
+            "trades": len(closed),
+            "wins": wins,
+            "win_rate": (wins / len(closed)) if closed else None,
+            "ret": equity / PAPER_CASH - 1,
+            "max_dd": max_dd,
+            "open": len(positions),
+            "bars": max(0, stop - start),
+        }
+
+    split = 60 + int((len(index) - 60) * 0.7)
+    best_edge = 0.0015
+    best_score = None
+    train = None
+    for edge in (0.001, 0.0015, 0.002, 0.003):
+        sample = run_window(edge, 60, split)
+        score = sample["ret"] - sample["max_dd"]
+        if best_score is None or score > best_score:
+            best_score = score
+            best_edge = edge
+            train = sample
+    test = run_window(best_edge, split, len(index))
     result = {
-        "trades": len(closed),
-        "wins": wins,
-        "win_rate": (wins / len(closed)) if closed else None,
-        "ret": equity / PAPER_CASH - 1,
-        "max_dd": max_dd,
-        "open": len(positions),
-        "bars": len(index) - 60,
+        "edge": best_edge,
+        "use_live": test["ret"] > -0.02 and test["max_dd"] < 0.25,
+        "train": train,
+        "test": test,
+        "trades": test["trades"],
+        "win_rate": test["win_rate"],
+        "ret": test["ret"],
+        "max_dd": test["max_dd"],
+        "open": test["open"],
+        "bars": test["bars"],
     }
     cache["at"] = time.time()
     cache["row"] = result
@@ -3160,7 +3263,8 @@ def _monitor_loop():
                         prices[ticker] = last_price(ticker) or pos.get("cost")
                     accrue_book(book, prices)
                     review_drawdown(book, prices, cn_stamp())
-                crypto_rebalance(books["crypto"], crypto_market_rows())
+                crypto_edge = (books.get("crypto") or {}).get("entry_edge")
+                crypto_rebalance(books["crypto"], crypto_market_rows(crypto_edge))
                 acted = apply_shocks(books)
                 after = json.dumps(books, sort_keys=True, default=str)
                 if not acted and before == after:
@@ -3450,12 +3554,14 @@ def render_paper():
     )
     if key == "crypto":
         marks = crypto_marks()
-        cached = globals().get("_CRYPTO_15M") or {}
+        edge = (books.get("crypto") or {}).get("entry_edge")
+        fetched = crypto_market_rows(edge)
         crypto_rows = []
-        for row in cached.get("rows") or []:
+        for row in fetched or []:
             if not isinstance(row, dict) or not row.get("ticker"):
                 continue
             item = dict(row)
+            item.pop("rets", None)
             if item["ticker"] in marks:
                 item["price"] = marks[item["ticker"]]
             crypto_rows.append(item)
@@ -3469,9 +3575,9 @@ def render_paper():
                 continue
             crypto_rows.append({"ticker": ticker, "price": (marks or {}).get(ticker) or pos.get("cost"), "side": pos.get("side"), "horizons": {}})
         signals = {"watch": book_rows_from_book(books.get("watch")), "market": book_rows_from_book(books.get("market")), "edge": book_rows_from_book(books.get("edge")), "crypto": crypto_rows}
-        if cached.get("rows"):
+        if fetched:
             try:
-                crypto_rebalance(books["crypto"], cached["rows"])
+                crypto_rebalance(books["crypto"], fetched)
             except Exception:
                 pass
     elif fresh:
@@ -3535,18 +3641,30 @@ def render_paper():
                         halted = "总资产离开高点超过 15%，24 小时内不再开新仓。"
                 except Exception:
                     halted = ""
-            st.caption("方向、下多少、能不能下是分开的。同一根 15 分钟平掉后不再开回。浮亏到保证金四成才止损，并冷却 12 小时。" + halted)
+            st.caption("同方向、走势相关性达到 0.75 的币，保证金合并计算，合计不超过总资产的 25%。同一根 15 分钟平掉后不再开回。浮亏到保证金四成才止损。" + halted)
             if st.button("回测这条加密规则", key="bt_crypto"):
-                with st.spinner("用最近约 500 根 15 分钟 K 线回测，不含新闻"):
-                    st.session_state.crypto_bt = crypto_rule_backtest()
-                    st.session_state.crypto_bt_tried = st.session_state.crypto_bt is None
+                with st.spinner("前 70% 选阈值，后 30% 单独验收。下一根才成交。"):
+                    result = crypto_rule_backtest()
+                    st.session_state.crypto_bt = result
+                    st.session_state.crypto_bt_tried = result is None
+                    if isinstance(result, dict):
+                        if result.get("use_live"):
+                            books["crypto"]["entry_edge"] = result["edge"]
+                        else:
+                            books["crypto"].pop("entry_edge", None)
+                        save_books(books)
             row = st.session_state.get("crypto_bt")
-            if isinstance(row, dict) and row.get("trades") is not None:
-                rate = "暂无已平仓" if row.get("win_rate") is None else f"{row['win_rate'] * 100:.0f}%"
+            if isinstance(row, dict) and isinstance(row.get("test"), dict):
+                train = row["train"]
+                test = row["test"]
+                rate = "暂无已平仓" if test.get("win_rate") is None else f"{test['win_rate'] * 100:.0f}%"
+                verdict = "样本外过关，之后按这个阈值开仓。" if row.get("use_live") else "样本外没过关，实盘仍用 0.15%。"
                 st.caption(
-                    f"回测 {row['bars']} 根：已平 {row['trades']} 笔，胜率 {rate}，"
-                    f"收益率 {row['ret'] * 100:+.1f}%，最大回撤 {row['max_dd'] * 100:.1f}%，"
-                    f"结束时仍持有 {row['open']} 笔。这是历史模拟，不是之后的收益。"
+                    f"阈值 {row['edge'] * 100:.2f}% 只在前 {train['bars']} 根里选定。"
+                    f"样本内收益 {train['ret'] * 100:+.1f}%，回撤 {train['max_dd'] * 100:.1f}%。"
+                    f"样本外 {test['bars']} 根：已平 {test['trades']} 笔，胜率 {rate}，"
+                    f"收益 {test['ret'] * 100:+.1f}%，回撤 {test['max_dd'] * 100:.1f}%。"
+                    f"{verdict}下一根收盘才成交，含 0.05% 滑点。不是之后的收益。"
                 )
             elif row is None and st.session_state.get("crypto_bt_tried"):
                 st.caption("这轮回测没有拿到足够的 K 线。")
