@@ -29,10 +29,34 @@ st.markdown("""
     .stApp { background: #ffffff; }
     .block-container { max-width: 100%; padding-top: 1.1rem; padding-bottom: 2rem; padding-left: 1.25rem; padding-right: 1.25rem; }
     .topbar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
-    a.paper-link, a.paper-link:hover {
-        margin-left: auto; color: #fff; text-decoration: none; font-size: 14px; font-weight: 720;
-        background: #111827; border-radius: 999px; padding: 6px 14px;
+    a.paper-entry, a.paper-entry:hover {
+        display: flex; align-items: center; justify-content: space-between; gap: 16px;
+        text-decoration: none; color: #111827; background: #fff;
+        border: 1px solid #e7e9ee; border-radius: 16px; padding: 16px;
+        min-height: 76px; margin: 0 0 14px;
     }
+    .paper-entry-main b { display: block; font-size: 18px; font-weight: 760; }
+    .paper-entry-main i { display: block; margin-top: 4px; color: #8b919a; font-style: normal; font-size: 13px; }
+    .paper-entry-rate { text-align: right; }
+    .paper-entry-rate em { display: block; color: #8b919a; font-style: normal; font-size: 12px; }
+    .paper-entry-rate strong { display: block; font-size: 28px; font-weight: 760; letter-spacing: -0.04em; line-height: 1.1; }
+    .paper-tabs { display: flex; gap: 22px; border-bottom: 1px solid #e7e9ee; margin: 4px 0 16px; }
+    .paper-tabs a { color: #8b919a; text-decoration: none; font-size: 16px; font-weight: 700; padding-bottom: 10px; }
+    .paper-tabs a.on { color: #111827; border-bottom: 3px solid #f0b90b; }
+    .asset-row, .asset-row:hover {
+        display: flex; align-items: center; gap: 12px; text-decoration: none; color: #111827;
+        padding: 14px 0; border-bottom: 1px solid #f0f1f4;
+    }
+    .asset-mid { flex: 1; min-width: 0; }
+    .asset-mid b, .asset-right b { display: block; font-size: 16px; font-weight: 760; }
+    .asset-mid i, .asset-right i { display: block; margin-top: 3px; color: #8b919a; font-style: normal; font-size: 12px; }
+    .asset-right { text-align: right; }
+    .pnl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 14px 0 8px; }
+    .pnl-grid span { display: block; color: #8b919a; font-size: 12px; }
+    .pnl-grid b { display: block; margin-top: 4px; font-size: 16px; font-weight: 760; }
+    .trade-line { display: flex; justify-content: space-between; gap: 12px; padding: 14px 0; border-bottom: 1px solid #f0f1f4; }
+    .trade-line b { display: block; font-size: 16px; }
+    .trade-line i { display: block; margin-top: 4px; color: #8b919a; font-style: normal; font-size: 12px; }
     .brand { font-size: 22px; font-weight: 760; color: #111827; letter-spacing: -0.03em; }
     .brand span { color: #1677ff; }
     .brand-sub { color: #8b919a; font-size: 13px; }
@@ -200,8 +224,7 @@ st.markdown("""
 
 st.markdown(
     '<div class="topbar"><div class="brand">行情<span>测算</span></div>'
-    '<div class="brand-sub">自选 · K线 · 财报 · 预测</div>'
-    '<a class="paper-link" href="?view=paper">模拟仓</a></div>',
+    '<div class="brand-sub">自选 · K线 · 财报 · 预测</div></div>',
     unsafe_allow_html=True,
 )
 
@@ -254,6 +277,14 @@ elif sort_q in ("name", "amount", "score", "price", "chg"):
 page = st.query_params.get("view")
 if isinstance(page, list):
     page = page[0] if page else None
+paper_book = st.query_params.get("book")
+if isinstance(paper_book, list):
+    paper_book = paper_book[0] if paper_book else None
+if paper_book not in ("watch", "market"):
+    paper_book = "watch"
+paper_hold = st.query_params.get("hold")
+if isinstance(paper_hold, list):
+    paper_hold = paper_hold[0] if paper_hold else None
 
 ALIASES = {
     "BTC": "BTC-USD",
@@ -1759,65 +1790,197 @@ def apply_shocks(books):
                     acted.append(f"{'自选' if name == 'watch' else '全市场'} {show_symbol(ticker)} 卖出 · {zh}")
     return acted
 
-def book_table(book, signals):
+def fmt_qty(value):
+    value = float(value)
+    if abs(value - round(value)) < 1e-6:
+        return f"{int(round(value)):,}"
+    return f"{value:,.4f}"
+
+def money_class(value):
+    if value > 0:
+        return "up"
+    if value < 0:
+        return "down"
+    return ""
+
+def book_snapshot(book, signals):
     prices = {row["ticker"]: row["price"] for row in signals}
-    labels = {row["ticker"]: row for row in signals}
+    unreal = 0.0
     market_value = 0.0
-    rows = []
-    for ticker, pos in book["positions"].items():
-        price = prices.get(ticker) or pos.get("cost") or 0
-        value = pos["shares"] * float(price)
-        cost = pos["shares"] * float(pos.get("cost") or 0)
+    positions = []
+    for ticker, pos in book.get("positions", {}).items():
+        price = float(prices.get(ticker) or pos.get("cost") or 0)
+        cost = float(pos.get("cost") or 0)
+        shares = float(pos.get("shares") or 0)
+        value = shares * price
+        pnl = value - shares * cost
         market_value += value
-        sig = labels.get(ticker) or {}
-        horizon = pos.get("horizon") or "日"
-        rows.append({
-            "代码": show_symbol(ticker),
-            "级别": f"{horizon}线",
-            "股数": pos["shares"],
-            "成本": round(float(pos.get("cost") or 0), 2),
-            "现价": round(float(price), 2),
-            "市值": round(value, 2),
-            "浮动盈亏": round(value - cost, 2),
-            "该级别评级": ((sig.get("horizons") or {}).get(horizon) or {}).get("label") or "—",
+        unreal += pnl
+        positions.append({
+            "ticker": ticker,
+            "shares": shares,
+            "cost": cost,
+            "price": price,
+            "value": value,
+            "pnl": pnl,
+            "horizon": pos.get("horizon") or "日",
         })
-    equity = book["cash"] + market_value
-    return equity, market_value, rows
+    realized = sum(float(trade.get("pnl") or 0) for trade in book.get("trades") or [] if trade.get("side") == "卖")
+    equity = float(book.get("cash") or 0) + market_value
+    return equity, market_value, unreal, realized, positions
 
-def render_one_book(title, note, book, signals):
-    equity, market_value, rows = book_table(book, signals)
-    pnl = equity - PAPER_CASH
-    st.markdown(f'<div class="board-head"><div class="section-title">{title}</div><div class="muted">{note}</div></div>', unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("总资产", f"{equity:,.0f}")
-    c2.metric("现金", f"{book['cash']:,.0f}")
-    c3.metric("持仓市值", f"{market_value:,.0f}")
-    c4.metric("累计盈亏", f"{pnl:,.0f}", f"{pnl / PAPER_CASH * 100:+.2f}%")
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
-        st.caption("今天没有符合条件的买入，这笔现金还在。")
-    trades = list(reversed(book.get("trades") or []))[:12]
-    if trades:
-        st.dataframe(pd.DataFrame(trades), use_container_width=True, hide_index=True)
-
-def render_win_rate(books):
-    n, wins, by_h = win_record(books)
+def render_win_rate(books, book_key):
+    n, wins, by_h = win_record({"one": books[book_key]})
     rate = (wins / n) if n else None
+    shown = f"{rate * 100:.0f}%" if rate is not None else "—"
     if n < 6:
-        rule = "已平仓不足 6 笔，买入门槛先不改。日线要评级是买入，并且 20 日上涨概率不低于 50%。周线和月线不看这一个短线概率。"
+        rule = "已平仓不足 6 笔，买入门槛先不改。"
     elif rate < 0.45:
-        rule = f"最近胜率 {rate * 100:.0f}%，门槛收紧：只有综合评级是强烈买入，并且这一级仍是买入，才允许开仓。"
+        rule = "胜率低于 45%，现在只在综合评级为强烈买入时开仓。"
     elif rate > 0.62:
-        rule = f"最近胜率 {rate * 100:.0f}%，周线和月线放宽到持有也可以开仓。日线仍然要买入，并且上涨概率不低于 50%。"
+        rule = "胜率高于 62%，周线和月线放到持有也可以开仓。"
     else:
-        rule = f"最近胜率 {rate * 100:.0f}%，门槛维持：日线、周线、月线只要是买入或强烈买入就可以开仓。"
-    parts = [f"已平仓 {n} 笔，获胜 {wins} 笔" + (f"，胜率 {rate * 100:.0f}%。" if rate is not None else "。")]
+        rule = "胜率在中间，日线、周线和月线维持买入才开仓。"
+    bits = []
     for horizon, (count, got) in by_h.items():
         if count:
-            parts.append(f"{horizon}线 {got}/{count}")
-    st.markdown("**胜率**")
-    st.caption(" ".join(parts) + rule + " 页面上的自选评级不跟着改，避免列表乱跳。模拟仓下单用这个门槛。")
+            bits.append(f"{horizon}线 {got}/{count}")
+    extra = (" " + " · ".join(bits)) if bits else ""
+    return shown, f"已平仓 {n} 笔，获胜 {wins} 笔。{rule}{extra}"
+
+def render_holding(book_key, book, signals):
+    ticker = paper_hold
+    snap = {row["ticker"]: row for row in book_snapshot(book, signals)[4]}
+    pos = snap.get(ticker)
+    name = pretty_name(ticker)
+    back = f"?view=paper&book={book_key}"
+    st.markdown(f'<a class="watch-link" href="{back}">返回模拟仓</a>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:10px;margin:12px 0;">{logo_html(ticker, "", 40)}'
+        f'<div><div class="bn-symbol">{html.escape(show_symbol(ticker))}</div>'
+        f'<div class="bn-name">{html.escape(name)}</div></div></div>',
+        unsafe_allow_html=True,
+    )
+    if not pos:
+        st.info("这笔仓位已经平掉了。")
+    else:
+        pnl_pct = (pos["pnl"] / (pos["shares"] * pos["cost"]) * 100) if pos["shares"] and pos["cost"] else 0
+        klass = money_class(pos["pnl"])
+        st.markdown(
+            f'<div class="bn-name">总价值</div>'
+            f'<div class="bn-last">${pos["value"]:,.2f}</div>'
+            f'<div class="pnl-grid">'
+            f'<div><span>成本价</span><b>${fmt_px(pos["cost"])}</b></div>'
+            f'<div><span>市价</span><b>${fmt_px(pos["price"])}</b></div>'
+            f'<div><span>未实现盈亏</span><b class="{klass}">{pos["pnl"]:+,.2f}<br>{pnl_pct:+.2f}%</b></div>'
+            f'</div>'
+            f'<div class="bn-name">{html.escape(pos["horizon"])}线开的仓 · {fmt_qty(pos["shares"])} 股</div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown('<div class="section-title" style="margin-top:18px;">历史记录</div>', unsafe_allow_html=True)
+    trades = [trade for trade in reversed(book.get("trades") or []) if trade.get("ticker") == ticker]
+    if not trades:
+        st.caption("还没有成交。")
+    for trade in trades[:40]:
+        side = trade.get("side") or ""
+        klass = "up" if side == "买" else "down"
+        qty = trade.get("shares")
+        st.markdown(
+            f'<div class="trade-line"><div><b>{html.escape(side)}</b>'
+            f'<i>{html.escape(str(trade.get("date") or ""))} · {html.escape(str(trade.get("reason") or ""))}</i></div>'
+            f'<b class="{klass}">{"+" if side == "买" else "-"}{fmt_qty(qty or 0)}</b></div>',
+            unsafe_allow_html=True,
+        )
+
+def render_book_list(book_key, book, signals):
+    equity, market_value, unreal, realized, positions = book_snapshot(book, signals)
+    shown, rule = render_win_rate(load_books(), book_key)
+    total_pnl = unreal + realized
+    st.markdown(
+        f'<div class="bn-name">总资产 · 美元</div>'
+        f'<div class="bn-last">${equity:,.0f}</div>'
+        f'<div class="pnl-grid">'
+        f'<div><span>胜率</span><b>{shown}</b></div>'
+        f'<div><span>未实现盈亏</span><b class="{money_class(unreal)}">{unreal:+,.0f}</b></div>'
+        f'<div><span>已实现盈亏</span><b class="{money_class(realized)}">{realized:+,.0f}</b></div>'
+        f'</div>'
+        f'<div class="bn-name">累计盈亏 <b class="{money_class(total_pnl)}">{total_pnl:+,.0f}</b> · {html.escape(rule)}</div>',
+        unsafe_allow_html=True,
+    )
+    cash = float(book.get("cash") or 0)
+    st.markdown(
+        f'<a class="asset-row" href="?view=paper&book={book_key}">'
+        f'<span class="logo-fallback" style="width:36px;height:36px;background:#1677ff;color:#fff;">$</span>'
+        f'<span class="asset-mid"><b>现金</b><i>美元</i></span>'
+        f'<span class="asset-right"><b>{cash:,.2f}</b><i>未投入</i></span></a>',
+        unsafe_allow_html=True,
+    )
+    if not positions:
+        st.caption("今天没有符合条件的股票，现金还在。")
+        return
+    for pos in sorted(positions, key=lambda item: item["value"], reverse=True):
+        ticker = pos["ticker"]
+        pnl_pct = (pos["pnl"] / (pos["shares"] * pos["cost"]) * 100) if pos["shares"] and pos["cost"] else 0
+        klass = money_class(pos["pnl"])
+        st.markdown(
+            f'<a class="asset-row" href="?view=paper&book={book_key}&hold={quote(ticker)}">'
+            f'{logo_html(ticker, "", 36)}'
+            f'<span class="asset-mid"><b>{html.escape(show_symbol(ticker))}</b>'
+            f'<i>{html.escape(pretty_name(ticker))} · {html.escape(pos["horizon"])}线</i>'
+            f'<i class="{klass}">未实现盈亏 {pos["pnl"]:+,.2f} ({pnl_pct:+.2f}%)</i></span>'
+            f'<span class="asset-right"><b>{fmt_qty(pos["shares"])}</b><i>${pos["value"]:,.2f}</i></span></a>',
+            unsafe_allow_html=True,
+        )
+
+def render_paper():
+    books = load_books()
+    key = paper_book if paper_book in books else "watch"
+    other = "market" if key == "watch" else "watch"
+    tabs = (
+        f'<div class="paper-tabs">'
+        f'<a class="{"on" if key == "watch" else ""}" href="?view=paper&book=watch">自选</a>'
+        f'<a class="{"on" if key == "market" else ""}" href="?view=paper&book=market">全市场</a>'
+        f'</div>'
+    )
+    st.markdown(tabs, unsafe_allow_html=True)
+    with st.spinner("正在按日线、周线和月线检查模拟仓"):
+        watch_rows = paper_signals(st.session_state.watchlist)
+        ranked = rank_universe(MARKET)[:12]
+        market_rows = []
+        for item in ranked:
+            row = signal_from_item(item.get("ticker"), item)
+            if row and row.get("price"):
+                market_rows.append(row)
+        have = {row["ticker"] for row in market_rows}
+        extra = [ticker for ticker in books["market"]["positions"] if ticker not in have]
+        if extra:
+            market_rows.extend(paper_signals(extra))
+    signals = {"watch": watch_rows, "market": market_rows}
+    paper_rebalance(books["watch"], watch_rows, "watch")
+    paper_rebalance(books["market"], market_rows, "market")
+    apply_shocks(books)
+    save_books(books)
+    if paper_hold and paper_hold in books[key]["positions"] or (paper_hold and any(t.get("ticker") == paper_hold for t in books[key].get("trades") or [])):
+        render_holding(key, books[key], signals[key])
+    else:
+        render_book_list(key, books[key], signals[key])
+    paper_monitor()
+    if st.button("这笔重置为 100 万美元"):
+        books[key] = empty_paper()
+        save_books(books)
+        st.rerun()
+    st.caption("另一笔是" + ("全市场" if other == "market" else "自选") + "，点上面的标签切换。各 100 万美元。没有佣金，不是下单建议。")
+
+def paper_entry():
+    books = load_books()
+    n, wins, _ = win_record(books)
+    shown = f"{wins / n * 100:.0f}%" if n else "—"
+    st.markdown(
+        f'<a class="paper-entry" href="?view=paper">'
+        f'<span class="paper-entry-main"><b>模拟仓</b><i>点这里进入 · 自选和全市场各 100 万美元</i></span>'
+        f'<span class="paper-entry-rate"><em>胜率</em><strong>{shown}</strong></span></a>',
+        unsafe_allow_html=True,
+    )
 
 def paper_monitor():
     books = load_books()
@@ -1834,35 +1997,6 @@ try:
     paper_monitor = st.fragment(run_every=180)(paper_monitor)
 except Exception:
     pass
-
-def render_paper():
-    st.markdown('<div class="board-head"><div class="section-title">模拟仓</div><div class="muted">两笔各 100 万美元</div></div>', unsafe_allow_html=True)
-    st.caption("上面这笔只做自选，下面这笔做全市场评分靠前的标的。日线、周线、月线都可以开仓，同一只股票用级别更高的信号。每个自然日按收盘价调一次。重大消息不等到第二天。没有佣金和滑点，也不是下单建议。")
-    books = load_books()
-    with st.spinner("正在按日线、周线和月线检查两笔模拟仓"):
-        watch_rows = paper_signals(st.session_state.watchlist)
-        ranked = rank_universe(MARKET)[:12]
-        market_rows = []
-        for item in ranked:
-            row = signal_from_item(item.get("ticker"), item)
-            if row and row.get("price"):
-                market_rows.append(row)
-        have = {row["ticker"] for row in market_rows}
-        extra = [ticker for ticker in books["market"]["positions"] if ticker not in have]
-        if extra:
-            market_rows.extend(paper_signals(extra))
-    paper_rebalance(books["watch"], watch_rows, "watch")
-    paper_rebalance(books["market"], market_rows, "market")
-    apply_shocks(books)
-    save_books(books)
-    render_win_rate(books)
-    render_one_book("自选模拟", "只买自选", books["watch"], watch_rows)
-    render_one_book("全市场模拟", "评分靠前的标的", books["market"], market_rows)
-    paper_monitor()
-    if st.button("两笔都重置为 100 万美元"):
-        fresh = {"watch": empty_paper(), "market": empty_paper()}
-        save_books(fresh)
-        st.rerun()
 
 # ==================== 详情页优先显示 ====================
 if st.session_state.selected_ticker:
@@ -2421,6 +2555,7 @@ elif page == "paper":
     render_paper()
 
 else:
+    paper_entry()
     with st.spinner("正在扫描美股龙头和主流加密货币，按买入评级取前十"):
         ranked = rank_universe(MARKET)
         pool = ranked[:40]
