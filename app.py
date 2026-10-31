@@ -2126,6 +2126,8 @@ NEWS_ALIAS = {
     "RKLB": ("Rocket Lab",),
 }
 
+CRYPTO_RESET_ID = "flat-20261101"
+
 def empty_paper():
     return {"cash": PAPER_CASH, "positions": {}, "trades": [], "last_run": "", "started": date.today().isoformat(), "seen": []}
 
@@ -2135,10 +2137,19 @@ def reset_book(name):
     if name == "crypto":
         book["last_run"] = crypto_bar_slot()
         book["rules"] = "crypto-15m-v3"
+        book["reset_id"] = CRYPTO_RESET_ID
     else:
         book["last_run"] = cn_now().date().isoformat()
         book["rules"] = "edge-lev-v3" if name == "edge" else "lev-v3"
     return book
+
+def ensure_crypto_reset(books):
+    book = books.get("crypto") if isinstance(books, dict) else None
+    if isinstance(book, dict) and book.get("reset_id") == CRYPTO_RESET_ID:
+        return False
+    fresh = reset_book("crypto")
+    books["crypto"] = fresh
+    return True
 
 def load_books():
     raw = None
@@ -2166,6 +2177,8 @@ def load_books():
     else:
         for key in ("watch", "market", "edge", "crypto"):
             st.session_state.books.setdefault(key, empty_paper())
+    if ensure_crypto_reset(st.session_state.books):
+        save_books(st.session_state.books)
     return st.session_state.books
 
 def save_books(books):
@@ -2963,6 +2976,9 @@ def _monitor_loop():
                 if not isinstance(books, dict) or "watch" not in books:
                     continue
                 books.setdefault("crypto", empty_paper())
+                if ensure_crypto_reset(books):
+                    books["updated"] = datetime.now().isoformat(timespec="seconds")
+                    PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False))
                 before = json.dumps(books, sort_keys=True, default=str)
                 for name in ("watch", "market", "edge", "crypto"):
                     book = books.get(name)
