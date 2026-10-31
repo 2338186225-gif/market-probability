@@ -1930,11 +1930,22 @@ else:
         if symbol not in ratings:
             ratings[symbol] = rate_ticker(symbol)
 
+    basis = st.radio("按哪一级看", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
+    level_unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
+
+    def shown_rating(item):
+        if not item:
+            return "—", None
+        if level_unit:
+            cell = (item.get("by_unit") or {}).get(level_unit) or {}
+            return cell.get("label") or "—", cell.get("score")
+        return item.get("label") or "—", item.get("score")
+
     st.markdown('<div class="home-board"></div>', unsafe_allow_html=True)
     watch_col, rank_col, news_col = st.columns([1.75, 0.9, 0.78], gap="medium")
 
     with watch_col:
-        st.markdown('<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · 延迟行情</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · {basis}</div></div>', unsafe_allow_html=True)
         st.markdown('<div class="add-bar"></div>', unsafe_allow_html=True)
         add_l, add_r = st.columns([5, 1])
         with add_l:
@@ -1969,6 +1980,7 @@ else:
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
             rated = ratings.get(ticker) or {}
+            label, score = shown_rating(rated)
             info = (summary or {}).get("info") or {}
             volume = info.get("regularMarketVolume") or info.get("volume")
             price = summary["price"] if summary else None
@@ -1976,8 +1988,8 @@ else:
             rows.append({
                 "ticker": ticker,
                 "summary": summary,
-                "label": rated.get("label", "—"),
-                "score": rated.get("score"),
+                "label": label,
+                "score": score,
                 "price": price or 0,
                 "change_pct": summary["change_pct"] if summary else -999,
                 "amount": amount or 0,
@@ -2010,10 +2022,8 @@ else:
             )
 
     with rank_col:
-        basis = st.radio("按哪一级看前十", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
-        unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
-        if unit:
-            ranked_view = sorted(ranked, key=lambda item: item.get("by_unit", {}).get(unit, {}).get("score", -99), reverse=True)
+        if level_unit:
+            ranked_view = sorted(ranked, key=lambda item: (item.get("by_unit") or {}).get(level_unit, {}).get("score", -99), reverse=True)
         else:
             ranked_view = list(ranked)
         picks = ranked_view[:10]
@@ -2031,9 +2041,10 @@ else:
             info = (summary or {}).get("info") or {}
             volume = info.get("regularMarketVolume") or info.get("volume")
             amount = price * float(volume) if price and volume else None
+            label, score = shown_rating(item)
             body = quote_bar(
-                symbol, price, change_pct, item["label"], name, website,
-                prefix=f"{index}. ", amount=amount, score=item.get("score"),
+                symbol, price, change_pct, label, name, website,
+                prefix=f"{index}. ", amount=amount, score=score,
             )
             st.markdown(f'<div class="qrow"><a class="row-hit bare" href="?ticker={quote(symbol)}">{body}</a></div>', unsafe_allow_html=True)
 
