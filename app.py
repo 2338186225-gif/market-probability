@@ -1112,10 +1112,6 @@ def quote_bar(ticker, price, change_pct, label, name, website="", prefix="", amo
     sign = "+" if change_pct >= 0 else ""
     shown = f"{prefix}{show_symbol(ticker)}"
     sub = html.escape(name)
-    ext = extended_quote(ticker)
-    if ext:
-        ext_sign = "+" if ext["pct"] >= 0 else ""
-        sub += f" · {ext['label']} {fmt_px(ext['price'])} {ext_sign}{ext['pct']:.2f}%"
     if amount:
         sub += f" | {fmt_cap(amount)}"
     score_text = f"{score:.1f}" if score is not None else "—"
@@ -2157,6 +2153,25 @@ def position_margin_pnl(pos, price):
     margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
     return margin, pnl
 
+def crypto_marks():
+    cache = globals().setdefault("_CRYPTO_PX", {"at": 0, "rows": {}})
+    if cache["rows"] and time.time() - cache["at"] < 20:
+        return cache["rows"]
+    wanted = {binance_symbol(ticker): ticker for ticker in CRYPTO_MARKET}
+    try:
+        payload = binance_get("/api/v3/ticker/price", {"symbols": json.dumps(list(wanted), separators=(",", ":"))})
+    except Exception:
+        payload = []
+    out = {}
+    for item in payload or []:
+        ticker = wanted.get(item.get("symbol"))
+        if ticker and item.get("price"):
+            out[ticker] = float(item["price"])
+    if out:
+        cache["at"] = time.time()
+        cache["rows"] = out
+    return out or cache["rows"]
+
 def crypto_market_rows():
     cache = globals().setdefault("_CRYPTO_15M", {"at": 0, "rows": []})
     if cache["rows"] and time.time() - cache["at"] < 180:
@@ -2254,10 +2269,10 @@ def crypto_rebalance(book, rows):
         reason = None
         if margin and pnl <= -0.8 * margin:
             reason = "亏损接近保证金，提前平仓"
-        elif not sig or not sig.get("side"):
-            reason = "15 分钟趋势走平，先平掉"
-        elif sig.get("side") != side:
+        elif sig and sig.get("side") and sig.get("side") != side:
             reason = "15 分钟方向反了"
+        elif not sig:
+            continue
         elif margin and pnl <= -0.35 * margin:
             reason = "15 分钟止损"
         rate = funding_rate_8h(ticker)
@@ -2763,7 +2778,6 @@ def render_book_list(book_key, book, signals):
     )
     if not positions:
         st.caption("这一轮没有符合条件的币，现金还在。" if book_key == "crypto" else "今天没有符合条件的股票，现金还在。")
-        return
     for pos in sorted(positions, key=lambda item: item["value"], reverse=True):
         ticker = pos["ticker"]
         basis = pos.get("margin") or (pos["shares"] * pos["cost"])
@@ -2849,12 +2863,45 @@ def render_paper():
     st.markdown(tabs, unsafe_allow_html=True)
     paper_at = st.session_state.get("paper_board_at") or 0
     paper_key = (tuple(st.session_state.watchlist), "lev-v2")
-    if (
+    if key == "crypto":
+        marks = crypto_marks()
+        cached = globals().get("_CRYPTO_15M") or {}
+        crypto_rows = []
+        for row in cached.get("rows") or []:
+            item = dict(row)
+            if item["ticker"] in marks:
+                item["price"] = marks[item["ticker"]]
+            crypto_rows.append(item)
+        have = {row["ticker"] for row in crypto_rows}
+        for ticker, price in marks.items():
+            if ticker not in have:
+                crypto_rows.append({"ticker": ticker, "price": price, "side": None, "horizons": {}})
+        for ticker, pos in books["crypto"]["positions"].items():
+            if ticker not in {row["ticker"] for row in crypto_rows}:
+                crypto_rows.append({"ticker": ticker, "price": marks.get(ticker) or pos.get("cost"), "side": pos.get("side"), "horizons": {}})
+        signals = {"watch": [], "market": [], "edge": [], "crypto": crypto_rows}
+        if cached.get("rows"):
+            crypto_rebalance(books["crypto"], cached["rows"])
+        elif not globals().get("_CRYPTO_LOADING"):
+            globals()["_CRYPTO_LOADING"] = True
+            def _load_crypto():
+                try:
+                    crypto_market_rows()
+                finally:
+                    globals()["_CRYPTO_LOADING"] = False
+            threading.Thread(target=_load_crypto, name="crypto-15m", daemon=True).start()
+        save_books(books)
+    elif (
         time.time() - paper_at < 1800
         and st.session_state.get("paper_watch_key") == paper_key
         and st.session_state.get("paper_signals")
     ):
-        signals = st.session_state.paper_signals
+        signals = dict(st.session_state.paper_signals)
+        signals["crypto"] = (globals().get("_CRYPTO_15M") or {}).get("rows") or []
+        paper_rebalance(books["watch"], signals.get("watch") or [], "watch")
+        paper_rebalance(books["market"], signals.get("market") or [], "market")
+        paper_rebalance(books["edge"], signals.get("edge") or [], "edge")
+        save_books(books)
     else:
         with st.spinner("正在检查模拟仓"):
             watch_rows = paper_signals(st.session_state.watchlist)
@@ -2890,19 +2937,14 @@ def render_paper():
             edge_extra = [ticker for ticker in books["edge"]["positions"] if ticker not in edge_have]
             if edge_extra:
                 edge_rows.extend(paper_signals(edge_extra))
-        signals = {"watch": watch_rows, "market": market_rows, "edge": edge_rows}
+        signals = {"watch": watch_rows, "market": market_rows, "edge": edge_rows, "crypto": []}
         st.session_state.paper_signals = signals
         st.session_state.paper_board_at = time.time()
         st.session_state.paper_watch_key = paper_key
-    crypto_rows = crypto_market_rows()
-    signals = dict(signals)
-    signals["crypto"] = crypto_rows
-    paper_rebalance(books["watch"], signals.get("watch") or [], "watch")
-    paper_rebalance(books["market"], signals.get("market") or [], "market")
-    paper_rebalance(books["edge"], signals.get("edge") or [], "edge")
-    crypto_rebalance(books["crypto"], crypto_rows)
-    apply_shocks(books)
-    save_books(books)
+        paper_rebalance(books["watch"], signals.get("watch") or [], "watch")
+        paper_rebalance(books["market"], signals.get("market") or [], "market")
+        paper_rebalance(books["edge"], signals.get("edge") or [], "edge")
+        save_books(books)
     equities = {name: book_equity(books[name], signals.get(name) or []) for name in ("watch", "market", "edge", "crypto")}
     st.caption(
         "累计盈亏对照：自选 "
