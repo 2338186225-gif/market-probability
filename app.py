@@ -2287,10 +2287,10 @@ def render_holding(book_key, book, signals):
         )
         st.markdown(
             f'<div class="bn-name">总价值</div>'
-            f'<div class="bn-last">\\${pos["value"]:,.2f}</div>'
+            f'<div class="bn-last">&#36;{pos["value"]:,.2f}</div>'
             f'<div class="pnl-grid">'
-            f'<div><span>成本价</span><b>\\${fmt_px(pos["cost"])}</b></div>'
-            f'<div><span>市价</span><b>\\${fmt_px(pos["price"])}</b></div>'
+            f'<div><span>成本价</span><b>&#36;{fmt_px(pos["cost"])}</b></div>'
+            f'<div><span>市价</span><b>&#36;{fmt_px(pos["price"])}</b></div>'
             f'<div><span>未实现盈亏</span><b class="{klass}">{pos["pnl"]:+,.2f}<br>{pnl_pct:+.2f}%</b></div>'
             f'</div>'
             f'<div class="bn-name">{html.escape(hold_text)}</div>',
@@ -2319,7 +2319,7 @@ def render_book_list(book_key, book, signals):
     total_pnl = unreal + realized
     st.markdown(
         f'<div class="bn-name">总资产 · 美元</div>'
-        f'<div class="bn-last">\\${equity:,.0f}</div>'
+        f'<div class="bn-last">&#36;{equity:,.0f}</div>'
         f'<div class="pnl-grid">'
         f'<div><span>胜率</span><b>{shown}</b></div>'
         f'<div><span>未实现盈亏</span><b class="{money_class(unreal)}">{unreal:+,.0f}</b></div>'
@@ -2351,9 +2351,9 @@ def render_book_list(book_key, book, signals):
             f'{logo_html(ticker, "", 36)}'
             f'<span class="asset-mid"><b>{html.escape(show_symbol(ticker))}</b>'
             f'<i>{html.escape(pretty_name(ticker))} · {html.escape(tag)}</i>'
-            f'<i>成本 \\${fmt_px(pos["cost"])}</i>'
+            f'<i>成本 &#36;{fmt_px(pos["cost"])} · 现价 &#36;{fmt_px(pos["price"])}</i>'
             f'<i class="{klass}">未实现盈亏 {pos["pnl"]:+,.2f} ({pnl_pct:+.2f}%)</i></span>'
-            f'<span class="asset-right"><b>{fmt_qty(pos["shares"])}</b><i>\\${pos["value"]:,.2f}</i></span></a>',
+            f'<span class="asset-right"><b>{fmt_qty(pos["shares"])}</b><i>&#36;{pos["value"]:,.2f}</i></span></a>',
             unsafe_allow_html=True,
         )
     trades = list(reversed(book.get("trades") or []))[:16]
@@ -2373,7 +2373,7 @@ def render_book_list(book_key, book, signals):
         st.markdown(
             f'<a class="trade-line" href="{href}" target="_self" style="text-decoration:none;color:#111827;">'
             f'<div><b>{html.escape(show_symbol(ticker))} {html.escape(side)}</b>'
-            f'<i>{html.escape(str(trade.get("date") or ""))}{lev_text} · \\${fmt_px(trade.get("price") or 0)} · {html.escape(str(trade.get("reason") or ""))}</i></div>'
+            f'<i>{html.escape(str(trade.get("date") or ""))}{lev_text} · &#36;{fmt_px(trade.get("price") or 0)} · {html.escape(str(trade.get("reason") or ""))}</i></div>'
             f'<b class="{klass}">{right}</b></a>',
             unsafe_allow_html=True,
         )
