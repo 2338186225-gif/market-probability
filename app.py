@@ -887,12 +887,8 @@ def _info_num(info, key):
     except (TypeError, ValueError):
         return None
 
-_CONTEXT_CACHE = {}
-
+@st.cache_data(ttl=1800, show_spinner=False)
 def context_points(ticker, with_news=True):
-    key = (ticker, bool(with_news))
-    if key in _CONTEXT_CACHE:
-        return _CONTEXT_CACHE[key]
     report = value = news = flow = 0
     notes = []
     try:
@@ -967,7 +963,6 @@ def context_points(ticker, with_news=True):
         if flow:
             notes.append("ETF 份额变化" + ("净流入，+6。" if flow > 0 else "净流出，-6。"))
     result = {"report": report, "value": value, "news": news, "flow": flow, "total": report + value + news + flow, "notes": notes}
-    _CONTEXT_CACHE[key] = result
     return result
 
 def merge_context(item, with_news=True):
@@ -2132,35 +2127,47 @@ def render_paper():
         f'</div>'
     )
     st.markdown(tabs, unsafe_allow_html=True)
-    with st.spinner("正在检查三笔模拟仓"):
-        watch_rows = paper_signals(st.session_state.watchlist)
-        ranked = rank_universe(MARKET)
-        market_rows = []
-        for item in ranked[:20]:
-            row = signal_from_item(item.get("ticker"), item)
-            if row and row.get("price"):
-                market_rows.append(row)
-        have = {row["ticker"] for row in market_rows}
-        extra = [ticker for ticker in books["market"]["positions"] if ticker not in have]
-        if extra:
-            market_rows.extend(paper_signals(extra))
-        edge_rows = []
-        for item in ranked:
-            if not item or not item.get("price"):
-                continue
-            edge_rows.append({
-                "ticker": item.get("ticker"),
-                "price": item.get("price"),
-                "vol": item.get("vol"),
-                "mom": item.get("mom"),
-                "above_ma": bool(item.get("above_ma")),
-                "horizons": {},
-            })
-        edge_have = {row["ticker"] for row in edge_rows}
-        edge_extra = [ticker for ticker in books["edge"]["positions"] if ticker not in edge_have]
-        if edge_extra:
-            edge_rows.extend(paper_signals(edge_extra))
-    signals = {"watch": watch_rows, "market": market_rows, "edge": edge_rows}
+    paper_at = st.session_state.get("paper_board_at") or 0
+    paper_key = tuple(st.session_state.watchlist)
+    if (
+        time.time() - paper_at < 1800
+        and st.session_state.get("paper_watch_key") == paper_key
+        and st.session_state.get("paper_signals")
+    ):
+        signals = st.session_state.paper_signals
+    else:
+        with st.spinner("正在检查三笔模拟仓"):
+            watch_rows = paper_signals(st.session_state.watchlist)
+            ranked = rank_universe(MARKET)
+            market_rows = []
+            for item in ranked[:20]:
+                row = signal_from_item(item.get("ticker"), item)
+                if row and row.get("price"):
+                    market_rows.append(row)
+            have = {row["ticker"] for row in market_rows}
+            extra = [ticker for ticker in books["market"]["positions"] if ticker not in have]
+            if extra:
+                market_rows.extend(paper_signals(extra))
+            edge_rows = []
+            for item in ranked:
+                if not item or not item.get("price"):
+                    continue
+                edge_rows.append({
+                    "ticker": item.get("ticker"),
+                    "price": item.get("price"),
+                    "vol": item.get("vol"),
+                    "mom": item.get("mom"),
+                    "above_ma": bool(item.get("above_ma")),
+                    "horizons": {},
+                })
+            edge_have = {row["ticker"] for row in edge_rows}
+            edge_extra = [ticker for ticker in books["edge"]["positions"] if ticker not in edge_have]
+            if edge_extra:
+                edge_rows.extend(paper_signals(edge_extra))
+        signals = {"watch": watch_rows, "market": market_rows, "edge": edge_rows}
+        st.session_state.paper_signals = signals
+        st.session_state.paper_board_at = time.time()
+        st.session_state.paper_watch_key = paper_key
     paper_rebalance(books["watch"], watch_rows, "watch")
     paper_rebalance(books["market"], market_rows, "market")
     paper_rebalance(books["edge"], market_rows, "edge")
@@ -2789,28 +2796,43 @@ elif page == "paper":
 
 else:
     paper_entry()
-    with st.spinner("正在扫描美股龙头和主流加密货币，按买入评级取前十"):
-        ranked = rank_universe(MARKET)
-        pool = ranked[:40]
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            enriched = list(executor.map(lambda item: merge_context(item, True), pool))
-        ranked = enriched + ranked[40:]
-        ranked.sort(key=lambda item: item.get("score") or -999, reverse=True)
-    ratings = {item["ticker"]: item for item in ranked}
-    missing = [symbol for symbol in st.session_state.watchlist if not (ratings.get(symbol) or {}).get("context")]
-    need_fetch = [symbol for symbol in missing if symbol not in ratings]
-    fetched = {}
-    if need_fetch:
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            for symbol, item in zip(need_fetch, executor.map(rate_ticker, need_fetch)):
-                fetched[symbol] = item
-    for symbol in missing:
-        base = ratings.get(symbol) or fetched.get(symbol)
-        if base:
-            ratings[symbol] = merge_context(base, True)
-
     basis = st.radio("按哪一级看", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
     level_unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
+    watch_key = tuple(st.session_state.watchlist)
+    board_at = st.session_state.get("home_board_at") or 0
+    board_ok = (
+        time.time() - board_at < 1800
+        and st.session_state.get("home_watch_key") == watch_key
+        and st.session_state.get("home_ranked")
+        and st.session_state.get("home_ratings")
+    )
+    if board_ok:
+        ranked = st.session_state.home_ranked
+        ratings = st.session_state.home_ratings
+    else:
+        with st.spinner("正在扫描美股龙头和主流加密货币，按买入评级取前十"):
+            ranked = rank_universe(MARKET)
+            pool = ranked[:40]
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                enriched = list(executor.map(lambda item: merge_context(item, True), pool))
+            ranked = enriched + ranked[40:]
+            ranked.sort(key=lambda item: item.get("score") or -999, reverse=True)
+        ratings = {item["ticker"]: item for item in ranked}
+        missing = [symbol for symbol in st.session_state.watchlist if not (ratings.get(symbol) or {}).get("context")]
+        need_fetch = [symbol for symbol in missing if symbol not in ratings]
+        fetched = {}
+        if need_fetch:
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                for symbol, item in zip(need_fetch, executor.map(rate_ticker, need_fetch)):
+                    fetched[symbol] = item
+        for symbol in missing:
+            base = ratings.get(symbol) or fetched.get(symbol)
+            if base:
+                ratings[symbol] = merge_context(base, True)
+        st.session_state.home_ranked = ranked
+        st.session_state.home_ratings = ratings
+        st.session_state.home_board_at = time.time()
+        st.session_state.home_watch_key = watch_key
 
     def shown_rating(item):
         if not item:
