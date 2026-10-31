@@ -140,6 +140,10 @@ st.markdown("""
     .qhead .qleft { gap: 12px; }
     a.sort-link, a.sort-link:hover { color: #8b919a; text-decoration: none; font-size: 12px; font-weight: 500; cursor: pointer; }
     a.sort-link.on { color: #111827; font-weight: 700; }
+    div[data-testid="stElementContainer"]:has(.sort-slot),
+    .element-container:has(.sort-slot) {
+        display: none !important; height: 0 !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important;
+    }
     iframe[height="0"] { height: 0 !important; min-height: 0 !important; border: 0 !important; display: block; }
     .qhead .score-num a.sort-link, .qhead .px a.sort-link, .qhead .pct-h a.sort-link {
         display: block; width: 100%; padding: 6px 0;
@@ -2867,53 +2871,60 @@ else:
                     del st.session_state.stock_cache[t]
                 st.rerun()
         active_sort = st.session_state.get("watch_sort")
+        labels = (("name", "名称"), ("amount", "成交额"), ("score", "评分"), ("price", "最新价"), ("chg", "涨跌幅"))
 
-        def sort_link(key, label):
-            on = active_sort == key
-            mark = " ↓" if on else ""
-            click = (
-                "event.preventDefault();event.stopImmediatePropagation();"
-                "(function(el){"
-                "var key=el.getAttribute('data-sort');"
-                "var head=el.closest('.qhead-row');"
-                "if(!head)return;"
-                "var box=head.closest('[data-testid=stElementContainer]')||head.closest('.element-container')||head.parentElement;"
-                "var parent=box.parentElement;"
-                "var nodes=[],kids=parent.children;"
-                "for(var i=0;i<kids.length;i++){"
-                "var n=kids[i];"
-                "if(n.querySelector&&n.querySelector('.qrow')&&!n.querySelector('.qhead-row'))nodes.push(n);"
-                "}"
-                "if(!parent._watchOrder)parent._watchOrder=nodes.slice();"
-                "var same=head.getAttribute('data-on')===key;"
-                "head.setAttribute('data-on',same?'':key);"
-                "var list=same?parent._watchOrder.slice():nodes.slice().sort(function(a,b){"
-                "var ra=a.querySelector('.qrow'),rb=b.querySelector('.qrow');"
-                "if(!ra||!rb)return 0;"
-                "if(key==='name')return (ra.getAttribute('data-name')||'').localeCompare(rb.getAttribute('data-name')||'');"
-                "var av=parseFloat(ra.getAttribute('data-'+key)),bv=parseFloat(rb.getAttribute('data-'+key));"
-                "if(isNaN(av))av=-999;if(isNaN(bv))bv=-999;return bv-av;"
-                "});"
-                "for(var j=0;j<list.length;j++)parent.appendChild(list[j]);"
-                "var links=head.querySelectorAll('a.sort-link');"
-                "for(var k=0;k<links.length;k++){links[k].classList.remove('on');links[k].textContent=links[k].getAttribute('data-label');}"
-                "if(!same){el.classList.add('on');el.textContent=el.getAttribute('data-label')+' ↓';}"
-                "})(this);return false;"
-            )
-            return (
-                f'<a class="sort-link{" on" if on else ""}" data-sort="{key}" data-label="{label}" '
-                f'href="#" target="_self" onclick="{click}">{label}{mark}</a>'
-            )
+        def head_button(key, label):
+            on = " on" if active_sort == key else ""
+            text = f"{label} ↓" if active_sort == key else label
+            return f'<button type="button" class="s{on}" data-k="{key}">{text}</button>'
 
-        st.markdown(
-            '<div class="qrow qhead-row"><div class="qgrid qhead">'
-            f'<div class="qleft">{sort_link("name", "名称")}{sort_link("amount", "成交额")}</div>'
-            f'<div class="score-num">{sort_link("score", "评分")}</div>'
-            f'<div class="px">{sort_link("price", "最新价")}</div>'
-            f'<div class="pct-h">{sort_link("chg", "涨跌幅")}</div>'
-            '</div><span class="del-hit del-spacer">删除</span></div>',
-            unsafe_allow_html=True,
+        st.markdown('<div class="sort-slot"></div>', unsafe_allow_html=True)
+        import streamlit.components.v1 as components
+        picked = components.html(
+            f"""
+            <style>
+              html, body {{ margin: 0; padding: 0; background: #fff;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }}
+              .row {{ display: flex; align-items: center; padding: 2px 0 6px 4px; }}
+              .qgrid {{ flex: 1; display: grid; grid-template-columns: minmax(0, 5.2fr) 1fr 1.2fr 1.1fr;
+                column-gap: 0.5rem; align-items: center; }}
+              .qleft {{ display: flex; gap: 12px; }}
+              button {{ background: transparent; border: 0; padding: 0; margin: 0; cursor: pointer;
+                font-size: 12px; font-weight: 500; color: #8b919a; line-height: 1.2; }}
+              button.on {{ color: #111827; font-weight: 700; }}
+              .qgrid > button {{ width: 100%; text-align: right; }}
+              .spacer {{ flex: 0 0 2.4rem; }}
+              @media (max-width: 820px) {{
+                .qgrid {{ grid-template-columns: minmax(0, 1fr) 3.2rem 5.2rem 4.5rem; column-gap: 0.35rem; }}
+                .qleft {{ gap: 8px; }}
+              }}
+            </style>
+            <div class="row"><div class="qgrid">
+              <div class="qleft">{head_button("name", "名称")}{head_button("amount", "成交额")}</div>
+              {head_button("score", "评分")}{head_button("price", "最新价")}{head_button("chg", "涨跌幅")}
+            </div><span class="spacer"></span></div>
+            <script>
+              if (window.Streamlit) Streamlit.setComponentReady();
+              function send(key) {{
+                if (window.Streamlit) Streamlit.setComponentValue(key + ":" + Date.now());
+              }}
+              document.querySelectorAll("button").forEach(function (btn) {{
+                btn.addEventListener("click", function (event) {{
+                  event.preventDefault();
+                  send(btn.getAttribute("data-k"));
+                }});
+              }});
+            </script>
+            """,
+            height=28,
         )
+        if isinstance(picked, str) and ":" in picked and picked != st.session_state.get("_sort_event"):
+            st.session_state._sort_event = picked
+            key = picked.split(":", 1)[0]
+            if key in dict(labels):
+                st.session_state.watch_sort = None if active_sort == key else key
+                st.rerun()
+        active_sort = st.session_state.get("watch_sort")
         rows = []
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
