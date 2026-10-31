@@ -62,6 +62,20 @@ st.markdown("""
     .score-num { font-size: 14px; font-weight: 750; color: #111827; }
     .qgrid .px { font-size: 16px; font-weight: 750; color: #111827; }
     .qgrid .pct { margin: 0; justify-self: end; min-width: 72px; }
+    @media (max-width: 820px) {
+        .block-container { padding-left: 0.7rem !important; padding-right: 0.7rem !important; }
+        .qgrid { grid-template-columns: minmax(0, 1fr) auto; row-gap: 2px; }
+        .qgrid .score-num { display: none; }
+        .qgrid .qleft { grid-column: 1; grid-row: 1 / span 2; }
+        .qgrid .px { grid-column: 2; grid-row: 1; font-size: 15px; }
+        .qgrid .pct { grid-column: 2; grid-row: 2; min-width: 64px; padding: 4px 6px; font-size: 12px; }
+        .row-name { max-width: 52vw; }
+        .bn-quote { flex-direction: column; gap: 8px; }
+        .bn-last { font-size: 32px; }
+        .bn-stats { width: 100%; min-width: 0; }
+        div[data-testid="stHorizontalBlock"]:has(input) { flex-wrap: nowrap !important; }
+        .stButton > button { min-height: 2.2rem; }
+    }
     .qrow { display: flex; align-items: center; border-bottom: 1px solid #f2f3f5; }
     .qrow:hover { background: #fafafa; }
     a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; flex: 1; padding: 10px 0 10px 4px; cursor: pointer; }
@@ -1882,30 +1896,22 @@ else:
 
     with watch_col:
         st.markdown('<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · 延迟行情</div></div>', unsafe_allow_html=True)
-        new_ticker = st.text_input("添加股票", placeholder="代码，如 AAPL、BTC", label_visibility="collapsed")
-        if st.button("添加", use_container_width=True) and new_ticker.strip():
+        add_l, add_r = st.columns([5, 1])
+        with add_l:
+            new_ticker = st.text_input("添加股票", placeholder="代码，如 AAPL、BTC", label_visibility="collapsed")
+        with add_r:
+            add_clicked = st.button("添加", use_container_width=True)
+        if add_clicked and new_ticker.strip():
             t = resolve_ticker(new_ticker)
             if t not in st.session_state.watchlist:
                 st.session_state.watchlist.append(t)
                 if t in st.session_state.stock_cache:
                     del st.session_state.stock_cache[t]
                 st.rerun()
-        active_sort = st.session_state.get("watch_sort")
-        h_name, h_score, h_price, h_chg, h_pad = st.columns([5.2, 1, 1.2, 1.1, 0.45], gap="small")
-        with h_name:
-            n1, n2 = st.columns(2)
-            for column, key, label in ((n1, "name", "名称"), (n2, "amount", "成交额")):
-                with column:
-                    mark = " ↓" if active_sort == key else ""
-                    if st.button(label + mark, key=f"wsort_{key}", type="primary" if active_sort == key else "secondary", use_container_width=True):
-                        st.session_state.watch_sort = None if active_sort == key else key
-                        st.rerun()
-        for column, key, label in ((h_score, "score", "买入评分"), (h_price, "price", "最新价"), (h_chg, "chg", "涨跌幅")):
-            with column:
-                mark = " ↓" if active_sort == key else ""
-                if st.button(label + mark, key=f"wsort_{key}", type="primary" if active_sort == key else "secondary", use_container_width=True):
-                    st.session_state.watch_sort = None if active_sort == key else key
-                    st.rerun()
+        sort_options = ["默认", "名称", "成交额", "买入评分", "最新价", "涨跌幅"]
+        sort_keys = {"默认": None, "名称": "name", "成交额": "amount", "买入评分": "score", "最新价": "price", "涨跌幅": "chg"}
+        picked_sort = st.selectbox("排序", sort_options, label_visibility="collapsed")
+        active_sort = sort_keys[picked_sort]
         rows = []
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
