@@ -28,10 +28,16 @@ st.markdown("""
     .brand { font-size: 22px; font-weight: 760; color: #111827; letter-spacing: -0.03em; }
     .brand span { color: #1677ff; }
     .brand-sub { color: #8b919a; font-size: 13px; }
-    .quote-card {
-        background: #fff; border: 1px solid #e7e9ee; border-radius: 16px;
-        padding: 18px 20px 8px; margin-bottom: 12px;
-    }
+    .bn-symbol { font-size: 22px; font-weight: 760; color: #111827; line-height: 1.1; }
+    .bn-name { color: #8b919a; font-size: 13px; margin-top: 2px; }
+    .bn-quote { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; padding: 4px 0 14px; }
+    .bn-last { font-size: 40px; font-weight: 760; letter-spacing: -0.04em; line-height: 1; font-variant-numeric: tabular-nums; }
+    .bn-chg { margin-top: 6px; font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .bn-stats { display: grid; grid-template-columns: auto auto; gap: 8px 28px; min-width: 240px; padding-top: 6px; }
+    .bn-stats div { color: #8b919a; font-size: 13px; display: flex; justify-content: space-between; gap: 16px; }
+    .bn-stats b { color: #111827; font-weight: 650; font-variant-numeric: tabular-nums; }
+    .ma-line { font-size: 13px; font-weight: 700; margin: 4px 0 8px; font-variant-numeric: tabular-nums; }
+    .ma7 { color: #f0b90b; } .ma25 { color: #c026d3; } .ma60 { color: #7c3aed; }
     .quote-top { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; }
     .quote-symbol { font-size: 20px; font-weight: 760; color: #111827; line-height: 1.2; }
     .quote-name { font-size: 13px; font-weight: 500; color: #8b919a; margin-left: 8px; }
@@ -1272,34 +1278,35 @@ if st.session_state.selected_ticker:
         cap = info.get("marketCap")
         structure = rate_ticker(ticker) or {"label": "观望", "score": 0, "notes": ["历史不够，先不给买入评级。"]}
 
-        bar_l, bar_r = st.columns([1, 6])
-        with bar_l:
+        c_back, c_title, c_fresh = st.columns([0.5, 6, 0.7])
+        with c_back:
             if st.button("返回", type="secondary", use_container_width=True):
                 st.session_state.selected_ticker = None
                 if "ticker" in st.query_params:
                     del st.query_params["ticker"]
                 st.rerun()
-        with bar_r:
-            if st.button("刷新", type="primary"):
+        with c_title:
+            st.markdown(
+                f'<div style="display:flex;align-items:center;">{logo_html(ticker, website, 36)}'
+                f'<div><div class="bn-symbol">{show_symbol(ticker)} '
+                f'<span class="chg-pill {rate_class(structure["label"])}">{structure["label"]}</span></div>'
+                f'<div class="bn-name">{html.escape(name)}</div></div></div>',
+                unsafe_allow_html=True,
+            )
+        with c_fresh:
+            if st.button("刷新", use_container_width=True):
                 if ticker in st.session_state.stock_cache:
                     del st.session_state.stock_cache[ticker]
                 st.rerun()
 
         st.markdown(
-            f'<div class="quote-card"><div class="quote-top">'
-            f'<div style="display:flex;align-items:center;">{logo_html(ticker, website, 42)}'
-            f'<div><div class="quote-symbol">{show_symbol(ticker)}'
-            f'<span class="quote-name">{name}</span></div>'
-            f'<div style="margin-top:6px;"><span class="chg-pill {rate_class(structure["label"])}">{structure["label"]}</span></div></div></div>'
-            f'<div style="text-align:right;"><div class="quote-last {color}">{fmt_px(current_price)}</div>'
-            f'<div class="quote-chg {color}">{sign}{change:.2f}&nbsp;&nbsp;{sign}{change_pct:.2f}%</div></div>'
-            f'</div><div class="stat-strip">'
-            f'<div class="stat"><span>今开</span><b>{fmt_px(open_px)}</b></div>'
-            f'<div class="stat"><span>昨收</span><b>{fmt_px(prev_close)}</b></div>'
-            f'<div class="stat"><span>最高</span><b>{fmt_px(high_px)}</b></div>'
-            f'<div class="stat"><span>最低</span><b>{fmt_px(low_px)}</b></div>'
-            f'<div class="stat"><span>成交量</span><b>{fmt_vol(volume)}</b></div>'
-            f'<div class="stat"><span>市值</span><b>{fmt_cap(cap)}</b></div>'
+            f'<div class="bn-quote"><div>'
+            f'<div class="bn-last {color}">{fmt_px(current_price)}</div>'
+            f'<div class="bn-chg {color}">{sign}{change:.2f}&nbsp;&nbsp;{sign}{change_pct:.2f}%</div>'
+            f'</div><div class="bn-stats">'
+            f'<div>最高<b>{fmt_px(high_px)}</b></div><div>开盘<b>{fmt_px(open_px)}</b></div>'
+            f'<div>最低<b>{fmt_px(low_px)}</b></div><div>昨收<b>{fmt_px(prev_close)}</b></div>'
+            f'<div>成交量<b>{fmt_vol(volume)}</b></div><div>市值<b>{fmt_cap(cap)}</b></div>'
             f'</div></div>',
             unsafe_allow_html=True,
         )
@@ -1307,16 +1314,11 @@ if st.session_state.selected_ticker:
         tab1, tab2, tab3, tab4 = st.tabs(["概览", "财务", "分析", "行情预测"])
         
         with tab1:
-            st.markdown("**周期**")
-            tf_cols = st.columns(6)
-            timeframes = [("15分", "15m"), ("1小时", "1h"), ("4小时", "4h"), ("1天", "1d"), ("周线", "1wk"), ("月线", "1mo")]
-            for i, (label, tf) in enumerate(timeframes):
-                with tf_cols[i]:
-                    if st.button(label, key=f"tf_{tf}", use_container_width=True,
-                                 type="primary" if st.session_state.timeframe == tf else "secondary"):
-                        st.session_state.timeframe = tf
-                        st.rerun()
-            
+            tf_labels = ["15分", "1小时", "4小时", "1天", "周线", "月线"]
+            tf_values = ["15m", "1h", "4h", "1d", "1wk", "1mo"]
+            current_tf = st.session_state.timeframe if st.session_state.timeframe in tf_values else "1d"
+            picked = st.radio("周期", tf_labels, index=tf_values.index(current_tf), horizontal=True, label_visibility="collapsed", key=f"tf_radio_{ticker}")
+            st.session_state.timeframe = tf_values[tf_labels.index(picked)]
             hist = fetch_hist(ticker, st.session_state.timeframe)
             
             if hist.empty:
@@ -1326,43 +1328,65 @@ if st.session_state.selected_ticker:
                 df["MA7"] = df["Close"].rolling(7).mean()
                 df["MA25"] = df["Close"].rolling(25).mean()
                 df["MA60"] = df["Close"].rolling(60).mean()
-                
+                df["VOL5"] = df["Volume"].rolling(5).mean()
+                df["VOL10"] = df["Volume"].rolling(10).mean()
                 delta = df["Close"].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                rs = gain / loss.replace(0, np.nan)
-                df["RSI"] = 100 - (100 / (1 + rs))
+                for length, col in ((6, "RSI6"), (12, "RSI12"), (24, "RSI24")):
+                    gain = delta.clip(lower=0).rolling(length).mean()
+                    loss = (-delta.clip(upper=0)).rolling(length).mean()
+                    df[col] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+                ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+                ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+                df["DIF"] = ema12 - ema26
+                df["DEA"] = df["DIF"].ewm(span=9, adjust=False).mean()
+                df["MACD"] = (df["DIF"] - df["DEA"]) * 2
+
+                def last_num(col):
+                    value = df[col].iloc[-1]
+                    return f"{float(value):.2f}" if pd.notna(value) else "--"
+
+                st.markdown(
+                    f'<div class="ma-line"><span class="ma7">MA(7): {last_num("MA7")}</span>&nbsp;&nbsp;'
+                    f'<span class="ma25">MA(25): {last_num("MA25")}</span>&nbsp;&nbsp;'
+                    f'<span class="ma60">MA(60): {last_num("MA60")}</span></div>',
+                    unsafe_allow_html=True,
+                )
                 
-                fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                                    vertical_spacing=0.03, row_heights=[0.55, 0.2, 0.25])
-                
+                fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
+                                    vertical_spacing=0.03, row_heights=[0.52, 0.16, 0.16, 0.16])
                 fig.add_trace(go.Candlestick(
                     x=df.index, open=df["Open"], high=df["High"],
                     low=df["Low"], close=df["Close"], name="K线",
-                    increasing_line_color="#059669", decreasing_line_color="#dc2626"
+                    increasing_line_color="#0ecb81", decreasing_line_color="#f6465d",
+                    increasing_fillcolor="#0ecb81", decreasing_fillcolor="#f6465d",
                 ), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df["MA7"], name="MA7", line=dict(color="#f59e0b", width=1.2)), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df["MA25"], name="MA25", line=dict(color="#3b82f6", width=1.2)), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df["MA60"], name="MA60", line=dict(color="#8b5cf6", width=1.2)), row=1, col=1)
-                
-                colors = ["#059669" if c >= o else "#dc2626" for c, o in zip(df["Close"], df["Open"])]
+                fig.add_trace(go.Scatter(x=df.index, y=df["MA7"], name="MA7", line=dict(color="#f0b90b", width=1.2)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["MA25"], name="MA25", line=dict(color="#c026d3", width=1.2)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["MA60"], name="MA60", line=dict(color="#7c3aed", width=1.2)), row=1, col=1)
+                colors = ["#0ecb81" if c >= o else "#f6465d" for c, o in zip(df["Close"], df["Open"])]
                 fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="成交量", marker_color=colors), row=2, col=1)
-                
-                fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#6366f1", width=1.5)), row=3, col=1)
-                fig.add_hline(y=70, line_dash="dash", line_color="#ef4444", row=3, col=1)
-                fig.add_hline(y=30, line_dash="dash", line_color="#10b981", row=3, col=1)
-                
+                fig.add_trace(go.Scatter(x=df.index, y=df["VOL5"], name="VOL MA5", line=dict(color="#f0b90b", width=1)), row=2, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["VOL10"], name="VOL MA10", line=dict(color="#7c3aed", width=1)), row=2, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["RSI6"], name="RSI6", line=dict(color="#f0b90b", width=1.2)), row=3, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["RSI12"], name="RSI12", line=dict(color="#c026d3", width=1.2)), row=3, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["RSI24"], name="RSI24", line=dict(color="#7c3aed", width=1.2)), row=3, col=1)
+                fig.add_hline(y=70, line_dash="dash", line_color="#e5e7eb", row=3, col=1)
+                fig.add_hline(y=30, line_dash="dash", line_color="#e5e7eb", row=3, col=1)
+                macd_colors = ["#0ecb81" if v >= 0 else "#f6465d" for v in df["MACD"].fillna(0)]
+                fig.add_trace(go.Bar(x=df.index, y=df["MACD"], name="MACD", marker_color=macd_colors), row=4, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["DIF"], name="DIF", line=dict(color="#f0b90b", width=1.2)), row=4, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=df["DEA"], name="DEA", line=dict(color="#7c3aed", width=1.2)), row=4, col=1)
                 fig.update_layout(
-                    template="plotly_white", height=680,
-                    margin=dict(l=0, r=0, t=10, b=0),
+                    template="plotly_white", height=760, showlegend=False,
+                    margin=dict(l=0, r=8, t=8, b=0),
                     xaxis_rangeslider_visible=False,
-                    legend=dict(orientation="h", y=1.02, x=1, xanchor="right", bgcolor="rgba(255,255,255,0.8)"),
-                    dragmode="zoom",  # 默认拖拽缩放
-                    hovermode="x unified"
+                    dragmode="zoom", hovermode="x unified",
+                    paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
                 )
-                # 确保可交互缩放
-                fig.update_xaxes(rangeslider_visible=False)
+                fig.update_xaxes(rangeslider_visible=False, showgrid=True, gridcolor="#f3f4f6")
+                fig.update_yaxes(showgrid=True, gridcolor="#f3f4f6")
                 st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
+                st.caption(f"RSI(6) {last_num('RSI6')} · RSI(12) {last_num('RSI12')} · RSI(24) {last_num('RSI24')} · DIF {last_num('DIF')} · DEA {last_num('DEA')} · MACD {last_num('MACD')}")
 
             st.markdown("### 最新相关新闻")
             news = fetch_news(ticker)
