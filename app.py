@@ -22,7 +22,7 @@ st.set_page_config(
 # 浅色行情终端
 st.markdown("""
 <style>
-    .stApp { background: #f5f6f8; }
+    .stApp { background: #ffffff; }
     .block-container { max-width: 100%; padding-top: 1.1rem; padding-bottom: 2rem; padding-left: 1.25rem; padding-right: 1.25rem; }
     .topbar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
     .brand { font-size: 22px; font-weight: 760; color: #111827; letter-spacing: -0.03em; }
@@ -51,18 +51,29 @@ st.markdown("""
         display: block; max-width: 420px; color: #8b919a; font-size: 12px; margin-top: 2px;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; padding: 12px 78px 12px 14px; cursor: pointer; }
-    a.row-hit.bare, a.row-hit.bare:hover { padding-right: 14px; }
+    .qrow { position: relative; border-bottom: 1px solid #f2f3f5; }
+    .qrow:hover { background: #fafafa; }
+    a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; padding: 12px 46px 12px 4px; cursor: pointer; }
+    a.row-hit.bare, a.row-hit.bare:hover { padding-right: 4px; }
     a.del-hit, a.del-hit:hover {
-        position: absolute; right: 12px; top: 50%; transform: translateY(-50%); z-index: 2;
-        color: #374151; text-decoration: none; background: #fff; border: 1px solid #e5e7eb;
-        border-radius: 8px; padding: 4px 10px; font-size: 13px;
+        position: absolute; right: 0; top: 50%; transform: translateY(-50%); z-index: 2;
+        color: #b0b6bf; text-decoration: none; background: transparent; border: 0;
+        padding: 4px; font-size: 12px;
     }
-    div[data-testid="stVerticalBlockBorderWrapper"]:has(a.row-hit) { position: relative; padding: 0 !important; }
+    .qline { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .qleft { display: flex; align-items: center; min-width: 0; }
+    .pct {
+        display: inline-block; min-width: 72px; margin-left: 12px; padding: 6px 8px;
+        border-radius: 6px; text-align: center; color: #fff; font-size: 13px; font-weight: 700;
+        font-variant-numeric: tabular-nums;
+    }
+    .pct.up { background: #0ecb81; color: #fff; }
+    .pct.down { background: #f6465d; color: #fff; }
     a.news-hit { color: #111827; text-decoration: none; font-weight: 650; font-size: 13px; line-height: 1.45; }
     a.news-hit:hover { color: #1677ff; }
-    .row-px { text-align: right; font-variant-numeric: tabular-nums; }
+    .row-px { display: flex; align-items: center; justify-content: flex-end; text-align: right; font-variant-numeric: tabular-nums; }
     .row-px .px { font-size: 16px; font-weight: 750; color: #111827; }
+    .row-symbol .chg-pill { min-width: 0; margin: 0 0 0 6px; padding: 1px 6px; }
     .chg-pill {
         display: inline-block; margin-top: 3px; min-width: 92px; text-align: center;
         padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 720;
@@ -560,19 +571,21 @@ def rank_universe(tickers: tuple):
     ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked
 
-def quote_bar(ticker, price, change_pct, label, name, website="", prefix=""):
-    pill = "chg-up" if change_pct >= 0 else "chg-down"
+def quote_bar(ticker, price, change_pct, label, name, website="", prefix="", cap=None):
+    tone = "up" if change_pct >= 0 else "down"
     sign = "+" if change_pct >= 0 else ""
     shown = f"{prefix}{show_symbol(ticker)}"
+    sub = html.escape(name)
+    if cap:
+        sub += f" | {fmt_cap(cap)}"
     return (
-        f'<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">'
-        f'<div style="display:flex;align-items:center;min-width:0;">'
-        f'{logo_html(ticker, website, 32)}'
+        f'<div class="qline">'
+        f'<div class="qleft">{logo_html(ticker, website, 32)}'
         f'<div><div class="row-symbol">{shown} '
         f'<span class="chg-pill {rate_class(label)}">{label}</span></div>'
-        f'<span class="row-name" title="{html.escape(name)}">{html.escape(name)}</span></div></div>'
-        f'<div class="row-px"><div class="px">{fmt_px(price)}</div>'
-        f'<span class="chg-pill {pill}">{sign}{change_pct:.2f}%</span></div></div>'
+        f'<span class="row-name" title="{html.escape(name)}">{sub}</span></div></div>'
+        f'<div class="row-px"><span class="px">{fmt_px(price)}</span>'
+        f'<span class="pct {tone}">{sign}{change_pct:.2f}%</span></div></div>'
     )
 
 def treasury_percent(symbol):
@@ -1812,17 +1825,18 @@ else:
             label = (ratings.get(ticker) or {}).get("label", "—")
             if summary is None:
                 body = f'<div class="row-symbol">{show_symbol(ticker)}</div><span class="row-name">暂无行情</span>'
+                cap = None
             else:
+                cap = (summary.get("info") or {}).get("marketCap")
                 body = quote_bar(
                     ticker, summary["price"], summary["change_pct"], label,
-                    pretty_name(ticker, summary.get("info")), summary.get("website") or "",
+                    pretty_name(ticker, summary.get("info")), summary.get("website") or "", cap=cap,
                 )
-            with st.container(border=True):
-                st.markdown(
-                    f'<a class="row-hit" href="?ticker={quote(ticker)}">{body}</a>'
-                    f'<a class="del-hit" href="?drop={quote(ticker)}">删除</a>',
-                    unsafe_allow_html=True,
-                )
+            st.markdown(
+                f'<div class="qrow"><a class="row-hit" href="?ticker={quote(ticker)}">{body}</a>'
+                f'<a class="del-hit" href="?drop={quote(ticker)}">删除</a></div>',
+                unsafe_allow_html=True,
+            )
 
     with rank_col:
         basis = st.radio("按哪一级看前十", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
@@ -1843,9 +1857,9 @@ else:
             change_pct = summary["change_pct"] if summary else 0
             name = pretty_name(symbol, summary.get("info") if summary else None)
             website = (summary or {}).get("website") or ""
-            body = quote_bar(symbol, price, change_pct, item["label"], name, website, prefix=f"{index}. ")
-            with st.container(border=True):
-                st.markdown(f'<a class="row-hit bare" href="?ticker={quote(symbol)}">{body}</a>', unsafe_allow_html=True)
+            cap = ((summary or {}).get("info") or {}).get("marketCap")
+            body = quote_bar(symbol, price, change_pct, item["label"], name, website, prefix=f"{index}. ", cap=cap)
+            st.markdown(f'<div class="qrow"><a class="row-hit bare" href="?ticker={quote(symbol)}">{body}</a></div>', unsafe_allow_html=True)
 
     with news_col:
         st.markdown('<div class="board-head"><div class="section-title">市场要闻</div><div class="muted">最值得看</div></div>', unsafe_allow_html=True)
