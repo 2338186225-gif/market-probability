@@ -8,6 +8,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import html
 import json
+import threading
+import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import date, datetime
@@ -698,6 +700,8 @@ def rate_frame(ticker, hist):
         rated["notes"] = list(rated["notes"]) + [money_note]
     rated["money"] = money
     rated["up_prob"] = up_prob_20(frame["Close"])
+    rets = np.log(frame["Close"].astype(float) / frame["Close"].astype(float).shift(1)).dropna()
+    rated["vol"] = float(rets.tail(60).std() * np.sqrt(252)) if len(rets) >= 20 else None
     rated["levels"] = levels
     rated["ticker"] = ticker
     rated["price"] = float(frame["Close"].iloc[-1])
@@ -1577,6 +1581,7 @@ def load_iv_rows(ticker, spot):
 PAPER_PATH = Path(__file__).with_name("paper_book.json")
 PAPER_CASH = 1_000_000.0
 PAPER_SLOTS = 10
+_BOOK_LOCK = threading.Lock()
 SHOCKS = (
     "hack", "hacked", "stolen", "exploit", "bankrupt", "bankruptcy", "fraud",
     "sec charges", "trading halt", "halted", "delisting", "default",
@@ -1589,32 +1594,37 @@ def empty_paper():
     return {"cash": PAPER_CASH, "positions": {}, "trades": [], "last_run": "", "started": date.today().isoformat(), "seen": []}
 
 def load_books():
-    if "books" not in st.session_state:
-        raw = None
+    raw = None
+    with _BOOK_LOCK:
         try:
             raw = json.loads(PAPER_PATH.read_text())
         except Exception:
             raw = None
-        if isinstance(raw, dict) and "watch" in raw and "market" in raw:
-            books = raw
-        elif isinstance(raw, dict) and "cash" in raw:
-            books = {"watch": raw, "market": empty_paper()}
-        else:
-            books = {"watch": empty_paper(), "market": empty_paper()}
-        for key in ("watch", "market"):
-            books[key].setdefault("positions", {})
-            books[key].setdefault("trades", [])
-            books[key].setdefault("seen", [])
-            books[key].setdefault("cash", PAPER_CASH)
+    if isinstance(raw, dict) and "watch" in raw and "market" in raw:
+        books = raw
+    elif isinstance(raw, dict) and "cash" in raw:
+        books = {"watch": raw, "market": empty_paper()}
+    else:
+        books = {"watch": empty_paper(), "market": empty_paper()}
+    for key in ("watch", "market"):
+        books.setdefault(key, empty_paper())
+        books[key].setdefault("positions", {})
+        books[key].setdefault("trades", [])
+        books[key].setdefault("seen", [])
+        books[key].setdefault("cash", PAPER_CASH)
+    stamp = books.get("updated")
+    if "books" not in st.session_state or (stamp and stamp != st.session_state.books.get("updated")):
         st.session_state.books = books
     return st.session_state.books
 
 def save_books(books):
+    books["updated"] = datetime.now().isoformat(timespec="seconds")
     st.session_state.books = books
-    try:
-        PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False))
-    except Exception:
-        pass
+    with _BOOK_LOCK:
+        try:
+            PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False))
+        except Exception:
+            pass
 
 def win_record(books):
     n = wins = 0
@@ -1663,6 +1673,7 @@ def signal_from_item(symbol, item):
         "label": item.get("label") or "—",
         "score": item.get("score"),
         "up_prob": item.get("up_prob"),
+        "vol": item.get("vol"),
         "horizons": horizons,
     }
 
@@ -1699,7 +1710,7 @@ def close_position(book, ticker, price, reason, today):
 
 def paper_rebalance(book, signals, kind):
     today = date.today().isoformat()
-    rule_id = "market-cap-v1" if kind == "market" else "watch-v1"
+    rule_id = "quant-v1"
     if book.get("last_run") == today and book.get("rules") == rule_id:
         return book
     books = load_books()
@@ -1727,7 +1738,7 @@ def paper_rebalance(book, signals, kind):
     for ticker, pos in book["positions"].items():
         price = (by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0
         equity += pos["shares"] * float(price)
-    if kind == "market":
+    if kind in ("market", "watch"):
         for horizon, cap in (("日", 0.30), ("周", 0.60)):
             while True:
                 held = []
@@ -1760,40 +1771,39 @@ def paper_rebalance(book, signals, kind):
                 for ticker, pos in book["positions"].items():
                     px = float((by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0)
                     equity += pos["shares"] * float(px)
-    slot = equity / PAPER_SLOTS if PAPER_SLOTS else equity
     caps = {"日": 0.30, "周": 0.60, "月": 1.0}
-    each = {"日": 0.10, "周": 0.15, "月": 0.20}
     ranked = []
     for row in signals:
         horizon = best_horizon(row, n, wins)
         if horizon:
             ranked.append((horizon, row))
-    if kind == "market":
-        ranked.sort(key=lambda pair: ({"月": 0, "周": 1, "日": 2}[pair[0]], -(pair[1].get("score") or -999)))
-    else:
-        ranked.sort(key=lambda pair: pair[1].get("score") if pair[1].get("score") is not None else -999, reverse=True)
+    ranked.sort(key=lambda pair: ({"月": 0, "周": 1, "日": 2}[pair[0]], -(pair[1].get("score") or -999)))
 
     def sleeve_value(horizon):
         total = 0.0
         for ticker, pos in book["positions"].items():
             if (pos.get("horizon") or "日") != horizon:
                 continue
-            price = (by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0
-            total += pos["shares"] * float(price)
+            px = (by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0
+            total += pos["shares"] * float(px)
         return total
+
+    def quant_budget(horizon, vol, room):
+        vol = float(vol) if vol and vol > 0.05 else 0.30
+        risk = {"日": 0.004, "周": 0.007, "月": 0.010}[horizon]
+        name_cap = {"日": 0.08, "周": 0.12, "月": 0.18}[horizon]
+        weight = min(name_cap, risk / vol)
+        return max(0.0, min(book["cash"], room, equity * weight))
 
     for horizon, row in ranked:
         if len(book["positions"]) >= PAPER_SLOTS or row["ticker"] in book["positions"]:
             continue
         price = float(row["price"])
-        if kind == "market":
-            up = row.get("up_prob")
-            if horizon == "日" and up is not None and up < 0.55:
-                continue
-            room = equity * caps[horizon] - sleeve_value(horizon)
-            budget = min(book["cash"], equity * each[horizon], room)
-        else:
-            budget = min(slot, book["cash"])
+        up = row.get("up_prob")
+        if horizon == "日" and up is not None and up < 0.55:
+            continue
+        room = equity * caps[horizon] - sleeve_value(horizon)
+        budget = quant_budget(horizon, row.get("vol"), room)
         shares = int(budget // price) if budget > 0 else 0
         if shares <= 0:
             continue
@@ -1802,7 +1812,7 @@ def paper_rebalance(book, signals, kind):
         book["trades"].append({
             "date": today, "side": "买", "ticker": row["ticker"], "shares": shares,
             "price": round(price, 4), "horizon": horizon,
-            "reason": f"{horizon}线{row['horizons'][horizon]['label']}，综合{row.get('label')} {row.get('score')}",
+            "reason": f"{horizon}线{row['horizons'][horizon]['label']}，波动率调仓，综合{row.get('label')} {row.get('score')}",
         })
     book["last_run"] = today
     book["rules"] = rule_id
@@ -1813,9 +1823,21 @@ def shock_headline(title):
     text = (title or "").lower()
     return any(word in text for word in SHOCKS)
 
-def apply_shocks(books):
+def last_price(ticker):
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        if hist is not None and not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        return None
+    return None
+
+def apply_shocks(books, price_fn=None):
+    price_fn = price_fn or last_price
     held = []
     for book in books.values():
+        if not isinstance(book, dict):
+            continue
         held.extend(book.get("positions") or [])
     held = list(dict.fromkeys(held))
     if not held:
@@ -1832,21 +1854,51 @@ def apply_shocks(books):
             if not shock_headline(title):
                 continue
             key = title.lower()
-            zh = to_zh(title)
+            try:
+                zh = to_zh(title)
+            except Exception:
+                zh = title
             for name, book in books.items():
-                if ticker not in book.get("positions", {}):
+                if not isinstance(book, dict) or ticker not in book.get("positions", {}):
                     continue
                 if key in book.get("seen", []):
                     continue
                 price = book["positions"][ticker].get("cost")
-                summary = get_stock_summary(ticker)
-                if summary and summary.get("price"):
-                    price = summary["price"]
+                fresh = price_fn(ticker)
+                if fresh:
+                    price = fresh
                 if close_position(book, ticker, price, f"重大消息：{zh}", today):
                     book.setdefault("seen", []).append(key)
                     book["seen"] = book["seen"][-80:]
                     acted.append(f"{'自选' if name == 'watch' else '全市场'} {show_symbol(ticker)} 卖出 · {zh}")
     return acted
+
+def _monitor_loop():
+    while True:
+        time.sleep(180)
+        try:
+            with _BOOK_LOCK:
+                try:
+                    books = json.loads(PAPER_PATH.read_text())
+                except Exception:
+                    continue
+                if not isinstance(books, dict) or "watch" not in books:
+                    continue
+                acted = apply_shocks(books)
+                if not acted:
+                    continue
+                books["updated"] = datetime.now().isoformat(timespec="seconds")
+                PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False))
+        except Exception:
+            continue
+
+def start_paper_monitor():
+    if globals().get("_PAPER_MONITOR_ON"):
+        return
+    globals()["_PAPER_MONITOR_ON"] = True
+    threading.Thread(target=_monitor_loop, name="paper-news", daemon=True).start()
+
+start_paper_monitor()
 
 def fmt_qty(value):
     value = float(value)
@@ -2027,7 +2079,7 @@ def render_paper():
         books[key] = empty_paper()
         save_books(books)
         st.rerun()
-    st.caption("另一笔是" + ("全市场" if other == "market" else "自选") + "，点上面的标签切换。各 100 万美元。全市场这笔：日线合计不超过总资产 30%，单只大约一成；周线合计不超过 60%，单只大约一成五；月线优先买，用来放主要仓位。没有佣金，不是下单建议。")
+    st.caption("两笔都是有信号才买，没有信号就留现金。日线合计不超过总资产 30%，周线不超过 60%，这是上限，不会为了凑满这个比例去买。仓位按波动率决定大小。关掉页面后，服务器仍约每 3 分钟查一次持仓新闻。")
 
 def paper_entry():
     books = load_books()
@@ -2049,7 +2101,7 @@ def paper_monitor():
         st.warning("重大消息已立刻卖出：" + "；".join(acted))
         st.rerun()
     else:
-        st.caption(f"持仓监控 {stamp} 已检查新闻。页面开着时大约每 3 分钟再查一次。没有接上 X 的公司账号接口，被盗、财报暴雷、停牌、调查这类字样用新闻标题识别。")
+        st.caption(f"新闻监测 {stamp}。服务器大约每 3 分钟查一次，不需要开着这个页面。被盗、财报暴雷、停牌、调查用新闻标题识别。")
 
 try:
     paper_monitor = st.fragment(run_every=180)(paper_monitor)
