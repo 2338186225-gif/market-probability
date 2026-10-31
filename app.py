@@ -73,16 +73,20 @@ st.markdown("""
         .bn-quote { flex-direction: column; gap: 8px; }
         .bn-last { font-size: 32px; }
         .bn-stats { width: 100%; min-width: 0; }
-        div[data-testid="stHorizontalBlock"]:has(input),
-        div[data-testid="stHorizontalBlock"]:has([class*="st-key-wsort_"]) { flex-wrap: nowrap !important; }
-        div[data-testid="stHorizontalBlock"]:has([class*="st-key-wsort_"]) > div[data-testid="column"],
-        div[data-testid="stHorizontalBlock"]:has([class*="st-key-wsort_"]) > div[data-testid="stColumn"] {
-            min-width: 0 !important; width: auto !important; flex: 1 1 0% !important; max-width: none !important;
+        div[data-testid="stElementContainer"]:has(.home-board) + div[data-testid="stElementContainer"] > div[data-testid="stHorizontalBlock"],
+        .element-container:has(.home-board) + .element-container > div[data-testid="stHorizontalBlock"] {
+            flex-direction: column !important;
+            flex-wrap: wrap !important;
         }
-        div[class*="st-key-wsort_"] button {
-            font-size: 11px !important; min-height: 28px !important; padding: 0 2px !important; white-space: nowrap !important;
+        div[data-testid="stElementContainer"]:has(.home-board) + div[data-testid="stElementContainer"] > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
+        div[data-testid="stElementContainer"]:has(.home-board) + div[data-testid="stElementContainer"] > div[data-testid="stHorizontalBlock"] > div[data-testid="column"],
+        .element-container:has(.home-board) + .element-container > div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
+        .element-container:has(.home-board) + .element-container > div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+            width: 100% !important;
+            min-width: 100% !important;
+            max-width: 100% !important;
+            flex: 1 1 100% !important;
         }
-        .stButton > button { min-height: 2.2rem; }
     }
     .qrow { display: flex; align-items: center; border-bottom: 1px solid #f2f3f5; }
     .qrow:hover { background: #fafafa; }
@@ -1900,6 +1904,7 @@ else:
         if symbol not in ratings:
             ratings[symbol] = rate_ticker(symbol)
 
+    st.markdown('<div class="home-board"></div>', unsafe_allow_html=True)
     watch_col, rank_col, news_col = st.columns([1.75, 0.9, 0.78], gap="medium")
 
     with watch_col:
