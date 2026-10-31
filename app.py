@@ -57,19 +57,30 @@ st.markdown("""
         display: block; max-width: 420px; color: #8b919a; font-size: 12px; margin-top: 2px;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .qhead { display: flex; justify-content: space-between; align-items: center; color: #8b919a; font-size: 12px; padding: 8px 46px 6px 4px; }
-    .qhead a, .qhead a:hover { color: #8b919a; text-decoration: none; }
-    .qhead a.on { color: #111827; font-weight: 700; }
-    .qh-right { display: flex; gap: 16px; }
-    .score-num { margin-left: 6px; font-size: 13px; font-weight: 760; color: #111827; font-variant-numeric: tabular-nums; }
+    .qgrid { display: grid; grid-template-columns: minmax(0, 5.2fr) 1fr 1.2fr 1.1fr; column-gap: 0.5rem; align-items: center; }
+    .qgrid .score-num, .qgrid .px { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+    .score-num { font-size: 14px; font-weight: 750; color: #111827; }
+    .qgrid .px { font-size: 16px; font-weight: 750; color: #111827; }
+    .qgrid .pct { margin: 0; justify-self: end; min-width: 72px; }
+    .qrow { display: flex; align-items: center; border-bottom: 1px solid #f2f3f5; }
     .qrow:hover { background: #fafafa; }
-    a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; padding: 12px 46px 12px 4px; cursor: pointer; }
-    a.row-hit.bare, a.row-hit.bare:hover { padding-right: 4px; }
+    a.row-hit, a.row-hit:hover { color: inherit; text-decoration: none; display: block; flex: 1; padding: 10px 0 10px 4px; cursor: pointer; }
+    a.row-hit.bare, a.row-hit.bare:hover { padding-right: 0; }
     a.del-hit, a.del-hit:hover {
-        position: absolute; right: 0; top: 50%; transform: translateY(-50%); z-index: 2;
+        position: static; transform: none; width: 40px; text-align: center; flex: none;
         color: #b0b6bf; text-decoration: none; background: transparent; border: 0;
-        padding: 4px; font-size: 12px;
+        padding: 4px 0; font-size: 12px;
     }
+    div[class*="st-key-wsort_"] [data-testid="stBaseButton-secondary"],
+    div[class*="st-key-wsort_"] [data-testid="stBaseButton-primary"] {
+        background: transparent !important; border: none !important; box-shadow: none !important;
+        color: #8b919a !important; font-size: 12px !important; font-weight: 500 !important;
+        min-height: 28px !important; padding: 0 !important;
+    }
+    div[class*="st-key-wsort_"] [data-testid="stBaseButton-primary"] { color: #111827 !important; font-weight: 700 !important; }
+    div[class*="st-key-wsort_score"] button,
+    div[class*="st-key-wsort_price"] button,
+    div[class*="st-key-wsort_chg"] button { justify-content: flex-end !important; }
     .qline { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
     .qleft { display: flex; align-items: center; min-width: 0; }
     .pct {
@@ -176,13 +187,6 @@ if drop:
         st.session_state.watchlist.remove(drop)
         st.session_state.stock_cache.pop(drop, None)
     del st.query_params["drop"]
-    st.rerun()
-wsort = st.query_params.get("wsort")
-if isinstance(wsort, list):
-    wsort = wsort[0] if wsort else None
-if wsort in ("name", "amount", "price", "chg", "score"):
-    st.session_state.watch_sort = wsort
-    del st.query_params["wsort"]
     st.rerun()
 if opened:
     st.session_state.selected_ticker = opened
@@ -624,15 +628,16 @@ def quote_bar(ticker, price, change_pct, label, name, website="", prefix="", amo
     sub = html.escape(name)
     if amount:
         sub += f" | {fmt_cap(amount)}"
-    score_html = f'<span class="score-num">{score:.1f}</span>' if score is not None else ""
+    score_text = f"{score:.1f}" if score is not None else "—"
     return (
-        f'<div class="qline">'
+        f'<div class="qgrid">'
         f'<div class="qleft">{logo_html(ticker, website, 32)}'
         f'<div><div class="row-symbol">{shown} '
-        f'<span class="chg-pill {rate_class(label)}">{label}</span>{score_html}</div>'
+        f'<span class="chg-pill {rate_class(label)}">{label}</span></div>'
         f'<span class="row-name" title="{html.escape(name)}">{sub}</span></div></div>'
-        f'<div class="row-px"><span class="px">{fmt_px(price)}</span>'
-        f'<span class="pct {tone}">{sign}{change_pct:.2f}%</span></div></div>'
+        f'<div class="score-num">{score_text}</div>'
+        f'<div class="px">{fmt_px(price)}</div>'
+        f'<span class="pct {tone}">{sign}{change_pct:.2f}%</span></div>'
     )
 
 def treasury_percent(symbol):
@@ -1885,22 +1890,22 @@ else:
                 if t in st.session_state.stock_cache:
                     del st.session_state.stock_cache[t]
                 st.rerun()
-        sort_key = st.session_state.get("watch_sort")
-        def sort_mark(key):
-            return " ↓" if sort_key == key else ""
-        def head_link(key, text):
-            klass = "on" if sort_key == key else ""
-            return f'<a class="{klass}" href="?wsort={key}">{text}{sort_mark(key)}</a>'
-        st.markdown(
-            '<div class="qhead"><span>'
-            + head_link("name", "名称") + " / " + head_link("amount", "成交额")
-            + '</span><span class="qh-right">'
-            + head_link("score", "买入评分")
-            + head_link("price", "最新价")
-            + head_link("chg", "涨跌幅")
-            + "</span></div>",
-            unsafe_allow_html=True,
-        )
+        active_sort = st.session_state.get("watch_sort")
+        h_name, h_score, h_price, h_chg, h_pad = st.columns([5.2, 1, 1.2, 1.1, 0.45], gap="small")
+        with h_name:
+            n1, n2 = st.columns(2)
+            for column, key, label in ((n1, "name", "名称"), (n2, "amount", "成交额")):
+                with column:
+                    mark = " ↓" if active_sort == key else ""
+                    if st.button(label + mark, key=f"wsort_{key}", type="primary" if active_sort == key else "secondary", use_container_width=True):
+                        st.session_state.watch_sort = None if active_sort == key else key
+                        st.rerun()
+        for column, key, label in ((h_score, "score", "买入评分"), (h_price, "price", "最新价"), (h_chg, "chg", "涨跌幅")):
+            with column:
+                mark = " ↓" if active_sort == key else ""
+                if st.button(label + mark, key=f"wsort_{key}", type="primary" if active_sort == key else "secondary", use_container_width=True):
+                    st.session_state.watch_sort = None if active_sort == key else key
+                    st.rerun()
         rows = []
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
@@ -1918,15 +1923,15 @@ else:
                 "change_pct": summary["change_pct"] if summary else -999,
                 "amount": amount or 0,
             })
-        if sort_key == "name":
+        if active_sort == "name":
             rows.sort(key=lambda row: row["ticker"])
-        elif sort_key == "amount":
+        elif active_sort == "amount":
             rows.sort(key=lambda row: row["amount"], reverse=True)
-        elif sort_key == "price":
+        elif active_sort == "price":
             rows.sort(key=lambda row: row["price"], reverse=True)
-        elif sort_key == "chg":
+        elif active_sort == "chg":
             rows.sort(key=lambda row: row["change_pct"], reverse=True)
-        elif sort_key == "score":
+        elif active_sort == "score":
             rows.sort(key=lambda row: row["score"] if row["score"] is not None else -999, reverse=True)
         for row in rows:
             ticker = row["ticker"]
