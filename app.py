@@ -53,6 +53,8 @@ st.markdown("""
     .asset-mid { flex: 1; min-width: 0; }
     .asset-mid b, .asset-right b { display: block; font-size: 16px; font-weight: 760; }
     .asset-mid i, .asset-right i { display: block; margin-top: 3px; color: #8b919a; font-style: normal; font-size: 12px; }
+    .asset-mid i.up, .asset-right i.up, .pnl-grid b.up, .trade-line b.up { color: #0ecb81; }
+    .asset-mid i.down, .asset-right i.down, .pnl-grid b.down, .trade-line b.down { color: #f6465d; }
     .asset-right { text-align: right; }
     .pnl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 14px 0 8px; }
     .pnl-grid span { display: block; color: #8b919a; font-size: 12px; }
@@ -2349,6 +2351,7 @@ def render_book_list(book_key, book, signals):
             f'{logo_html(ticker, "", 36)}'
             f'<span class="asset-mid"><b>{html.escape(show_symbol(ticker))}</b>'
             f'<i>{html.escape(pretty_name(ticker))} · {html.escape(tag)}</i>'
+            f'<i>成本 ${fmt_px(pos["cost"])}</i>'
             f'<i class="{klass}">未实现盈亏 {pos["pnl"]:+,.2f} ({pnl_pct:+.2f}%)</i></span>'
             f'<span class="asset-right"><b>{fmt_qty(pos["shares"])}</b><i>${pos["value"]:,.2f}</i></span></a>',
             unsafe_allow_html=True,
