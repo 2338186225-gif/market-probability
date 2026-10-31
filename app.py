@@ -1964,46 +1964,88 @@ def market_headlines(tickers: tuple):
     _HEADLINE_CACHE[key] = (time.time(), rows)
     return rows
 
-def fill_home_ratings():
-    """页面先打开。评分每 20 秒补两只，避免一进来就把进程卡住。"""
-    if st.session_state.pop("_skip_fill", None):
-        return
-    last = st.session_state.get("home_fill_at") or 0
-    if time.time() - last < 15:
-        return
-    watch = list(st.session_state.get("watchlist") or [])
-    attempted = set(st.session_state.get("home_attempted") or [])
-    ratings = dict(st.session_state.get("home_ratings") or {})
-    pending = [ticker for ticker in watch if ticker not in attempted]
-    if not pending:
-        if watch and not st.session_state.get("home_board_at"):
-            st.session_state.home_board_at = time.time()
-        return
-    st.session_state.home_fill_at = time.time()
-    changed = False
-    for ticker in pending[:2]:
-        attempted.add(ticker)
+RATING_PATH = Path(__file__).with_name("home_ratings.json")
+
+def load_rating_disk():
+    cached = globals().get("_RATING_DISK")
+    if isinstance(cached, dict):
+        return cached
+    try:
+        raw = json.loads(RATING_PATH.read_text())
+        cached = raw if isinstance(raw, dict) else {}
+    except Exception:
+        cached = {}
+    globals()["_RATING_DISK"] = cached
+    return cached
+
+def save_rating_disk(ratings):
+    disk = load_rating_disk()
+    for ticker, rated in (ratings or {}).items():
+        if not isinstance(rated, dict) or not rated.get("ticker"):
+            continue
         try:
-            rated = rate_fast(ticker)
+            disk[ticker] = json.loads(json.dumps(rated, default=float))
         except Exception:
-            rated = None
-        if isinstance(rated, dict) and rated.get("ticker"):
-            ratings[rated["ticker"]] = rated
-            changed = True
-    ranked = sorted(
+            disk[ticker] = {
+                "ticker": ticker,
+                "score": rated.get("score"),
+                "label": rated.get("label"),
+                "by_unit": rated.get("by_unit") or {},
+                "price": rated.get("price"),
+            }
+    try:
+        RATING_PATH.write_text(json.dumps(disk, ensure_ascii=False))
+    except Exception:
+        pass
+
+def rank_ratings(ratings):
+    return sorted(
         (row for row in ratings.values() if isinstance(row, dict)),
         key=lambda item: item.get("score") or 0,
         reverse=True,
     )
-    st.session_state.home_attempted = list(attempted)
+
+def hydrate_ratings(watch):
+    ratings = dict(st.session_state.get("home_ratings") or {})
+    disk = load_rating_disk()
+    for ticker in watch:
+        if ticker not in ratings and isinstance(disk.get(ticker), dict):
+            ratings[ticker] = disk[ticker]
+    return ratings
+
+def fill_home_ratings(limit=6):
+    """先用已经存下的分数。缺的每次补几只，失败的下次再试，不把空分当成算完。"""
+    last = st.session_state.get("home_fill_at") or 0
+    if time.time() - last < 8:
+        ratings = hydrate_ratings(list(st.session_state.get("watchlist") or []))
+        st.session_state.home_ratings = ratings
+        st.session_state.home_ranked = rank_ratings(ratings)
+        return
+    watch = list(st.session_state.get("watchlist") or [])
+    ratings = hydrate_ratings(watch)
+    pending = [ticker for ticker in watch if ticker not in ratings]
     st.session_state.home_ratings = ratings
-    st.session_state.home_ranked = ranked
-    st.session_state.home_watch_key = tuple(watch)
-    if set(watch).issubset(attempted):
-        st.session_state.home_board_at = time.time()
-    else:
-        st.session_state.home_board_at = 0
+    st.session_state.home_ranked = rank_ratings(ratings)
+    if not pending:
+        return
+    st.session_state.home_fill_at = time.time()
+
+    def one(ticker):
+        try:
+            return rate_fast(ticker)
+        except Exception:
+            return None
+
+    changed = False
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for rated in pool.map(one, pending[:limit]):
+            if isinstance(rated, dict) and rated.get("ticker"):
+                ratings[rated["ticker"]] = rated
+                changed = True
     if changed:
+        save_rating_disk(ratings)
+        st.session_state.home_ratings = ratings
+        st.session_state.home_ranked = rank_ratings(ratings)
         st.rerun()
 
 try:
@@ -4330,9 +4372,12 @@ else:
     basis = st.radio("按哪一级看", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
     level_unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
     watch_key = tuple(st.session_state.watchlist)
-    ratings = dict(st.session_state.get("home_ratings") or {})
+    ratings = hydrate_ratings(list(watch_key))
+    st.session_state.home_ratings = ratings
+    if not st.session_state.get("home_ranked"):
+        st.session_state.home_ranked = rank_ratings(ratings)
     ranked = [
-        row for row in (st.session_state.get("home_ranked") or [])
+        row for row in (st.session_state.get("home_ranked") or rank_ratings(ratings))
         if isinstance(row, dict) and row.get("ticker") in watch_key
     ]
 
@@ -4494,9 +4539,6 @@ else:
 
 st.caption("仅供学习研究，不构成投资建议。股票行情来自纳斯达克官网，加密货币来自币安现货，都有延迟。")
 if not st.session_state.selected_ticker and page != "paper":
-    if "home_seen" not in st.session_state:
-        st.session_state.home_seen = True
-        st.session_state._skip_fill = True
     try:
         fill_home_ratings()
     except Exception:
