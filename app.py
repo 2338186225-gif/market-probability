@@ -13,10 +13,11 @@ import threading
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 
 st.set_page_config(
@@ -1867,10 +1868,30 @@ def crypto_market_rows():
         cache["rows"] = rows
     return rows or cache["rows"]
 
+def cn_now():
+    return datetime.now(ZoneInfo("Asia/Shanghai"))
+
+def cn_stamp(when=None):
+    when = when or cn_now()
+    return when.strftime("%Y-%m-%d %H:%M") + " +08"
+
+def show_trade_time(value):
+    text = str(value or "").strip()
+    if text.endswith(" +08"):
+        return text[:-4]
+    if len(text) == 10 and text[4:5] == "-" and text[7:8] == "-":
+        return text
+    try:
+        dt = datetime.strptime(text.replace("T", " ")[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return text
+    return dt.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+
 def crypto_bar_slot():
-    now = datetime.now()
+    now = cn_now()
     minute = (now.minute // 15) * 15
-    return now.strftime("%Y-%m-%d %H:") + f"{minute:02d}"
+    floored = now.replace(minute=minute, second=0, microsecond=0)
+    return floored.strftime("%Y-%m-%d %H:%M") + " +08"
 
 def crypto_rebalance(book, rows):
     slot = crypto_bar_slot()
@@ -1943,7 +1964,8 @@ def crypto_rebalance(book, rows):
     return book
 
 def paper_rebalance(book, signals, kind):
-    today = date.today().isoformat()
+    today = cn_now().date().isoformat()
+    stamp = cn_stamp()
     rule_id = "edge-lev-v1" if kind == "edge" else "lev-v1"
     if book.get("last_run") == today and book.get("rules") == rule_id:
         return book
@@ -1980,7 +2002,7 @@ def paper_rebalance(book, signals, kind):
         sig = by_ticker.get(ticker)
         price = (sig or {}).get("price") or pos.get("cost")
         if kind == "watch" and ticker not in st.session_state.watchlist:
-            close_position(book, ticker, price, "已移出自选", today)
+            close_position(book, ticker, price, "已移出自选", stamp)
             continue
         if not price:
             continue
@@ -2016,7 +2038,7 @@ def paper_rebalance(book, signals, kind):
             elif cost and price >= cost * 1.12:
                 reason = "空头止损，反弹超过成本 12%"
         if reason:
-            close_position(book, ticker, price, reason, today)
+            close_position(book, ticker, price, reason, stamp)
 
     def book_equity_now():
         total = float(book["cash"])
@@ -2053,7 +2075,7 @@ def paper_rebalance(book, signals, kind):
             if not held:
                 break
             _, ticker, px = max(held)
-            if px <= 0 or not close_position(book, ticker, px, f"{horizon}线保证金超过总资产 {int(cap*100)}%，减回上限", today):
+            if px <= 0 or not close_position(book, ticker, px, f"{horizon}线保证金超过总资产 {int(cap*100)}%，减回上限", stamp):
                 break
             equity = book_equity_now()
 
@@ -2102,7 +2124,7 @@ def paper_rebalance(book, signals, kind):
         else:
             reason = f"{horizon}线{label}，{side}头 {lev} 倍"
         book["trades"].append({
-            "date": today, "side": "买" if side == "多" else "开空",
+            "date": stamp, "side": "买" if side == "多" else "开空",
             "ticker": row["ticker"], "shares": shares, "price": round(price, 4),
             "horizon": horizon, "leverage": lev, "reason": reason + "，杠杆不超过 10 倍",
         })
@@ -2135,7 +2157,7 @@ def apply_shocks(books, price_fn=None):
     if not held:
         return []
     acted = []
-    today = date.today().isoformat()
+    today = cn_stamp()
     for ticker in held:
         try:
             items = fetch_news(ticker, limit=4, timeout=5)
@@ -2306,7 +2328,7 @@ def render_holding(book_key, book, signals):
         qty = trade.get("shares")
         st.markdown(
             f'<div class="trade-line"><div><b>{html.escape(side)}</b>'
-            f'<i>{html.escape(str(trade.get("date") or ""))} · {html.escape(str(trade.get("reason") or ""))}</i></div>'
+            f'<i>{html.escape(show_trade_time(trade.get("date")))} · {html.escape(str(trade.get("reason") or ""))}</i></div>'
             f'<b class="{klass}">{"+" if side == "买" else "-"}{fmt_qty(qty or 0)}</b></div>',
             unsafe_allow_html=True,
         )
@@ -2373,7 +2395,7 @@ def render_book_list(book_key, book, signals):
         st.markdown(
             f'<a class="trade-line" href="{href}" target="_self" style="text-decoration:none;color:#111827;">'
             f'<div><b>{html.escape(show_symbol(ticker))} {html.escape(side)}</b>'
-            f'<i>{html.escape(str(trade.get("date") or ""))}{lev_text} · &#36;{fmt_px(trade.get("price") or 0)} · {html.escape(str(trade.get("reason") or ""))}</i></div>'
+            f'<i>{html.escape(show_trade_time(trade.get("date")))}{lev_text} · &#36;{fmt_px(trade.get("price") or 0)} · {html.escape(str(trade.get("reason") or ""))}</i></div>'
             f'<b class="{klass}">{right}</b></a>',
             unsafe_allow_html=True,
         )
