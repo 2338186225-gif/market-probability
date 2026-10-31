@@ -18,7 +18,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(
     page_title="市场行情概率测算器",
@@ -444,7 +444,7 @@ def binance_get(path, params):
     query = urlencode(params)
     url = f"https://data-api.binance.vision{path}?{query}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with urllib.request.urlopen(req, timeout=4) as resp:
         return json.loads(resp.read().decode())
 
 def binance_klines(symbol, interval, limit=500):
@@ -490,7 +490,7 @@ def nasdaq_symbol(ticker):
             return f"{base}.{suffix}"
     return str(ticker)
 
-def nasdaq_get(path, timeout=8):
+def nasdaq_get(path, timeout=4):
     req = urllib.request.Request(
         "https://api.nasdaq.com" + path,
         headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
@@ -498,14 +498,20 @@ def nasdaq_get(path, timeout=8):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
+ETFS = {"VTI", "VT", "QQQ", "QQQM", "SOXL", "KORU", "DRAM", "SGOV", "SPY", "IVV", "VOO", "IWM", "DIA", "GLD", "TLT", "SMH", "ARKK"}
+
 def nasdaq_payload(ticker, kind):
     symbol = quote(nasdaq_symbol(ticker), safe=".")
-    for asset in ("stocks", "etf"):
+    order = ("etf", "stocks") if str(ticker).upper() in ETFS else ("stocks", "etf")
+    for asset in order:
         try:
             data = nasdaq_get(f"/api/quote/{symbol}/{kind}?assetclass={asset}")
             payload = data.get("data") or {}
-            if payload:
-                return payload
+            if not payload:
+                continue
+            if kind == "info" and not payload.get("primaryData"):
+                continue
+            return payload
         except Exception:
             continue
     return None
@@ -687,10 +693,12 @@ def nasdaq_intraday(ticker, rule):
     bars["Volume"] = 0.0
     return bars
 
-def get_stock_summary(ticker):
+def get_stock_summary(ticker, fetch=True):
     cached = st.session_state.stock_cache.get(ticker) if ticker in st.session_state.stock_cache else None
     symbol = binance_symbol(ticker)
     if cached and ((symbol and cached.get("source") == "binance") or (not symbol and cached.get("source") == "nasdaq")):
+        return cached
+    if not fetch:
         return cached
     try:
         if symbol:
@@ -735,7 +743,7 @@ def get_stock_summary(ticker):
     except Exception:
         return cached
 
-def warm_quotes(tickers):
+def warm_quotes(tickers, budget=8):
     cache = st.session_state.stock_cache
     missing = []
     for ticker in tickers:
@@ -783,10 +791,20 @@ def warm_quotes(tickers):
         except Exception:
             return ticker, None
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for ticker, summary in pool.map(one, missing):
+    pool = ThreadPoolExecutor(max_workers=8)
+    futs = [pool.submit(one, ticker) for ticker in missing]
+    try:
+        for fut in as_completed(futs, timeout=budget):
+            try:
+                ticker, summary = fut.result()
+            except Exception:
+                continue
             if summary:
                 cache[ticker] = summary
+    except TimeoutError:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 def fetch_hist(ticker, timeframe):
     symbol = binance_symbol(ticker)
@@ -1885,29 +1903,108 @@ def to_zh(text):
     _ZH_CACHE[text] = translated or text
     return _ZH_CACHE[text]
 
-@st.cache_data(ttl=900, show_spinner=False)
+_HEADLINE_CACHE = {}
+
 def market_headlines(tickers: tuple):
-    cache = st.session_state.setdefault("headline_cache", {})
-    hit = cache.get(tickers)
+    key = tuple(tickers)
+    hit = _HEADLINE_CACHE.get(key)
     if hit and time.time() - hit[0] < 600:
         return hit[1]
     seen = set()
-    rows = []
-    for ticker in tickers:
-        for item in fetch_news(ticker, limit=2):
-            key = item["title"].lower()
-            if key in seen:
+    found = []
+    pool = ThreadPoolExecutor(max_workers=6)
+    futs = {}
+    for ticker in list(tickers)[:8]:
+        futs[pool.submit(fetch_news, ticker, 2, 2.5)] = ticker
+    try:
+        for fut in as_completed(futs, timeout=3.0):
+            ticker = futs[fut]
+            try:
+                items = fut.result()
+            except Exception:
                 continue
-            seen.add(key)
-            row = dict(item)
-            row["ticker"] = ticker
-            row["title_zh"] = to_zh(item["title"])
-            rows.append(row)
-            if len(rows) >= 8:
-                cache[tickers] = (time.time(), rows)
-                return rows
-    cache[tickers] = (time.time(), rows)
+            for item in items or []:
+                title = item.get("title") or ""
+                if not title or title.lower() in seen:
+                    continue
+                seen.add(title.lower())
+                row = dict(item)
+                row["ticker"] = ticker
+                found.append(row)
+                if len(found) >= 8:
+                    break
+            if len(found) >= 8:
+                break
+    except TimeoutError:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    rows = []
+    pool = ThreadPoolExecutor(max_workers=6)
+    jobs = {pool.submit(to_zh, row.get("title") or ""): row for row in found[:8]}
+    try:
+        for fut in as_completed(jobs, timeout=3.0):
+            row = jobs[fut]
+            try:
+                row["title_zh"] = fut.result()
+            except Exception:
+                row["title_zh"] = row.get("title") or ""
+    except TimeoutError:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    for row in found[:8]:
+        row.setdefault("title_zh", row.get("title") or "")
+        rows.append(row)
+    _HEADLINE_CACHE[key] = (time.time(), rows)
     return rows
+
+def fill_home_ratings():
+    """页面先打开。评分每 20 秒补两只，避免一进来就把进程卡住。"""
+    if st.session_state.pop("_skip_fill", None):
+        return
+    last = st.session_state.get("home_fill_at") or 0
+    if time.time() - last < 15:
+        return
+    watch = list(st.session_state.get("watchlist") or [])
+    attempted = set(st.session_state.get("home_attempted") or [])
+    ratings = dict(st.session_state.get("home_ratings") or {})
+    pending = [ticker for ticker in watch if ticker not in attempted]
+    if not pending:
+        if watch and not st.session_state.get("home_board_at"):
+            st.session_state.home_board_at = time.time()
+        return
+    st.session_state.home_fill_at = time.time()
+    changed = False
+    for ticker in pending[:2]:
+        attempted.add(ticker)
+        try:
+            rated = rate_fast(ticker)
+        except Exception:
+            rated = None
+        if isinstance(rated, dict) and rated.get("ticker"):
+            ratings[rated["ticker"]] = rated
+            changed = True
+    ranked = sorted(
+        (row for row in ratings.values() if isinstance(row, dict)),
+        key=lambda item: item.get("score") or 0,
+        reverse=True,
+    )
+    st.session_state.home_attempted = list(attempted)
+    st.session_state.home_ratings = ratings
+    st.session_state.home_ranked = ranked
+    st.session_state.home_watch_key = tuple(watch)
+    if set(watch).issubset(attempted):
+        st.session_state.home_board_at = time.time()
+    else:
+        st.session_state.home_board_at = 0
+    if changed:
+        st.rerun()
+
+try:
+    fill_home_ratings = st.fragment(run_every=20)(fill_home_ratings)
+except Exception:
+    pass
 
 def hist_vol_drift(close):
     log_returns = np.log(close / close.shift(1)).dropna()
@@ -3042,7 +3139,6 @@ except Exception:
     pass
 
 # ==================== 详情页优先显示 ====================
-home_more = False
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
     try:
@@ -3659,52 +3755,11 @@ else:
     basis = st.radio("按哪一级看", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
     level_unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
     watch_key = tuple(st.session_state.watchlist)
-    board_at = st.session_state.get("home_board_at") or 0
-    attempted = set(st.session_state.get("home_attempted") or [])
-    board_ok = (
-        time.time() - board_at < 1800
-        and st.session_state.get("home_watch_key") == watch_key
-        and set(watch_key).issubset(attempted)
-    )
-    ranked = list(st.session_state.get("home_ranked") or [])
     ratings = dict(st.session_state.get("home_ratings") or {})
-    if board_ok:
-        pass
-    else:
-        if st.session_state.get("home_watch_key") != watch_key:
-            attempted = set()
-            ratings = {}
-            ranked = []
-        pending = [ticker for ticker in watch_key if ticker not in attempted]
-        deadline = time.time() + 7
-        try:
-            with st.spinner("正在读取自选行情"):
-                for ticker in pending:
-                    if attempted and time.time() > deadline:
-                        break
-                    attempted.add(ticker)
-                    try:
-                        rated = rate_fast(ticker)
-                    except Exception:
-                        rated = None
-                    if isinstance(rated, dict) and rated.get("ticker"):
-                        ratings[rated["ticker"]] = rated
-        except Exception:
-            pass
-        ranked = sorted(
-            (row for row in ratings.values() if isinstance(row, dict)),
-            key=lambda item: item.get("score") or 0,
-            reverse=True,
-        )
-        st.session_state.home_attempted = list(attempted)
-        st.session_state.home_ranked = ranked
-        st.session_state.home_ratings = ratings
-        st.session_state.home_watch_key = watch_key
-        if set(watch_key).issubset(attempted):
-            st.session_state.home_board_at = time.time()
-        else:
-            st.session_state.home_board_at = 0
-            home_more = True
+    ranked = [
+        row for row in (st.session_state.get("home_ranked") or [])
+        if isinstance(row, dict) and row.get("ticker") in watch_key
+    ]
 
     def shown_rating(item):
         if not item:
@@ -3734,12 +3789,10 @@ else:
                 st.rerun()
         active_sort = st.session_state.get("watch_sort")
         st.markdown('<div class="sort-live"></div>', unsafe_allow_html=True)
-        c_name, c_score, c_px, c_chg, _c_del = st.columns([4.4, 1.05, 1.45, 1.45, 0.7], gap="small")
-        with c_name:
-            n_name, n_amount = st.columns(2, gap="small")
+        c_name, c_amount, c_score, c_px, c_chg, _c_del = st.columns([2.2, 2.2, 1.05, 1.45, 1.45, 0.7], gap="small")
         for key, label, col in (
-            ("name", "名称", n_name),
-            ("amount", "成交额", n_amount),
+            ("name", "名称", c_name),
+            ("amount", "成交额", c_amount),
             ("score", "评分", c_score),
             ("price", "最新价", c_px),
             ("chg", "涨跌幅", c_chg),
@@ -3763,7 +3816,7 @@ else:
             pass
         rows = []
         for ticker in st.session_state.watchlist:
-            summary = get_stock_summary(ticker)
+            summary = get_stock_summary(ticker, fetch=False)
             rated = ratings.get(ticker) or {}
             label, score = shown_rating(rated)
             info = (summary or {}).get("info") or {}
@@ -3823,7 +3876,7 @@ else:
             st.info("评级还在分批计算，行情先显示。稍等或点一下页面就会补上。")
         for index, item in enumerate(picks, start=1):
             symbol = item["ticker"]
-            summary = get_stock_summary(symbol)
+            summary = get_stock_summary(symbol, fetch=False)
             price = summary["price"] if summary else item.get("price")
             change_pct = summary["change_pct"] if summary else 0
             name = pretty_name(symbol, summary.get("info") if summary else None)
@@ -3845,8 +3898,11 @@ else:
 
     with news_col:
         st.markdown('<div class="board-head"><div class="section-title">市场要闻</div><div class="muted">自选</div></div>', unsafe_allow_html=True)
-        news_names = list(dict.fromkeys(st.session_state.watchlist))[:12]
-        headlines = market_headlines(tuple(news_names))
+        news_names = list(dict.fromkeys(st.session_state.watchlist))[:8]
+        try:
+            headlines = market_headlines(tuple(news_names))
+        except Exception:
+            headlines = []
         if not headlines:
             st.caption("自选里这次没有拉到新闻。")
         for item in headlines:
@@ -3862,5 +3918,11 @@ else:
             )
 
 st.caption("仅供学习研究，不构成投资建议。股票行情来自纳斯达克官网，加密货币来自币安现货，都有延迟。")
-if home_more:
-    st.rerun()
+if not st.session_state.selected_ticker and page != "paper":
+    if "home_seen" not in st.session_state:
+        st.session_state.home_seen = True
+        st.session_state._skip_fill = True
+    try:
+        fill_home_ratings()
+    except Exception:
+        pass
