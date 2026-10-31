@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import html
 import json
+import re
 import threading
 import time
 import urllib.request
@@ -1459,7 +1460,8 @@ def fetch_news(ticker, limit=6, timeout=12):
         items = []
     return items
 
-_ZH_CACHE = {}
+if "_ZH_CACHE" not in globals():
+    _ZH_CACHE = {}
 
 def to_zh(text):
     text = (text or "").strip()
@@ -1467,8 +1469,6 @@ def to_zh(text):
         return text
     if any("\u4e00" <= ch <= "\u9fff" for ch in text):
         return text
-    if text in _ZH_CACHE:
-        return _ZH_CACHE[text]
     translated = ""
     try:
         url = "https://api.mymemory.translated.net/get?langpair=en|zh-CN&q=" + quote(text[:420])
@@ -2377,8 +2377,10 @@ if st.session_state.selected_ticker:
                 st.info("暂时没有拉到这只标的的新闻。")
             else:
                 for item in news:
-                    title = html.escape(item["title"])
-                    summary = html.escape(item["summary"])
+                    title = html.escape(to_zh(item["title"]))
+                    raw_summary = re.sub(r"<[^>]+>", " ", item.get("summary") or "")
+                    raw_summary = re.sub(r"\s+", " ", html.unescape(raw_summary)).strip()
+                    summary = html.escape(to_zh(raw_summary)) if raw_summary else ""
                     meta = " · ".join(part for part in (item["source"], item["time"]) if part)
                     link = html.escape(item["link"], quote=True)
                     body = f'<a href="{link}" target="_self">{title}</a>' if link else title
@@ -2387,7 +2389,7 @@ if st.session_state.selected_ticker:
                         f'<div class="news-item">{body}<div class="muted">{meta}</div>{extra}</div>',
                         unsafe_allow_html=True,
                     )
-                st.caption("新闻来自 Yahoo Finance 英文源，点标题打开原文。")
+                st.caption("新闻已译成中文，来自 Yahoo Finance。点标题打开原文。")
         
         with tab2:
             st.markdown("### 财报日程")
@@ -2864,9 +2866,34 @@ else:
 
         def sort_link(key, label):
             on = active_sort == key
-            href = "?sort=off" if on else f"?sort={key}"
             mark = " ↓" if on else ""
-            return f'<a class="sort-link{" on" if on else ""}" href="{href}" target="_self">{label}{mark}</a>'
+            click = (
+                "event.preventDefault();event.stopPropagation();"
+                "(function(el){"
+                "var key=el.getAttribute('data-sort');"
+                "var head=el.closest('.qhead-row');"
+                "var box=head.closest('[data-testid=\"stElementContainer\"]')||head.closest('.element-container');"
+                "if(!box)return;"
+                "var parent=box.parentElement;"
+                "var nodes=Array.prototype.slice.call(parent.children).filter(function(n){"
+                "return n.querySelector&&n.querySelector('.qrow')&&!n.querySelector('.qhead-row');});"
+                "if(!parent._watchOrder)parent._watchOrder=nodes.slice();"
+                "var same=head.getAttribute('data-on')===key;"
+                "head.setAttribute('data-on',same?'':key);"
+                "var list=same?parent._watchOrder.slice():nodes.slice().sort(function(a,b){"
+                "var ra=a.querySelector('.qrow'),rb=b.querySelector('.qrow');"
+                "if(key==='name')return (ra.getAttribute('data-name')||'').localeCompare(rb.getAttribute('data-name')||'');"
+                "return (parseFloat(rb.getAttribute('data-'+key))||-999)-(parseFloat(ra.getAttribute('data-'+key))||-999);"
+                "});"
+                "list.forEach(function(n){parent.appendChild(n);});"
+                "Array.prototype.forEach.call(head.querySelectorAll('a.sort-link'),function(a){a.classList.remove('on');a.textContent=a.getAttribute('data-label');});"
+                "if(!same){el.classList.add('on');el.textContent=el.getAttribute('data-label')+' ↓';}"
+                "})(this);return false;"
+            )
+            return (
+                f'<a class="sort-link{" on" if on else ""}" data-sort="{key}" data-label="{label}" '
+                f'href="#" target="_self" onclick="{html.escape(click, quote=True)}">{label}{mark}</a>'
+            )
 
         st.markdown(
             '<div class="qrow qhead-row"><div class="qgrid qhead">'
@@ -2917,7 +2944,7 @@ else:
                     amount=row["amount"] or None, score=row["score"],
                 )
             st.markdown(
-                f'<div class="qrow"><a class="row-hit" href="?ticker={quote(ticker)}" target="_self">{body}</a>'
+                f'<div class="qrow" data-name="{html.escape(show_symbol(ticker))}" data-amount="{row["amount"]}" data-score="{row["score"] if row["score"] is not None else -999}" data-price="{row["price"]}" data-chg="{row["change_pct"]}"><a class="row-hit" href="?ticker={quote(ticker)}" target="_self">{body}</a>'
                 f'<a class="del-hit" href="?drop={quote(ticker)}" target="_self">删除</a></div>',
                 unsafe_allow_html=True,
             )
