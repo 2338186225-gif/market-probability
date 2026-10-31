@@ -11,6 +11,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlparse
+from concurrent.futures import ThreadPoolExecutor
 
 st.set_page_config(
     page_title="市场行情概率测算器",
@@ -636,6 +637,11 @@ def rate_frame(ticker, hist):
     monthly = frame.resample("ME").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
     levels = [kline_level(frame.tail(320), "日"), kline_level(weekly, "周"), kline_level(monthly, "月")]
     rated = score_trends(frame.tail(320), weekly, monthly)
+    money, money_note = tape_money(frame)
+    if money:
+        rated["score"] = round(float(rated["score"]) + money, 1)
+        rated["notes"] = list(rated["notes"]) + [money_note]
+    rated["money"] = money
     rated["levels"] = levels
     rated["ticker"] = ticker
     rated["price"] = float(frame["Close"].iloc[-1])
@@ -787,6 +793,131 @@ def news_read(items):
     else:
         tone = "多空标题交错，新闻没有形成一边倒。"
     return f"最近 {len(items)} 条新闻里，偏多表述 {pos} 条，偏空表述 {neg} 条。{tone}", score
+
+def tape_money(frame):
+    if frame is None or "Volume" not in frame.columns or len(frame) < 25:
+        return 0, ""
+    vol = frame["Volume"].astype(float)
+    close = frame["Close"].astype(float)
+    recent = float(vol.tail(5).mean())
+    base = float(vol.iloc[-25:-5].mean())
+    if not base:
+        return 0, ""
+    ratio = recent / base
+    ret = float(close.iloc[-1] / close.iloc[-5] - 1)
+    if ratio >= 1.3 and ret > 0.01:
+        return 6, "近 5 日放量上涨，短线资金偏进场，+6。"
+    if ratio >= 1.3 and ret < -0.01:
+        return -6, "近 5 日放量下跌，短线资金偏离场，-6。"
+    if ratio <= 0.7 and ret < -0.01:
+        return 2, "下跌但成交萎缩，抛压没有明显放大，+2。"
+    return 0, ""
+
+def _info_num(info, key):
+    try:
+        value = (info or {}).get(key)
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+_CONTEXT_CACHE = {}
+
+def context_points(ticker, with_news=True):
+    key = (ticker, bool(with_news))
+    if key in _CONTEXT_CACHE:
+        return _CONTEXT_CACHE[key]
+    report = value = news = flow = 0
+    notes = []
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        info = {}
+    crypto = str(ticker).endswith("-USD") or str(info.get("quoteType") or "").upper() == "CRYPTOCURRENCY"
+    etf = is_etf(info)
+    if crypto:
+        notes.append("加密货币没有财报和市盈率，这两项不打分。")
+    elif etf:
+        notes.append("ETF 不按单一公司财报打分。")
+    else:
+        rg = _info_num(info, "revenueGrowth")
+        eg = _info_num(info, "earningsGrowth")
+        if eg is None:
+            eg = _info_num(info, "earningsQuarterlyGrowth")
+        margin = _info_num(info, "profitMargins")
+        if rg is not None:
+            report += 4 if rg >= 0.15 else 2 if rg >= 0 else -2 if rg >= -0.05 else -5
+            notes.append(f"营收同比 {rg * 100:+.1f}%。")
+        if eg is not None:
+            report += 4 if eg >= 0.15 else 2 if eg >= 0 else -4
+            notes.append(f"盈利同比 {eg * 100:+.1f}%。")
+        if margin is not None:
+            if margin >= 0.15:
+                report += 3
+            elif margin < 0:
+                report -= 4
+            notes.append(f"利润率 {margin * 100:.1f}%。")
+        report = max(-12, min(12, report))
+        pe = _info_num(info, "trailingPE")
+        fpe = _info_num(info, "forwardPE")
+        if pe is not None and pe > 0:
+            value += 5 if pe <= 15 else 2 if pe <= 25 else -2 if pe <= 40 else -6
+            notes.append(f"市盈率 {pe:.1f}。")
+        elif pe is not None and pe <= 0:
+            value -= 4
+            notes.append("市盈率为负，不按便宜处理。")
+        if pe and fpe and pe > 0 and fpe > 0:
+            if fpe < pe * 0.9:
+                value += 3
+                notes.append(f"远期市盈率 {fpe:.1f}，低于过去十二个月。")
+            elif fpe > pe * 1.15:
+                value -= 3
+                notes.append(f"远期市盈率 {fpe:.1f}，高于过去十二个月。")
+        value = max(-8, min(8, value))
+    if etf:
+        pe = _info_num(info, "trailingPE")
+        if pe is not None and pe > 0:
+            value += 3 if pe <= 18 else -2 if pe >= 30 else 0
+            notes.append(f"ETF 市盈率 {pe:.1f}。")
+            value = max(-8, min(8, value))
+    if with_news:
+        headlines = fetch_news(ticker, 6, timeout=5)
+        _, news_raw = news_read(headlines)
+        if news_raw >= 2:
+            news = 6
+        elif news_raw == 1:
+            news = 3
+        elif news_raw == -1:
+            news = -3
+        elif news_raw <= -2:
+            news = -6
+        if news:
+            notes.append(f"新闻标题{'偏多' if news > 0 else '偏空'}，{news:+d} 分。只看标题。")
+        elif headlines:
+            notes.append("新闻标题中性，不加不减。")
+    if etf:
+        text, flow_raw = flow_read(etf_flow_frame(ticker))
+        flow = {1: 6, -1: -6}.get(flow_raw, 0)
+        if flow:
+            notes.append("ETF 份额变化" + ("净流入，+6。" if flow > 0 else "净流出，-6。"))
+    result = {"report": report, "value": value, "news": news, "flow": flow, "total": report + value + news + flow, "notes": notes}
+    _CONTEXT_CACHE[key] = result
+    return result
+
+def merge_context(item, with_news=True):
+    if not item or item.get("context"):
+        return item
+    try:
+        extra = context_points(item.get("ticker"), with_news)
+    except Exception:
+        extra = {"total": 0, "notes": []}
+    merged = dict(item)
+    merged["score"] = round(float(item.get("score") or 0) + float(extra.get("total") or 0), 1)
+    merged["label"] = decide_label(merged["score"], item.get("by_unit") or {})
+    merged["notes"] = list(item.get("notes") or []) + list(extra.get("notes") or [])
+    merged["context"] = extra
+    return merged
 
 def is_etf(info):
     quote_type = str((info or {}).get("quoteType") or "")
@@ -1237,12 +1368,12 @@ def earnings_view(stock, info):
     body = [line for line in lines if not line.startswith("以上解读")]
     return verdict, klass, body
 
-def fetch_news(ticker, limit=6):
+def fetch_news(ticker, limit=6, timeout=12):
     items = []
     url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote(ticker)}&region=US&lang=en-US"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             root = ET.fromstring(resp.read())
         for node in root.findall("./channel/item"):
             title = (node.findtext("title") or "").strip()
@@ -1672,28 +1803,12 @@ if st.session_state.selected_ticker:
             for item in known:
                 tech_score += {"多头": 1, "偏多": 0.5, "空头": -1, "偏空": -0.5}.get(item["trend"], 0)
             news_bias = 1 if news_score >= 2 else -1 if news_score <= -2 else 0
-            extra_notes = []
-            extra = analyst_score * 6 + news_bias * 4 + flow_score * 4
-            if analyst_score > 0:
-                extra_notes.append("卖方评级偏买入，综合分加一点。")
-            elif analyst_score < 0:
-                extra_notes.append("卖方评级偏空，综合分减一点。")
-            if news_bias > 0:
-                extra_notes.append("最近新闻标题偏多，少量加分。标题不是全文。")
-            elif news_bias < 0:
-                extra_notes.append("最近新闻标题偏空，减分。")
-            if flow_score > 0:
-                extra_notes.append("ETF 近期估算为净流入，加分。")
-            elif flow_score < 0:
-                extra_notes.append("ETF 近期估算为净流出，减分。")
-            base = rate_ticker(ticker) or {}
-            by_unit = base.get("by_unit") or {}
-            score = round(float(base.get("score") or 0) + extra, 1)
-            buy_rated = {
-                "label": decide_label(score, by_unit),
-                "score": score,
-                "by_unit": by_unit,
-                "notes": list(base.get("notes") or []) + extra_notes,
+            base = merge_context(rate_ticker(ticker) or {})
+            buy_rated = base or {
+                "label": "观望",
+                "score": 0,
+                "by_unit": {},
+                "notes": ["历史不够，先不给买入评级。"],
             }
             buy_class = {"强烈买入": "verdict-up", "买入": "verdict-up", "回避": "verdict-down"}.get(buy_rated["label"], "verdict-mid")
             buy_text = "<br>".join(html.escape(line) for line in buy_rated["notes"])
@@ -1707,7 +1822,7 @@ if st.session_state.selected_ticker:
                 f'<div class="analysis-box"><span class="verdict {buy_class}">综合 {buy_rated["label"]} · {buy_rated["score"]}</span> '
                 + " ".join(pills)
                 + f'<br>{buy_text}'
-                f'<br>综合分先看月线、周线是不是多头，再看均线斜率。只是排齐、但均线走平，不会排到最前。价格离开长期均线太远，或者日线 RSI 超买，会扣分。月线和周线不同时偏多，不能给买入。不是下单建议。</div>',
+                f'<br>综合分先看月线、周线是不是多头，再加减财报、估值、新闻和资金。财报最多加减 12 分，估值 8 分，新闻和资金各 6 分。月线和周线不同时偏多，不能给买入。单看日线、周线、月线仍然只看均线。不是下单建议。</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1925,10 +2040,23 @@ if st.session_state.selected_ticker:
 else:
     with st.spinner("正在扫描美股龙头和主流加密货币，按买入评级取前十"):
         ranked = rank_universe(MARKET)
+        pool = ranked[:40]
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            enriched = list(executor.map(lambda item: merge_context(item, True), pool))
+        ranked = enriched + ranked[40:]
+        ranked.sort(key=lambda item: item.get("score") or -999, reverse=True)
     ratings = {item["ticker"]: item for item in ranked}
-    for symbol in st.session_state.watchlist:
-        if symbol not in ratings:
-            ratings[symbol] = rate_ticker(symbol)
+    missing = [symbol for symbol in st.session_state.watchlist if not (ratings.get(symbol) or {}).get("context")]
+    need_fetch = [symbol for symbol in missing if symbol not in ratings]
+    fetched = {}
+    if need_fetch:
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            for symbol, item in zip(need_fetch, executor.map(rate_ticker, need_fetch)):
+                fetched[symbol] = item
+    for symbol in missing:
+        base = ratings.get(symbol) or fetched.get(symbol)
+        if base:
+            ratings[symbol] = merge_context(base, True)
 
     basis = st.radio("按哪一级看", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
     level_unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
@@ -2028,7 +2156,7 @@ else:
             ranked_view = list(ranked)
         picks = ranked_view[:10]
         st.markdown(f'<div class="board-head"><div class="section-title">综合买入评级</div><div class="muted">{basis}前十</div></div>', unsafe_allow_html=True)
-        st.caption("月线权重最高。均线向上加分，离长期均线太远扣分。")
+        st.caption("综合分在均线之上加减财报、估值、新闻和资金。选日线、周线、月线时只看那一级均线。")
         if not picks:
             st.info("这次没有拉到足够行情，前十暂时空着。过一会儿再刷新。")
         for index, item in enumerate(picks, start=1):
