@@ -23,7 +23,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stApp { background: #f5f6f8; }
-    .block-container { max-width: 1320px; padding-top: 1.1rem; padding-bottom: 2rem; }
+    .block-container { max-width: 100%; padding-top: 1.1rem; padding-bottom: 2rem; padding-left: 1.25rem; padding-right: 1.25rem; }
     .topbar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
     .brand { font-size: 22px; font-weight: 760; color: #111827; letter-spacing: -0.03em; }
     .brand span { color: #1677ff; }
@@ -368,6 +368,96 @@ def rate_class(label):
         return "rate-avoid"
     return "rate-hold"
 
+def ma_state(close, short, mid, long):
+    close = close.astype(float).dropna()
+    if len(close) < long + 5:
+        return None
+    ma_s = close.rolling(short).mean()
+    ma_m = close.rolling(mid).mean()
+    ma_l = close.rolling(long).mean()
+    last = float(close.iloc[-1])
+    s0, m0, l0 = float(ma_s.iloc[-1]), float(ma_m.iloc[-1]), float(ma_l.iloc[-1])
+    if not m0 or not l0:
+        return None
+    look = max(3, mid // 3)
+    prev = float(ma_m.iloc[-1 - look]) if len(ma_m) > look else m0
+    slope = (m0 / prev - 1) if prev else 0
+    ext = last / l0 - 1
+    if last > s0 > m0 > l0:
+        base = 1.0
+    elif last >= m0 and last > l0:
+        base = 0.45
+    elif last < s0 < m0 < l0:
+        base = -1.0
+    elif last < m0:
+        base = -0.45
+    else:
+        base = 0.0
+    return {"base": base, "slope": slope, "ext": ext}
+
+def rsi14(close):
+    close = close.astype(float).dropna()
+    if len(close) < 20:
+        return None
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean().iloc[-1]
+    loss = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
+    if not loss:
+        return 100.0
+    return float(100 - 100 / (1 + gain / loss))
+
+def decide_label(score, by_unit):
+    monthly = (by_unit.get("月") or {}).get("trend")
+    weekly = (by_unit.get("周") or {}).get("trend")
+    daily = (by_unit.get("日") or {}).get("trend")
+    higher = monthly in ("多头", "偏多") and weekly in ("多头", "偏多")
+    if not higher:
+        if score < -8 or monthly == "空头":
+            return "回避"
+        return "观望"
+    if monthly == "多头" and weekly == "多头" and daily == "多头" and score >= 90:
+        return "强烈买入"
+    if score >= 64:
+        return "买入"
+    if score >= 42:
+        return "持有"
+    return "观望"
+
+def score_trends(daily, weekly, monthly):
+    specs = {"日": (daily, 7, 25, 60, 16), "周": (weekly, 10, 20, 40, 28), "月": (monthly, 6, 12, 24, 36)}
+    names = {1.0: "多头", 0.45: "偏多", 0.0: "震荡", -0.45: "偏空", -1.0: "空头"}
+    by_unit = {}
+    score = 0.0
+    for unit, (frame, short, mid, long, weight) in specs.items():
+        if frame is None or frame.empty or "Close" not in frame:
+            continue
+        state = ma_state(frame["Close"], short, mid, long)
+        if not state:
+            continue
+        part = state["base"] * weight
+        if unit in ("周", "月"):
+            part += max(-8, min(10, state["slope"] * 120))
+        if unit == "日" and state["ext"] > 0.15:
+            part -= min(16, (state["ext"] - 0.15) * 80)
+        elif unit == "周" and state["ext"] > 0.25:
+            part -= min(10, (state["ext"] - 0.25) * 40)
+        elif state["base"] > 0 and 0 <= state["ext"] <= (0.12 if unit == "日" else 0.22):
+            part += 2
+        trend = names[state["base"]]
+        label = {"多头": "买入", "偏多": "持有", "震荡": "观望", "偏空": "观望", "空头": "回避"}[trend]
+        why = f"{unit}线相对长期均线 {state['ext']*100:+.1f}%，中期均线斜率 {state['slope']*100:+.1f}%。"
+        by_unit[unit] = {"unit": unit, "trend": trend, "label": label, "why": why, "score": round(part, 1)}
+        score += part
+    rsi = rsi14(daily["Close"]) if daily is not None and not daily.empty else None
+    if rsi is not None and rsi >= 75 and "日" in by_unit:
+        score -= 8
+        if by_unit["日"]["label"] == "买入":
+            by_unit["日"]["label"] = "持有"
+        by_unit["日"]["why"] += " 日线 RSI 超买，这一项扣分。"
+    elif rsi is not None and rsi <= 35 and (by_unit.get("月") or {}).get("trend") == "多头":
+        score += 4
+    return {"score": round(score, 1), "label": decide_label(score, by_unit), "by_unit": by_unit, "notes": [by_unit[u]["why"] for u in ("日", "周", "月") if u in by_unit]}
+
 def level_call(item):
     trend = item["trend"]
     label = {"多头": "买入", "偏多": "持有", "偏空": "观望", "空头": "回避"}.get(trend, "观望")
@@ -408,7 +498,8 @@ def rate_frame(ticker, hist):
     weekly = frame.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
     monthly = frame.resample("ME").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
     levels = [kline_level(frame.tail(320), "日"), kline_level(weekly, "周"), kline_level(monthly, "月")]
-    rated = rating_from_levels(levels)
+    rated = score_trends(frame.tail(320), weekly, monthly)
+    rated["levels"] = levels
     rated["ticker"] = ticker
     rated["price"] = float(frame["Close"].iloc[-1])
     return rated
@@ -442,7 +533,7 @@ def rank_universe(tickers: tuple):
         rated = rate_frame(ticker, hist)
         if rated:
             ranked.append(rated)
-    ranked.sort(key=lambda item: (item["score"], item.get("ticker", "")), reverse=True)
+    ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked
 
 def treasury_percent(symbol):
@@ -1389,11 +1480,11 @@ if st.session_state.selected_ticker:
                 tech_score += {"多头": 1, "偏多": 0.5, "空头": -1, "偏空": -0.5}.get(item["trend"], 0)
             news_bias = 1 if news_score >= 2 else -1 if news_score <= -2 else 0
             extra_notes = []
-            extra = analyst_score * 0.8 + news_bias * 0.5 + flow_score * 0.4
+            extra = analyst_score * 6 + news_bias * 4 + flow_score * 4
             if analyst_score > 0:
-                extra_notes.append("卖方评级偏买入，加分。")
+                extra_notes.append("卖方评级偏买入，综合分加一点。")
             elif analyst_score < 0:
-                extra_notes.append("卖方评级偏空，减分。")
+                extra_notes.append("卖方评级偏空，综合分减一点。")
             if news_bias > 0:
                 extra_notes.append("最近新闻标题偏多，少量加分。标题不是全文。")
             elif news_bias < 0:
@@ -1402,7 +1493,15 @@ if st.session_state.selected_ticker:
                 extra_notes.append("ETF 近期估算为净流入，加分。")
             elif flow_score < 0:
                 extra_notes.append("ETF 近期估算为净流出，减分。")
-            buy_rated = rating_from_levels(levels, extra, extra_notes)
+            base = rate_ticker(ticker) or {}
+            by_unit = base.get("by_unit") or {}
+            score = round(float(base.get("score") or 0) + extra, 1)
+            buy_rated = {
+                "label": decide_label(score, by_unit),
+                "score": score,
+                "by_unit": by_unit,
+                "notes": list(base.get("notes") or []) + extra_notes,
+            }
             buy_class = {"强烈买入": "verdict-up", "买入": "verdict-up", "回避": "verdict-down"}.get(buy_rated["label"], "verdict-mid")
             buy_text = "<br>".join(html.escape(line) for line in buy_rated["notes"])
             pills = []
@@ -1415,7 +1514,7 @@ if st.session_state.selected_ticker:
                 f'<div class="analysis-box"><span class="verdict {buy_class}">综合 {buy_rated["label"]} · {buy_rated["score"]}</span> '
                 + " ".join(pills)
                 + f'<br>{buy_text}'
-                f'<br>多头是指这一级收盘价在短、中、长均线之上，而且短均线高于中均线、中均线高于长均线。日线用 7/25/60，周线用 10/20/40，月线用 6/12/24。三个级别都是买入时，综合分才会到强烈买入。不是下单建议。</div>',
+                f'<br>综合分先看月线、周线是不是多头，再看均线斜率。只是排齐、但均线走平，不会排到最前。价格离开长期均线太远，或者日线 RSI 超买，会扣分。月线和周线不同时偏多，不能给买入。不是下单建议。</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1637,15 +1736,8 @@ else:
     for symbol in st.session_state.watchlist:
         if symbol not in ratings:
             ratings[symbol] = rate_ticker(symbol)
-    basis = st.radio("按哪一级看前十", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
-    unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
-    if unit:
-        ranked_view = sorted(ranked, key=lambda item: item.get("by_unit", {}).get(unit, {}).get("score", -99), reverse=True)
-    else:
-        ranked_view = ranked
-    picks = ranked_view[:10]
 
-    watch_col, rank_col = st.columns([1.15, 1], gap="medium")
+    watch_col, rank_col = st.columns([1.7, 0.9], gap="large")
 
     with watch_col:
         st.markdown('<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · 延迟行情</div></div>', unsafe_allow_html=True)
@@ -1690,7 +1782,15 @@ else:
                         st.rerun()
 
     with rank_col:
-        st.markdown(f'<div class="board-head"><div class="section-title">{basis}买入评级前十</div><div class="muted">日 7/25/60 · 周 10/20/40 · 月 6/12/24</div></div>', unsafe_allow_html=True)
+        basis = st.radio("按哪一级看前十", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
+        unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
+        if unit:
+            ranked_view = sorted(ranked, key=lambda item: item.get("by_unit", {}).get(unit, {}).get("score", -99), reverse=True)
+        else:
+            ranked_view = list(ranked)
+        picks = ranked_view[:10]
+        st.markdown(f'<div class="board-head"><div class="section-title">{basis}买入</div><div class="muted">前十</div></div>', unsafe_allow_html=True)
+        st.caption("月线权重大于周线，周线大于日线。均线往上加分，涨离长期均线太远就扣分。只是多头排齐、斜率接近零的，不会并列成一样的分数。")
         if not picks:
             st.info("这次没有拉到足够行情，前十暂时空着。过一会儿再刷新。")
         for index, item in enumerate(picks, start=1):
