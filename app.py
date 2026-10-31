@@ -140,6 +140,26 @@ st.markdown("""
     .qhead .qleft { gap: 12px; }
     a.sort-link, a.sort-link:hover { color: #8b919a; text-decoration: none; font-size: 12px; font-weight: 500; cursor: pointer; }
     a.sort-link.on { color: #111827; font-weight: 700; }
+    div[data-testid="stElementContainer"]:has(.sort-live) + div[data-testid="stHorizontalBlock"],
+    div[data-testid="stElementContainer"]:has(.sort-live) + div[data-testid="stHorizontalBlock"] [data-testid="stHorizontalBlock"],
+    div[data-testid="stElementContainer"]:has(.sort-live) + div[data-testid="stElementContainer"] [data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important; gap: 0.15rem !important; align-items: center !important;
+    }
+    div[data-testid="stElementContainer"]:has(.sort-live) + div[data-testid="stHorizontalBlock"] [data-testid="stColumn"],
+    div[data-testid="stElementContainer"]:has(.sort-live) + div[data-testid="stElementContainer"] [data-testid="stColumn"] {
+        min-width: 0 !important; width: auto !important;
+    }
+    div[data-testid="stElementContainer"]:has(.sort-live) + div[data-testid="stHorizontalBlock"] button,
+    div[data-testid="stElementContainer"]:has(.sort-live) + div[data-testid="stElementContainer"] button {
+        background: transparent !important; border: 0 !important; box-shadow: none !important;
+        color: #8b919a !important; font-size: 12px !important; font-weight: 500 !important;
+        min-height: 0 !important; height: auto !important; padding: 2px 0 6px !important; line-height: 1.2 !important;
+        white-space: nowrap !important;
+    }
+    div[data-testid="stElementContainer"]:has(.sort-live) + div[data-testid="stHorizontalBlock"] button[data-testid="stBaseButton-primary"],
+    div[data-testid="stElementContainer"]:has(.sort-live) + div[data-testid="stElementContainer"] button[data-testid="stBaseButton-primary"] {
+        color: #111827 !important; font-weight: 700 !important;
+    }
     div[data-testid="stElementContainer"]:has(.sort-slot),
     .element-container:has(.sort-slot) {
         display: none !important; height: 0 !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important;
@@ -2871,59 +2891,29 @@ else:
                     del st.session_state.stock_cache[t]
                 st.rerun()
         active_sort = st.session_state.get("watch_sort")
-        labels = (("name", "名称"), ("amount", "成交额"), ("score", "评分"), ("price", "最新价"), ("chg", "涨跌幅"))
-
-        def head_button(key, label):
-            on = " on" if active_sort == key else ""
-            text = f"{label} ↓" if active_sort == key else label
-            return f'<button type="button" class="s{on}" data-k="{key}">{text}</button>'
-
-        st.markdown('<div class="sort-slot"></div>', unsafe_allow_html=True)
-        import streamlit.components.v1 as components
-        picked = components.html(
-            f"""
-            <style>
-              html, body {{ margin: 0; padding: 0; background: #fff;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }}
-              .row {{ display: flex; align-items: center; padding: 2px 0 6px 4px; }}
-              .qgrid {{ flex: 1; display: grid; grid-template-columns: minmax(0, 5.2fr) 1fr 1.2fr 1.1fr;
-                column-gap: 0.5rem; align-items: center; }}
-              .qleft {{ display: flex; gap: 12px; }}
-              button {{ background: transparent; border: 0; padding: 0; margin: 0; cursor: pointer;
-                font-size: 12px; font-weight: 500; color: #8b919a; line-height: 1.2; }}
-              button.on {{ color: #111827; font-weight: 700; }}
-              .qgrid > button {{ width: 100%; text-align: right; }}
-              .spacer {{ flex: 0 0 2.4rem; }}
-              @media (max-width: 820px) {{
-                .qgrid {{ grid-template-columns: minmax(0, 1fr) 3.2rem 5.2rem 4.5rem; column-gap: 0.35rem; }}
-                .qleft {{ gap: 8px; }}
-              }}
-            </style>
-            <div class="row"><div class="qgrid">
-              <div class="qleft">{head_button("name", "名称")}{head_button("amount", "成交额")}</div>
-              {head_button("score", "评分")}{head_button("price", "最新价")}{head_button("chg", "涨跌幅")}
-            </div><span class="spacer"></span></div>
-            <script>
-              if (window.Streamlit) Streamlit.setComponentReady();
-              function send(key) {{
-                if (window.Streamlit) Streamlit.setComponentValue(key + ":" + Date.now());
-              }}
-              document.querySelectorAll("button").forEach(function (btn) {{
-                btn.addEventListener("click", function (event) {{
-                  event.preventDefault();
-                  send(btn.getAttribute("data-k"));
-                }});
-              }});
-            </script>
-            """,
-            height=28,
-        )
-        if isinstance(picked, str) and ":" in picked and picked != st.session_state.get("_sort_event"):
-            st.session_state._sort_event = picked
-            key = picked.split(":", 1)[0]
-            if key in dict(labels):
-                st.session_state.watch_sort = None if active_sort == key else key
-                st.rerun()
+        st.markdown('<div class="sort-live"></div>', unsafe_allow_html=True)
+        c_name, c_score, c_px, c_chg, _c_del = st.columns([4.4, 1.05, 1.45, 1.45, 0.7], gap="small")
+        with c_name:
+            n_name, n_amount = st.columns(2, gap="small")
+        for key, label, col in (
+            ("name", "名称", n_name),
+            ("amount", "成交额", n_amount),
+            ("score", "评分", c_score),
+            ("price", "最新价", c_px),
+            ("chg", "涨跌幅", c_chg),
+        ):
+            on = active_sort == key
+            with col:
+                if st.button(
+                    f"{label} ↓" if on else label,
+                    key=f"wsort_{key}",
+                    type="primary" if on else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state.watch_sort = None if on else key
+                    if "sort" in st.query_params:
+                        del st.query_params["sort"]
+                    st.rerun()
         active_sort = st.session_state.get("watch_sort")
         rows = []
         for ticker in st.session_state.watchlist:
