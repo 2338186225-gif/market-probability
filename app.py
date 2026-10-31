@@ -2080,12 +2080,46 @@ PAPER_CASH = 1_000_000.0
 PAPER_SLOTS = 10
 _BOOK_LOCK = threading.Lock()
 SHOCKS = (
-    "hack", "hacked", "stolen", "exploit", "bankrupt", "bankruptcy", "fraud",
-    "sec charges", "trading halt", "halted", "delisting", "default",
-    "data breach", "embezzl", "plunges", "investigation", "earnings miss",
-    "misses estimates", "guidance cut", "cuts guidance", "accounting scandal",
-    "被盗", "黑客", "破产", "欺诈", "停牌", "暴雷",
+    "hack", "hacked", "exploit", "exploited", "stolen",
+    "bankrupt", "bankruptcy", "fraud", "sec charges",
+    "trading halt", "halted", "delisting", "delisted", "in default",
+    "debt default", "defaults on",
+    "data breach", "embezzl", "accounting scandal",
+    "earnings miss", "misses estimates", "guidance cut", "cuts guidance",
+    "被盗", "黑客", "破产", "欺诈", "停牌", "退市", "暴雷", "爆仓", "造假",
 )
+
+NEWS_ALIAS = {
+    "BTC-USD": ("Bitcoin", "比特币"),
+    "ETH-USD": ("Ethereum", "以太坊"),
+    "BNB-USD": ("币安币",),
+    "SOL-USD": ("Solana", "索拉纳"),
+    "XRP-USD": ("Ripple", "瑞波"),
+    "DOGE-USD": ("Dogecoin", "狗狗币"),
+    "ADA-USD": ("Cardano",),
+    "AVAX-USD": ("Avalanche",),
+    "LINK-USD": ("Chainlink",),
+    "LTC-USD": ("Litecoin", "莱特币"),
+    "BCH-USD": ("Bitcoin Cash", "比特币现金"),
+    "DOT-USD": ("Polkadot", "波卡"),
+    "UNI-USD": ("Uniswap",),
+    "HYPE32196-USD": ("Hyperliquid",),
+    "AAPL": ("Apple", "苹果"),
+    "AMZN": ("Amazon", "亚马逊"),
+    "NVDA": ("Nvidia", "英伟达"),
+    "TSLA": ("Tesla", "特斯拉"),
+    "GOOGL": ("Google", "Alphabet", "谷歌"),
+    "MSFT": ("Microsoft", "微软"),
+    "META": ("Meta Platforms", "Facebook"),
+    "AVGO": ("Broadcom", "博通"),
+    "INTC": ("Intel", "英特尔"),
+    "COST": ("Costco", "好市多"),
+    "TSM": ("TSMC", "台积电"),
+    "AMD": ("Advanced Micro", "超威"),
+    "ASML": ("阿斯麦",),
+    "ASTS": ("AST SpaceMobile",),
+    "RKLB": ("Rocket Lab",),
+}
 
 def empty_paper():
     return {"cash": PAPER_CASH, "positions": {}, "trades": [], "last_run": "", "started": date.today().isoformat(), "seen": []}
@@ -2394,37 +2428,11 @@ def crypto_bar_slot():
 
 def crypto_rebalance(book, rows):
     slot = crypto_bar_slot()
-    rule_id = "crypto-15m-v2"
+    rule_id = "crypto-15m-v3"
     if book.get("last_run") == slot and book.get("rules") == rule_id:
         return book
     by_ticker = {row["ticker"]: row for row in rows if row.get("price")}
     accrue_book(book, {ticker: row.get("price") for ticker, row in by_ticker.items()})
-    for ticker in list(book["positions"]):
-        pos = book["positions"][ticker]
-        sig = by_ticker.get(ticker)
-        price = (sig or {}).get("price") or pos.get("cost")
-        if not price:
-            continue
-        shares = float(pos.get("shares") or 0)
-        cost = float(pos.get("cost") or 0)
-        side = pos.get("side") or "多"
-        pnl = (float(price) - cost) * shares if side != "空" else (cost - float(price)) * shares
-        margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
-        reason = None
-        if margin and pnl <= -0.8 * margin:
-            reason = "亏损接近保证金，提前平仓"
-        elif sig and sig.get("side") and sig.get("side") != side:
-            reason = "15 分钟方向反了"
-        elif not sig:
-            continue
-        elif margin and pnl <= -0.35 * margin:
-            reason = "15 分钟止损"
-        rate = funding_rate_8h(ticker)
-        paying = rate is not None and ((side == "多" and rate > 0) or (side == "空" and rate < 0))
-        if reason is None and paying and abs(rate) >= 0.0005:
-            reason = "资金费过高，先平掉"
-        if reason:
-            close_position(book, ticker, price, reason, slot)
     equity = float(book["cash"])
     for ticker, pos in book["positions"].items():
         price = float((by_ticker.get(ticker) or {}).get("price") or pos.get("cost") or 0)
@@ -2478,7 +2486,7 @@ def crypto_rebalance(book, rows):
 def paper_rebalance(book, signals, kind):
     today = cn_now().date().isoformat()
     stamp = cn_stamp()
-    rule_id = "edge-lev-v2" if kind == "edge" else "lev-v2"
+    rule_id = "edge-lev-v3" if kind == "edge" else "lev-v3"
     if book.get("last_run") == today and book.get("rules") == rule_id:
         return book
     books = load_books()
@@ -2524,43 +2532,6 @@ def paper_rebalance(book, signals, kind):
         price = (sig or {}).get("price") or pos.get("cost")
         if kind == "watch" and ticker not in st.session_state.watchlist:
             close_position(book, ticker, price, "已移出自选", stamp)
-            continue
-        if not price:
-            continue
-        side = pos.get("side") or "多"
-        margin, pnl = position_margin_pnl(pos, price)
-        plan = wanted(sig) if sig else None
-        reason = None
-        if pos.get("margin") is None or pos.get("leverage") is None:
-            reason = "按做空和杠杆规则重开"
-        elif plan is None:
-            reason = "信号消失，先平掉"
-        elif plan[0] != side:
-            reason = "方向反了，先平掉"
-        elif margin and pnl <= -0.8 * margin:
-            reason = "亏损接近保证金，提前平仓"
-        elif margin and pnl <= -0.35 * margin:
-            reason = "杠杆止损"
-        elif kind == "edge" and side == "多":
-            cost = float(pos.get("cost") or 0)
-            if cost and price <= cost * 0.88:
-                reason = "自设止损，跌破成本 12%"
-            elif sig and not sig.get("above_ma"):
-                reason = "跌破 200 日均线，多头退出"
-            elif sig and sig.get("mom") is not None and sig.get("mom") <= 0:
-                reason = "近一年动量转负，多头退出"
-        elif kind == "edge" and side == "空" and sig:
-            mom = sig.get("mom")
-            cost = float(pos.get("cost") or 0)
-            if mom is not None and mom >= -0.02:
-                reason = "跌势减弱，空头退出"
-            elif sig.get("above_ma"):
-                reason = "站回 200 日均线，空头退出"
-            elif cost and price >= cost * 1.12:
-                reason = "空头止损，反弹超过成本 12%"
-        if reason:
-            close_position(book, ticker, price, reason, stamp)
-
     def book_equity_now():
         total = float(book["cash"])
         for ticker, pos in book["positions"].items():
@@ -2677,7 +2648,29 @@ def paper_rebalance(book, signals, kind):
 
 def shock_headline(title):
     text = (title or "").lower()
-    return any(word in text for word in SHOCKS)
+    for word in SHOCKS:
+        if re.search(r"(?<![a-z0-9])" + re.escape(word.lower()) + r"(?![a-z0-9])", text):
+            return True
+    return False
+
+def mentions_asset(ticker, title):
+    text = title or ""
+    keys = []
+    symbol = show_symbol(ticker)
+    if len(symbol) >= 3:
+        keys.append(symbol)
+    name = FRIENDLY.get(ticker)
+    if name:
+        keys.append(name)
+    keys.extend(NEWS_ALIAS.get(ticker, ()))
+    for key in keys:
+        if not key:
+            continue
+        if re.search(r"(?<![A-Za-z0-9])" + re.escape(key) + r"(?![A-Za-z0-9])", text, flags=re.I):
+            return True
+    if len(symbol) <= 2:
+        return bool(re.search(r"(?:\$|NYSE:\s*|NASDAQ:\s*)" + re.escape(symbol) + r"(?![A-Za-z0-9])", text, flags=re.I))
+    return False
 
 def last_price(ticker):
     symbol = binance_symbol(ticker)
@@ -2719,7 +2712,7 @@ def apply_shocks(books, price_fn=None):
             items = []
         for item in items:
             title = item.get("title") or ""
-            if not shock_headline(title):
+            if not title or not mentions_asset(ticker, title) or not shock_headline(title):
                 continue
             key = title.lower()
             try:
@@ -3101,7 +3094,7 @@ def render_paper():
         if key == "edge":
             st.caption("择股自己挑。站上 200 日均线且近一年上涨的做多，跌破均线且近一年下跌的做空。杠杆 2 到 10 倍，波动越大倍数越低。最多 6 只。")
         elif key == "crypto":
-            st.caption("加密仓看 15 分钟线。做多做空，杠杆 2 到 10 倍。开平仓扣币安吃单手续费，持仓按资金费率计息。费盖不住预期波动就不开。资金费过高会先平掉。")
+            st.caption("加密仓看 15 分钟线。做多做空，杠杆 2 到 10 倍。开平仓扣币安吃单手续费，持仓按资金费率计息。费盖不住预期波动就不开。只有这只币自己的重大新闻才会平仓。")
         else:
             st.caption("持仓检查：" + sleeve_report(books[key], signals[key]))
     paper_monitor()
@@ -3131,7 +3124,7 @@ def paper_monitor():
         st.warning("重大消息已立刻卖出：" + "；".join(acted))
         st.rerun()
     else:
-        st.caption(f"新闻监测 {stamp}。服务器大约每 3 分钟查一次，不需要开着这个页面。被盗、财报暴雷、停牌、调查用新闻标题识别。")
+        st.caption(f"新闻监测 {stamp}。大约每 3 分钟查一次。只有持仓标的自己的重大新闻才平仓：被盗、破产、欺诈、停牌、退市、财报暴雷。跌了、调查这类标题不平。")
 
 try:
     paper_monitor = st.fragment(run_every=180)(paper_monitor)
