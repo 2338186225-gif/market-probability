@@ -490,12 +490,12 @@ def nasdaq_symbol(ticker):
             return f"{base}.{suffix}"
     return str(ticker)
 
-def nasdaq_get(path):
+def nasdaq_get(path, timeout=8):
     req = urllib.request.Request(
         "https://api.nasdaq.com" + path,
         headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 def nasdaq_payload(ticker, kind):
@@ -625,7 +625,13 @@ def accrue_book(book, prices):
         if not started:
             pos["funded_at"] = now.isoformat()
             continue
-        then = datetime.fromisoformat(started)
+        try:
+            text = str(started).replace(" ", "T")
+            text = text.split("+")[0].replace("Z", "")
+            then = datetime.fromisoformat(text)
+        except Exception:
+            pos["funded_at"] = now.isoformat()
+            continue
         if then.tzinfo is None:
             then = then.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
         hours = (now - then).total_seconds() / 3600
@@ -707,42 +713,80 @@ def get_stock_summary(ticker):
             }
         else:
             quote = nasdaq_quote(ticker)
-            if quote:
-                summary = {
-                    "ticker": ticker,
-                    "name": pretty_name(ticker) if pretty_name(ticker) != show_symbol(ticker) else (quote.get("name") or show_symbol(ticker)),
-                    "price": quote["price"],
-                    "change": quote["change"],
-                    "change_pct": quote["pct"],
-                    "info": {
-                        "quoteType": "EQUITY",
-                        "regularMarketVolume": quote.get("volume"),
-                        "volume": quote.get("volume"),
-                        "previousClose": quote.get("prev"),
-                    },
-                    "website": "",
-                    "source": "nasdaq",
-                }
-            else:
-                stock = yf.Ticker(ticker)
-                hist = stock.history(period="5d")
-                if hist.empty:
-                    return None
-                current = float(hist["Close"].iloc[-1])
-                prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current
-                change = current - prev
-                change_pct = (change / prev * 100) if prev else 0
-                info = stock.info
-                summary = {
-                    "ticker": ticker, "name": pretty_name(ticker, info), "price": current,
-                    "change": change, "change_pct": change_pct, "info": info,
-                    "website": info.get("website") or "",
-                    "source": "yahoo",
-                }
+            if not quote:
+                return cached
+            summary = {
+                "ticker": ticker,
+                "name": pretty_name(ticker) if pretty_name(ticker) != show_symbol(ticker) else (quote.get("name") or show_symbol(ticker)),
+                "price": quote["price"],
+                "change": quote["change"],
+                "change_pct": quote["pct"],
+                "info": {
+                    "quoteType": "EQUITY",
+                    "regularMarketVolume": quote.get("volume"),
+                    "volume": quote.get("volume"),
+                    "previousClose": quote.get("prev"),
+                },
+                "website": "",
+                "source": "nasdaq",
+            }
         st.session_state.stock_cache[ticker] = summary
         return summary
     except Exception:
         return cached
+
+def warm_quotes(tickers):
+    cache = st.session_state.stock_cache
+    missing = []
+    for ticker in tickers:
+        cached = cache.get(ticker)
+        symbol = binance_symbol(ticker)
+        fresh = cached and ((symbol and cached.get("source") == "binance") or (not symbol and cached.get("source") == "nasdaq"))
+        if not fresh:
+            missing.append(ticker)
+    if not missing:
+        return
+
+    def one(ticker):
+        try:
+            symbol = binance_symbol(ticker)
+            if symbol:
+                quote = binance_quote(symbol)
+                return ticker, {
+                    "ticker": ticker, "name": pretty_name(ticker), "price": quote["price"],
+                    "change": quote["change"], "change_pct": quote["pct"],
+                    "info": {
+                        "quoteType": "CRYPTOCURRENCY",
+                        "regularMarketVolume": quote["volume"], "volume": quote["volume"],
+                        "regularMarketOpen": quote["open"], "regularMarketDayHigh": quote["high"],
+                        "regularMarketDayLow": quote["low"], "previousClose": quote["prev"],
+                    },
+                    "website": "", "source": "binance",
+                }
+            quote = nasdaq_quote(ticker)
+            if not quote:
+                return ticker, None
+            name = pretty_name(ticker)
+            if name == show_symbol(ticker):
+                name = quote.get("name") or name
+            return ticker, {
+                "ticker": ticker, "name": name, "price": quote["price"],
+                "change": quote["change"], "change_pct": quote["pct"],
+                "info": {
+                    "quoteType": "EQUITY",
+                    "regularMarketVolume": quote.get("volume"),
+                    "volume": quote.get("volume"),
+                    "previousClose": quote.get("prev"),
+                },
+                "website": "", "source": "nasdaq",
+            }
+        except Exception:
+            return ticker, None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for ticker, summary in pool.map(one, missing):
+            if summary:
+                cache[ticker] = summary
 
 def fetch_hist(ticker, timeframe):
     symbol = binance_symbol(ticker)
@@ -1061,50 +1105,39 @@ def rate_frame(ticker, hist):
 def rate_ticker(ticker: str):
     """含 12 个月动量和 200 日均线。加密货币用币安现货。"""
     try:
-        symbol = binance_symbol(ticker)
-        if symbol:
-            hist = binance_klines(symbol, "1d", 1000)
-        else:
-            hist = nasdaq_daily(ticker)
-            if hist is None or hist.empty:
-                hist = yf.Ticker(ticker).history(period="3y", interval="1d")
+        return rate_fast(ticker)
     except Exception:
         return None
-    return rate_frame(ticker, hist)
+
+def rate_fast(ticker: str):
+    """只走纳斯达克和币安。不整包下载雅虎三年线，避免一打开就把进程打爆。"""
+    try:
+        symbol = binance_symbol(ticker)
+        if symbol:
+            hist = binance_klines(symbol, "1d", 400)
+        else:
+            hist = nasdaq_daily(ticker)
+    except Exception:
+        return None
+    if hist is None or getattr(hist, "empty", True):
+        return None
+    try:
+        return rate_frame(ticker, hist)
+    except Exception:
+        return None
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def rank_universe(tickers: tuple):
-    """全市场扫描，结果里带动量。加密货币用币安日线。"""
+    """最多给 12 只打分。全市场一次下载会把云上的进程撑死。"""
     ranked = []
-    stocks = tuple(ticker for ticker in tickers if not binance_symbol(ticker))
-    cryptos = tuple(ticker for ticker in tickers if binance_symbol(ticker))
-    if stocks:
-        try:
-            data = yf.download(
-                list(stocks), period="3y", interval="1d", group_by="ticker",
-                auto_adjust=True, progress=False, threads=True,
-            )
-        except Exception:
-            data = None
-        if data is not None and not data.empty:
-            multi = isinstance(data.columns, pd.MultiIndex)
-            for ticker in stocks:
-                try:
-                    hist = data[ticker].dropna(how="all") if multi else data
-                except Exception:
-                    continue
-                rated = rate_frame(ticker, hist)
-                if rated:
-                    ranked.append(rated)
-    for ticker in cryptos:
-        try:
-            hist = binance_klines(binance_symbol(ticker), "1d", 1000)
-        except Exception:
-            continue
-        rated = rate_frame(ticker, hist)
+    started = time.time()
+    for ticker in tuple(tickers)[:12]:
+        if ranked and time.time() - started > 8:
+            break
+        rated = rate_fast(ticker)
         if rated:
             ranked.append(rated)
-    ranked.sort(key=lambda item: item["score"], reverse=True)
+    ranked.sort(key=lambda item: item.get("score") or 0, reverse=True)
     return ranked
 
 def quote_bar(ticker, price, change_pct, label, name, website="", prefix="", amount=None, score=None):
@@ -1854,6 +1887,10 @@ def to_zh(text):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def market_headlines(tickers: tuple):
+    cache = st.session_state.setdefault("headline_cache", {})
+    hit = cache.get(tickers)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
     seen = set()
     rows = []
     for ticker in tickers:
@@ -1867,7 +1904,9 @@ def market_headlines(tickers: tuple):
             row["title_zh"] = to_zh(item["title"])
             rows.append(row)
             if len(rows) >= 8:
+                cache[tickers] = (time.time(), rows)
                 return rows
+    cache[tickers] = (time.time(), rows)
     return rows
 
 def hist_vol_drift(close):
@@ -2158,15 +2197,23 @@ def crypto_marks():
     if cache["rows"] and time.time() - cache["at"] < 20:
         return cache["rows"]
     wanted = {binance_symbol(ticker): ticker for ticker in CRYPTO_MARKET}
+    payload = []
     try:
-        payload = binance_get("/api/v3/ticker/price", {"symbols": json.dumps(list(wanted), separators=(",", ":"))})
+        raw = binance_get("/api/v3/ticker/price", {"symbols": json.dumps(list(wanted), separators=(",", ":"))})
+        if isinstance(raw, list):
+            payload = raw
     except Exception:
         payload = []
     out = {}
-    for item in payload or []:
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
         ticker = wanted.get(item.get("symbol"))
         if ticker and item.get("price"):
-            out[ticker] = float(item["price"])
+            try:
+                out[ticker] = float(item["price"])
+            except (TypeError, ValueError):
+                continue
     if out:
         cache["at"] = time.time()
         cache["rows"] = out
@@ -2650,11 +2697,17 @@ def money_class(value):
     return ""
 
 def book_snapshot(book, signals):
-    prices = {row["ticker"]: row["price"] for row in signals}
+    prices = {}
+    for row in signals or []:
+        if isinstance(row, dict) and row.get("ticker"):
+            prices[row["ticker"]] = row.get("price")
     unreal = 0.0
-    market_value = 0.0
     positions = []
-    for ticker, pos in book.get("positions", {}).items():
+    if not isinstance(book, dict):
+        book = {}
+    for ticker, pos in (book.get("positions") or {}).items():
+        if not isinstance(pos, dict):
+            continue
         price = float(prices.get(ticker) or pos.get("cost") or 0)
         cost = float(pos.get("cost") or 0)
         side = pos.get("side") or "多"
@@ -2664,18 +2717,11 @@ def book_snapshot(book, signals):
         value = shares * price
         unreal += pnl
         positions.append({
-            "ticker": ticker,
-            "shares": shares,
-            "cost": cost,
-            "price": price,
-            "value": value,
-            "pnl": pnl,
-            "margin": margin,
-            "side": side,
-            "leverage": pos.get("leverage") or 1,
-            "horizon": pos.get("horizon") or "日",
+            "ticker": ticker, "shares": shares, "cost": cost, "price": price,
+            "value": value, "pnl": pnl, "margin": margin, "side": side,
+            "leverage": pos.get("leverage") or 1, "horizon": pos.get("horizon") or "日",
         })
-    realized = sum(float(trade.get("pnl") or 0) for trade in book.get("trades") or [] if trade.get("side") in ("卖", "平空"))
+    realized = sum(float(trade.get("pnl") or 0) for trade in book.get("trades") or [] if isinstance(trade, dict) and trade.get("side") in ("卖", "平空"))
     equity = float(book.get("cash") or 0) + sum(item["margin"] + item["pnl"] for item in positions)
     return equity, sum(item["value"] for item in positions), unreal, realized, positions
 
@@ -2833,9 +2879,16 @@ def sleeve_report(book, signals):
     return f"持仓 {len(positions)} 只。日线保证金 {daily * 100:.0f}%，{daily_text}。周线保证金 {weekly * 100:.0f}%，{weekly_text}。可做空，杠杆不超过 10 倍。"
 
 def book_equity(book, signals):
-    prices = {row["ticker"]: row["price"] for row in signals}
+    prices = {}
+    for row in signals or []:
+        if isinstance(row, dict) and row.get("ticker"):
+            prices[row["ticker"]] = row.get("price")
+    if not isinstance(book, dict):
+        return 0.0
     equity = float(book.get("cash") or 0)
-    for ticker, pos in book.get("positions", {}).items():
+    for ticker, pos in (book.get("positions") or {}).items():
+        if not isinstance(pos, dict):
+            continue
         price = float(prices.get(ticker) or pos.get("cost") or 0)
         shares = float(pos.get("shares") or 0)
         cost = float(pos.get("cost") or 0)
@@ -2844,6 +2897,23 @@ def book_equity(book, signals):
         margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
         equity += margin + pnl
     return equity
+
+def book_rows_from_book(book):
+    rows = []
+    if not isinstance(book, dict):
+        return rows
+    for ticker, pos in (book.get("positions") or {}).items():
+        if not isinstance(pos, dict):
+            continue
+        cached = (st.session_state.get("stock_cache") or {}).get(ticker) or {}
+        rows.append({
+            "ticker": ticker,
+            "price": cached.get("price") or pos.get("cost"),
+            "side": pos.get("side"),
+            "vol": None,
+            "horizons": {},
+        })
+    return rows
 
 def render_paper():
     st.markdown(
@@ -2863,88 +2933,55 @@ def render_paper():
     st.markdown(tabs, unsafe_allow_html=True)
     paper_at = st.session_state.get("paper_board_at") or 0
     paper_key = (tuple(st.session_state.watchlist), "lev-v2")
+    fresh = (
+        time.time() - paper_at < 1800
+        and st.session_state.get("paper_watch_key") == paper_key
+        and st.session_state.get("paper_signals")
+    )
     if key == "crypto":
         marks = crypto_marks()
         cached = globals().get("_CRYPTO_15M") or {}
         crypto_rows = []
         for row in cached.get("rows") or []:
+            if not isinstance(row, dict) or not row.get("ticker"):
+                continue
             item = dict(row)
             if item["ticker"] in marks:
                 item["price"] = marks[item["ticker"]]
             crypto_rows.append(item)
         have = {row["ticker"] for row in crypto_rows}
-        for ticker, price in marks.items():
+        for ticker, price in (marks or {}).items():
             if ticker not in have:
                 crypto_rows.append({"ticker": ticker, "price": price, "side": None, "horizons": {}})
-        for ticker, pos in books["crypto"]["positions"].items():
-            if ticker not in {row["ticker"] for row in crypto_rows}:
-                crypto_rows.append({"ticker": ticker, "price": marks.get(ticker) or pos.get("cost"), "side": pos.get("side"), "horizons": {}})
-        signals = {"watch": [], "market": [], "edge": [], "crypto": crypto_rows}
+                have.add(ticker)
+        for ticker, pos in (books.get("crypto") or {}).get("positions", {}).items():
+            if not isinstance(pos, dict) or ticker in have:
+                continue
+            crypto_rows.append({"ticker": ticker, "price": (marks or {}).get(ticker) or pos.get("cost"), "side": pos.get("side"), "horizons": {}})
+        signals = {"watch": book_rows_from_book(books.get("watch")), "market": book_rows_from_book(books.get("market")), "edge": book_rows_from_book(books.get("edge")), "crypto": crypto_rows}
         if cached.get("rows"):
-            crypto_rebalance(books["crypto"], cached["rows"])
-        elif not globals().get("_CRYPTO_LOADING"):
-            globals()["_CRYPTO_LOADING"] = True
-            def _load_crypto():
-                try:
-                    crypto_market_rows()
-                finally:
-                    globals()["_CRYPTO_LOADING"] = False
-            threading.Thread(target=_load_crypto, name="crypto-15m", daemon=True).start()
-        save_books(books)
-    elif (
-        time.time() - paper_at < 1800
-        and st.session_state.get("paper_watch_key") == paper_key
-        and st.session_state.get("paper_signals")
-    ):
+            try:
+                crypto_rebalance(books["crypto"], cached["rows"])
+            except Exception:
+                pass
+    elif fresh:
         signals = dict(st.session_state.paper_signals)
-        signals["crypto"] = (globals().get("_CRYPTO_15M") or {}).get("rows") or []
-        paper_rebalance(books["watch"], signals.get("watch") or [], "watch")
-        paper_rebalance(books["market"], signals.get("market") or [], "market")
-        paper_rebalance(books["edge"], signals.get("edge") or [], "edge")
-        save_books(books)
+        signals.setdefault("crypto", [])
+        try:
+            paper_rebalance(books[key], signals.get(key) or [], key if key != "crypto" else "watch")
+        except Exception:
+            pass
     else:
-        with st.spinner("正在检查模拟仓"):
-            watch_rows = paper_signals(st.session_state.watchlist)
-            ranked = rank_universe(MARKET)
-            market_rows = []
-            seen_market = set()
-            pool = list(ranked[:12]) + list(ranked[-12:])
-            for item in pool:
-                symbol = item.get("ticker")
-                if not symbol or symbol in seen_market:
-                    continue
-                seen_market.add(symbol)
-                row = signal_from_item(symbol, item)
-                if row and row.get("price"):
-                    market_rows.append(row)
-            have = {row["ticker"] for row in market_rows}
-            extra = [ticker for ticker in books["market"]["positions"] if ticker not in have]
-            if extra:
-                market_rows.extend(paper_signals(extra))
-            edge_rows = []
-            for item in ranked:
-                if not item or not item.get("price"):
-                    continue
-                edge_rows.append({
-                    "ticker": item.get("ticker"),
-                    "price": item.get("price"),
-                    "vol": item.get("vol"),
-                    "mom": item.get("mom"),
-                    "above_ma": bool(item.get("above_ma")),
-                    "horizons": {},
-                })
-            edge_have = {row["ticker"] for row in edge_rows}
-            edge_extra = [ticker for ticker in books["edge"]["positions"] if ticker not in edge_have]
-            if edge_extra:
-                edge_rows.extend(paper_signals(edge_extra))
-        signals = {"watch": watch_rows, "market": market_rows, "edge": edge_rows, "crypto": []}
-        st.session_state.paper_signals = signals
-        st.session_state.paper_board_at = time.time()
-        st.session_state.paper_watch_key = paper_key
-        paper_rebalance(books["watch"], signals.get("watch") or [], "watch")
-        paper_rebalance(books["market"], signals.get("market") or [], "market")
-        paper_rebalance(books["edge"], signals.get("edge") or [], "edge")
+        signals = {
+            "watch": book_rows_from_book(books.get("watch")),
+            "market": book_rows_from_book(books.get("market")),
+            "edge": book_rows_from_book(books.get("edge")),
+            "crypto": book_rows_from_book(books.get("crypto")),
+        }
+    try:
         save_books(books)
+    except Exception:
+        pass
     equities = {name: book_equity(books[name], signals.get(name) or []) for name in ("watch", "market", "edge", "crypto")}
     st.caption(
         "累计盈亏对照：自选 "
@@ -3005,6 +3042,7 @@ except Exception:
     pass
 
 # ==================== 详情页优先显示 ====================
+home_more = False
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
     try:
@@ -3622,39 +3660,51 @@ else:
     level_unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
     watch_key = tuple(st.session_state.watchlist)
     board_at = st.session_state.get("home_board_at") or 0
+    attempted = set(st.session_state.get("home_attempted") or [])
     board_ok = (
         time.time() - board_at < 1800
         and st.session_state.get("home_watch_key") == watch_key
-        and st.session_state.get("home_ranked")
-        and st.session_state.get("home_ratings")
+        and set(watch_key).issubset(attempted)
     )
+    ranked = list(st.session_state.get("home_ranked") or [])
+    ratings = dict(st.session_state.get("home_ratings") or {})
     if board_ok:
-        ranked = st.session_state.home_ranked
-        ratings = st.session_state.home_ratings
+        pass
     else:
-        with st.spinner("正在扫描美股龙头和主流加密货币，按买入评级取前十"):
-            ranked = rank_universe(MARKET)
-            pool = ranked[:40]
-            with ThreadPoolExecutor(max_workers=6) as executor:
-                enriched = list(executor.map(lambda item: merge_context(item, True), pool))
-            ranked = enriched + ranked[40:]
-            ranked.sort(key=lambda item: item.get("score") or -999, reverse=True)
-        ratings = {item["ticker"]: item for item in ranked}
-        missing = [symbol for symbol in st.session_state.watchlist if not (ratings.get(symbol) or {}).get("context")]
-        need_fetch = [symbol for symbol in missing if symbol not in ratings]
-        fetched = {}
-        if need_fetch:
-            with ThreadPoolExecutor(max_workers=6) as executor:
-                for symbol, item in zip(need_fetch, executor.map(rate_ticker, need_fetch)):
-                    fetched[symbol] = item
-        for symbol in missing:
-            base = ratings.get(symbol) or fetched.get(symbol)
-            if base:
-                ratings[symbol] = merge_context(base, True)
+        if st.session_state.get("home_watch_key") != watch_key:
+            attempted = set()
+            ratings = {}
+            ranked = []
+        pending = [ticker for ticker in watch_key if ticker not in attempted]
+        deadline = time.time() + 7
+        try:
+            with st.spinner("正在读取自选行情"):
+                for ticker in pending:
+                    if attempted and time.time() > deadline:
+                        break
+                    attempted.add(ticker)
+                    try:
+                        rated = rate_fast(ticker)
+                    except Exception:
+                        rated = None
+                    if isinstance(rated, dict) and rated.get("ticker"):
+                        ratings[rated["ticker"]] = rated
+        except Exception:
+            pass
+        ranked = sorted(
+            (row for row in ratings.values() if isinstance(row, dict)),
+            key=lambda item: item.get("score") or 0,
+            reverse=True,
+        )
+        st.session_state.home_attempted = list(attempted)
         st.session_state.home_ranked = ranked
         st.session_state.home_ratings = ratings
-        st.session_state.home_board_at = time.time()
         st.session_state.home_watch_key = watch_key
+        if set(watch_key).issubset(attempted):
+            st.session_state.home_board_at = time.time()
+        else:
+            st.session_state.home_board_at = 0
+            home_more = True
 
     def shown_rating(item):
         if not item:
@@ -3707,6 +3757,10 @@ else:
                         del st.query_params["sort"]
                     st.rerun()
         active_sort = st.session_state.get("watch_sort")
+        try:
+            warm_quotes(tuple(st.session_state.watchlist))
+        except Exception:
+            pass
         rows = []
         for ticker in st.session_state.watchlist:
             summary = get_stock_summary(ticker)
@@ -3715,7 +3769,12 @@ else:
             info = (summary or {}).get("info") or {}
             volume = info.get("regularMarketVolume") or info.get("volume")
             price = summary["price"] if summary else None
-            amount = price * float(volume) if price and volume else None
+            amount = None
+            if price and volume:
+                try:
+                    amount = price * float(str(volume).replace(",", ""))
+                except (TypeError, ValueError):
+                    amount = None
             rows.append({
                 "ticker": ticker,
                 "summary": summary,
@@ -3759,9 +3818,9 @@ else:
             ranked_view = list(ranked)
         picks = ranked_view[:10]
         st.markdown(f'<div class="board-head"><div class="section-title">综合买入评级</div><div class="muted">{basis}前十</div></div>', unsafe_allow_html=True)
-        st.caption("综合分在均线之上加减财报、估值、新闻和资金。选日线、周线、月线时只看那一级均线。")
+        st.caption("按自选打分，不在打开页面时扫完全市场。选日线、周线、月线时只看那一级。评级会分批出来。")
         if not picks:
-            st.info("这次没有拉到足够行情，前十暂时空着。过一会儿再刷新。")
+            st.info("评级还在分批计算，行情先显示。稍等或点一下页面就会补上。")
         for index, item in enumerate(picks, start=1):
             symbol = item["ticker"]
             summary = get_stock_summary(symbol)
@@ -3771,7 +3830,12 @@ else:
             website = (summary or {}).get("website") or ""
             info = (summary or {}).get("info") or {}
             volume = info.get("regularMarketVolume") or info.get("volume")
-            amount = price * float(volume) if price and volume else None
+            amount = None
+            if price and volume:
+                try:
+                    amount = float(price) * float(str(volume).replace(",", ""))
+                except (TypeError, ValueError):
+                    amount = None
             label, score = shown_rating(item)
             body = quote_bar(
                 symbol, price, change_pct, label, name, website,
@@ -3798,3 +3862,5 @@ else:
             )
 
 st.caption("仅供学习研究，不构成投资建议。股票行情来自纳斯达克官网，加密货币来自币安现货，都有延迟。")
+if home_more:
+    st.rerun()
