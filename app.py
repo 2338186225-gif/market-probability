@@ -13,7 +13,7 @@ import threading
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -470,10 +470,108 @@ def binance_quote(symbol):
         "volume": float(data["volume"]),
     }
 
+def parse_num(text):
+    if text is None:
+        return None
+    raw = str(text).strip().replace("$", "").replace(",", "").replace("%", "")
+    if raw in ("", "N/A", "NA", "--"):
+        return None
+    if raw[0] == "+":
+        raw = raw[1:]
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+def nasdaq_symbol(ticker):
+    if "-" in str(ticker):
+        base, suffix = str(ticker).split("-", 1)
+        if len(suffix) == 1:
+            return f"{base}.{suffix}"
+    return str(ticker)
+
+def nasdaq_get(path):
+    req = urllib.request.Request(
+        "https://api.nasdaq.com" + path,
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode())
+
+def nasdaq_payload(ticker, kind):
+    symbol = quote(nasdaq_symbol(ticker), safe=".")
+    for asset in ("stocks", "etf"):
+        try:
+            data = nasdaq_get(f"/api/quote/{symbol}/{kind}?assetclass={asset}")
+            payload = data.get("data") or {}
+            if payload:
+                return payload
+        except Exception:
+            continue
+    return None
+
+def nasdaq_quote(ticker):
+    data = nasdaq_payload(ticker, "info")
+    if not data or not data.get("primaryData"):
+        return None
+    primary = data["primaryData"]
+    price = parse_num(primary.get("lastSalePrice"))
+    if price is None:
+        return None
+    change = parse_num(primary.get("netChange")) or 0.0
+    return {
+        "price": price,
+        "change": change,
+        "pct": parse_num(primary.get("percentageChange")) or 0.0,
+        "prev": price - change,
+        "volume": parse_num(primary.get("volume")),
+        "name": data.get("companyName") or "",
+    }
+
+def nasdaq_daily(ticker):
+    symbol = quote(nasdaq_symbol(ticker), safe=".")
+    start = (date.today() - timedelta(days=365 * 4)).isoformat()
+    end = date.today().isoformat()
+    rows = None
+    for asset in ("stocks", "etf"):
+        try:
+            data = nasdaq_get(
+                f"/api/quote/{symbol}/historical?assetclass={asset}&fromdate={start}&todate={end}&limit=2000"
+            )
+            found = ((data.get("data") or {}).get("tradesTable") or {}).get("rows") or []
+            if found:
+                rows = found
+                break
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    for col in ("close", "open", "high", "low", "volume"):
+        frame[col] = frame[col].map(parse_num)
+    frame["date"] = pd.to_datetime(frame["date"], format="%m/%d/%Y")
+    frame = frame.dropna(subset=["close"]).sort_values("date").set_index("date")
+    frame = frame.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+    return frame[["Open", "High", "Low", "Close", "Volume"]]
+
+def nasdaq_intraday(ticker, rule):
+    data = nasdaq_payload(ticker, "chart")
+    points = (data or {}).get("chart") or []
+    if len(points) < 2:
+        return pd.DataFrame()
+    series = pd.Series(
+        [float(point["y"]) for point in points],
+        index=pd.to_datetime([point["x"] for point in points], unit="ms", utc=True),
+    ).sort_index()
+    bars = series.resample(rule).ohlc().dropna()
+    bars.columns = ["Open", "High", "Low", "Close"]
+    bars["Volume"] = 0.0
+    return bars
+
 def get_stock_summary(ticker):
     cached = st.session_state.stock_cache.get(ticker) if ticker in st.session_state.stock_cache else None
     symbol = binance_symbol(ticker)
-    if cached and (not symbol or cached.get("source") == "binance"):
+    if cached and ((symbol and cached.get("source") == "binance") or (not symbol and cached.get("source") == "nasdaq")):
         return cached
     try:
         if symbol:
@@ -495,21 +593,39 @@ def get_stock_summary(ticker):
                 "source": "binance",
             }
         else:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="5d")
-            if hist.empty:
-                return None
-            current = float(hist["Close"].iloc[-1])
-            prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current
-            change = current - prev
-            change_pct = (change / prev * 100) if prev else 0
-            info = stock.info
-            summary = {
-                "ticker": ticker, "name": pretty_name(ticker, info), "price": current,
-                "change": change, "change_pct": change_pct, "info": info,
-                "website": info.get("website") or "",
-                "source": "yahoo",
-            }
+            quote = nasdaq_quote(ticker)
+            if quote:
+                summary = {
+                    "ticker": ticker,
+                    "name": pretty_name(ticker) if pretty_name(ticker) != show_symbol(ticker) else (quote.get("name") or show_symbol(ticker)),
+                    "price": quote["price"],
+                    "change": quote["change"],
+                    "change_pct": quote["pct"],
+                    "info": {
+                        "quoteType": "EQUITY",
+                        "regularMarketVolume": quote.get("volume"),
+                        "volume": quote.get("volume"),
+                        "previousClose": quote.get("prev"),
+                    },
+                    "website": "",
+                    "source": "nasdaq",
+                }
+            else:
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period="5d")
+                if hist.empty:
+                    return None
+                current = float(hist["Close"].iloc[-1])
+                prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current
+                change = current - prev
+                change_pct = (change / prev * 100) if prev else 0
+                info = stock.info
+                summary = {
+                    "ticker": ticker, "name": pretty_name(ticker, info), "price": current,
+                    "change": change, "change_pct": change_pct, "info": info,
+                    "website": info.get("website") or "",
+                    "source": "yahoo",
+                }
         st.session_state.stock_cache[ticker] = summary
         return summary
     except Exception:
@@ -524,6 +640,24 @@ def fetch_hist(ticker, timeframe):
             return binance_klines(symbol, interval, limit)
         except Exception:
             return pd.DataFrame()
+    if timeframe in ("1d", "1wk", "1mo"):
+        try:
+            daily = nasdaq_daily(ticker)
+        except Exception:
+            daily = pd.DataFrame()
+        if daily is not None and not daily.empty:
+            if timeframe == "1wk":
+                daily = daily.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
+            elif timeframe == "1mo":
+                daily = daily.resample("ME").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
+            return daily
+    elif timeframe in ("15m", "1h", "4h"):
+        try:
+            bars = nasdaq_intraday(ticker, {"15m": "15min", "1h": "1h", "4h": "4h"}[timeframe])
+        except Exception:
+            bars = pd.DataFrame()
+        if bars is not None and not bars.empty:
+            return bars
     stock = yf.Ticker(ticker)
     mapping = {
         "15m": ("7d", "15m"),
@@ -818,7 +952,9 @@ def rate_ticker(ticker: str):
         if symbol:
             hist = binance_klines(symbol, "1d", 1000)
         else:
-            hist = yf.Ticker(ticker).history(period="3y", interval="1d")
+            hist = nasdaq_daily(ticker)
+            if hist is None or hist.empty:
+                hist = yf.Ticker(ticker).history(period="3y", interval="1d")
     except Exception:
         return None
     return rate_frame(ticker, hist)
@@ -2226,6 +2362,12 @@ def last_price(ticker):
         except Exception:
             return None
     try:
+        quote = nasdaq_quote(ticker)
+        if quote:
+            return quote["price"]
+    except Exception:
+        pass
+    try:
         hist = yf.Ticker(ticker).history(period="5d")
         if hist is not None and not hist.empty:
             return float(hist["Close"].iloc[-1])
@@ -2664,20 +2806,38 @@ if st.session_state.selected_ticker:
             volume = quote["volume"]
             cap = None
         else:
+            quote = nasdaq_quote(ticker)
             stock = yf.Ticker(ticker)
-            info = stock.info
-            name = pretty_name(ticker, info)
-            quick = stock.history(period="2d")
-            current_price = float(quick["Close"].iloc[-1]) if not quick.empty else 0
-            prev_close = info.get("previousClose", current_price)
-            change = current_price - prev_close
-            change_pct = (change / prev_close * 100) if prev_close else 0
-            website = info.get("website") or ""
-            open_px = info.get("open") or info.get("regularMarketOpen")
-            high_px = info.get("dayHigh") or info.get("regularMarketDayHigh")
-            low_px = info.get("dayLow") or info.get("regularMarketDayLow")
-            volume = info.get("volume") or info.get("regularMarketVolume")
-            cap = info.get("marketCap")
+            info = {}
+            try:
+                info = stock.info or {}
+            except Exception:
+                info = {}
+            if quote:
+                name = pretty_name(ticker, info)
+                current_price = quote["price"]
+                prev_close = quote["prev"]
+                change = quote["change"]
+                change_pct = quote["pct"]
+                website = info.get("website") or ""
+                open_px = info.get("open") or info.get("regularMarketOpen")
+                high_px = info.get("dayHigh") or info.get("regularMarketDayHigh")
+                low_px = info.get("dayLow") or info.get("regularMarketDayLow")
+                volume = quote.get("volume") or info.get("volume") or info.get("regularMarketVolume")
+                cap = info.get("marketCap")
+            else:
+                name = pretty_name(ticker, info)
+                quick = stock.history(period="2d")
+                current_price = float(quick["Close"].iloc[-1]) if not quick.empty else 0
+                prev_close = info.get("previousClose", current_price)
+                change = current_price - prev_close
+                change_pct = (change / prev_close * 100) if prev_close else 0
+                website = info.get("website") or ""
+                open_px = info.get("open") or info.get("regularMarketOpen")
+                high_px = info.get("dayHigh") or info.get("regularMarketDayHigh")
+                low_px = info.get("dayLow") or info.get("regularMarketDayLow")
+                volume = info.get("volume") or info.get("regularMarketVolume")
+                cap = info.get("marketCap")
         color = "up" if change >= 0 else "down"
         sign = "+" if change >= 0 else ""
         structure = rate_ticker(ticker) or {"label": "观望", "score": 0, "notes": ["历史不够，先不给买入评级。"]}
@@ -3408,4 +3568,4 @@ else:
                 unsafe_allow_html=True,
             )
 
-st.caption("仅供学习研究，不构成投资建议。加密货币行情来自币安现货，股票来自 Yahoo Finance，有延迟。")
+st.caption("仅供学习研究，不构成投资建议。股票行情来自纳斯达克官网，加密货币来自币安现货，都有延迟。")
