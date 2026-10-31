@@ -6,6 +6,7 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from urllib.parse import urlparse
 
 st.set_page_config(
     page_title="市场行情概率测算器",
@@ -59,6 +60,10 @@ st.markdown("""
     }
     .chg-up { background: #ecfdf5; color: #047857; }
     .chg-down { background: #fef2f2; color: #b91c1c; }
+    .logo {
+        width: 32px; height: 32px; border-radius: 8px; object-fit: contain;
+        background: #f3f4f6; vertical-align: middle; margin-right: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -90,7 +95,8 @@ def get_stock_summary(ticker):
         name = info.get("shortName", ticker)
         summary = {
             "ticker": ticker, "name": name, "price": current,
-            "change": change, "change_pct": change_pct, "info": info
+            "change": change, "change_pct": change_pct, "info": info,
+            "website": info.get("website") or "",
         }
         st.session_state.stock_cache[ticker] = summary
         return summary
@@ -194,6 +200,155 @@ def to_cn(name):
             return zh
     return key
 
+def logo_src(ticker, website=""):
+    domain = ""
+    if website:
+        host = urlparse(website if "://" in website else "https://" + website).netloc
+        domain = host[4:] if host.startswith("www.") else host
+    symbol = ticker.split(".")[0]
+    if domain:
+        return f"https://www.google.com/s2/favicons?domain={domain}&sz=128"
+    return f"https://assets.parqet.com/logos/symbol/{symbol}"
+
+def logo_html(ticker, website="", size=32):
+    src = logo_src(ticker, website)
+    return (
+        f'<img class="logo" src="{src}" width="{size}" height="{size}" '
+        f'style="width:{size}px;height:{size}px;" alt="" '
+        f'onerror="this.style.visibility=\'hidden\'">'
+    )
+
+def series_at(df, names):
+    if df is None or df.empty:
+        return None
+    for name in names:
+        if name in df.index:
+            return df.loc[name]
+    for idx in df.index:
+        text = str(idx)
+        for name in names:
+            if text.startswith(name):
+                return df.loc[idx]
+    return None
+
+def pct_change(new, old):
+    if new is None or old is None or pd.isna(new) or pd.isna(old) or old == 0:
+        return None
+    return (float(new) - float(old)) / abs(float(old)) * 100
+
+def fmt_pct(v):
+    if v is None or pd.isna(v):
+        return "—"
+    return f"{v:+.1f}%"
+
+def quarter_label(ts):
+    if not hasattr(ts, "month"):
+        return str(ts)[:10]
+    q = (ts.month - 1) // 3 + 1
+    return f"{ts.year}Q{q}"
+
+def build_earnings_note(stock, info):
+    lines = []
+    qdf = None
+    try:
+        qdf = stock.quarterly_income_stmt
+    except Exception:
+        qdf = None
+    if qdf is None or qdf.empty:
+        try:
+            qdf = stock.quarterly_financials
+        except Exception:
+            qdf = None
+
+    rev = series_at(qdf, ["Total Revenue", "Operating Revenue"]) if qdf is not None else None
+    profit = series_at(qdf, ["Net Income", "Net Income Common Stockholders"]) if qdf is not None else None
+    gross = series_at(qdf, ["Gross Profit"]) if qdf is not None else None
+    op = series_at(qdf, ["Operating Income"]) if qdf is not None else None
+
+    if rev is not None and len(rev) >= 1:
+        latest = rev.iloc[0]
+        prev = rev.iloc[1] if len(rev) > 1 else None
+        yoy = rev.iloc[4] if len(rev) > 4 else None
+        label = quarter_label(rev.index[0] if hasattr(rev, "index") else qdf.columns[0])
+        # series index is columns of original frame
+        cols = list(qdf.columns)
+        label = quarter_label(cols[0])
+        lines.append(
+            f"最新季度（{label}）营收 {format_wan(latest)}，"
+            f"环比 {fmt_pct(pct_change(latest, prev))}，同比 {fmt_pct(pct_change(latest, yoy))}。"
+        )
+    if profit is not None and len(profit) >= 1:
+        cols = list(qdf.columns)
+        latest = profit.iloc[0]
+        prev = profit.iloc[1] if len(profit) > 1 else None
+        yoy = profit.iloc[4] if len(profit) > 4 else None
+        lines.append(
+            f"净利润 {format_wan(latest)}，环比 {fmt_pct(pct_change(latest, prev))}，"
+            f"同比 {fmt_pct(pct_change(latest, yoy))}。"
+        )
+    if rev is not None and gross is not None and len(rev) and len(gross):
+        g0 = float(gross.iloc[0]) / float(rev.iloc[0]) * 100 if rev.iloc[0] else None
+        g1 = None
+        if len(rev) > 1 and len(gross) > 1 and rev.iloc[1]:
+            g1 = float(gross.iloc[1]) / float(rev.iloc[1]) * 100
+        if g0 is not None:
+            extra = f"，上一季 {g1:.1f}%" if g1 is not None else ""
+            lines.append(f"毛利率 {g0:.1f}%{extra}。")
+    if rev is not None and op is not None and len(rev) and len(op) and rev.iloc[0]:
+        om = float(op.iloc[0]) / float(rev.iloc[0]) * 100
+        lines.append(f"营业利润率 {om:.1f}%。")
+
+    surprise = None
+    try:
+        ed = stock.earnings_dates
+        if ed is not None and not ed.empty:
+            reported = ed.dropna(subset=["Reported EPS"]) if "Reported EPS" in ed.columns else ed
+            if not reported.empty:
+                row = reported.iloc[0]
+                est = row.get("EPS Estimate")
+                act = row.get("Reported EPS")
+                sur = row.get("Surprise(%)")
+                if pd.notna(act):
+                    surprise = float(sur) if pd.notna(sur) else None
+                    when = reported.index[0]
+                    when_s = when.strftime("%Y-%m-%d") if hasattr(when, "strftime") else str(when)[:10]
+                    est_s = f"{float(est):.2f}" if pd.notna(est) else "—"
+                    lines.append(
+                        f"最近一次业绩（{when_s}）每股收益 {float(act):.2f}，市场预期 {est_s}，"
+                        f"超预期幅度 {fmt_pct(surprise) if surprise is not None else '—'}。"
+                    )
+    except Exception:
+        pass
+
+    if surprise is not None:
+        if surprise >= 2:
+            verdict = "高于市场预期"
+        elif surprise <= -2:
+            verdict = "低于市场预期"
+        else:
+            verdict = "基本符合市场预期"
+        lines.append(f"对照一致预期，这次业绩{verdict}。")
+    else:
+        rg = info.get("revenueGrowth")
+        eg = info.get("earningsGrowth")
+        if rg is not None or eg is not None:
+            bits = []
+            if rg is not None:
+                bits.append(f"营收增速 {rg*100:.1f}%")
+            if eg is not None:
+                bits.append(f"盈利增速 {eg*100:.1f}%")
+            lines.append("暂无完整的每股收益超预期数据。按公开增速看，" + "，".join(bits) + "。")
+            if (eg or 0) > 0.05 or (rg or 0) > 0.05:
+                lines.append("增长仍为正，大体不弱于市场对成长股的基本要求，但是否超预期还要看下一次业绩指引。")
+            elif (eg or 0) < -0.05 or (rg or 0) < -0.05:
+                lines.append("增速转负，更可能低于市场对持续增长的预期。")
+            else:
+                lines.append("增速接近持平，更接近符合预期而不是明显超预期。")
+    if not lines:
+        lines.append("这只标的暂时没有完整的季度财报，无法判断是否符合市场预期。")
+    lines.append("以上解读依据公开财报和一致预期自动生成，不是投资建议。")
+    return lines
+
 # ==================== 详情页优先显示 ====================
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
@@ -223,9 +378,15 @@ if st.session_state.selected_ticker:
         change_pct = (change / prev_close * 100) if prev_close else 0
         color = "up" if change >= 0 else "down"
         sign = "+" if change >= 0 else ""
+        website = info.get("website") or ""
         
-        st.markdown(f'<div class="price">${current_price:.2f}</div>', unsafe_allow_html=True)
-        st.markdown(f'<span class="{color}">{sign}{change:.2f} ({sign}{change_pct:.2f}%)</span> · {name}', unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;">'
+            f'{logo_html(ticker, website, 40)}'
+            f'<div><div class="price">${current_price:.2f}</div>'
+            f'<span class="{color}">{sign}{change:.2f} ({sign}{change_pct:.2f}%)</span> · {name}</div></div>',
+            unsafe_allow_html=True,
+        )
         st.caption("数据来自 Yahoo Finance，存在延迟。点击「刷新价格」可手动更新。")
         
         tab1, tab2, tab3, tab4 = st.tabs(["概览", "财务", "分析", "概率测算"])
@@ -295,30 +456,52 @@ if st.session_state.selected_ticker:
                 c4.metric("52周高/低", f"{info.get('fiftyTwoWeekHigh','N/A')} / {info.get('fiftyTwoWeekLow','N/A')}")
         
         with tab2:
-            st.markdown("### 财务摘要（单位：万元）")
+            st.markdown("### 近几个季度对比")
             try:
-                fin = stock.financials
-                if not fin.empty:
-                    fin_wan = fin.copy()
-                    for col in fin_wan.columns:
-                        fin_wan[col] = fin_wan[col].apply(
-                            lambda x: x / 10000 if pd.notna(x) and isinstance(x, (int, float)) else x
-                        )
-                    fin_wan.index = [to_cn(i) for i in fin_wan.index]
-                    fin_wan.columns = [
-                        c.strftime("%Y年") if hasattr(c, "strftime") else str(c)[:10]
-                        for c in fin_wan.columns
+                qdf = stock.quarterly_income_stmt
+                if qdf is None or qdf.empty:
+                    qdf = stock.quarterly_financials
+                if qdf is not None and not qdf.empty:
+                    qdf = qdf.iloc[:, :5]
+                    keys = [
+                        "Total Revenue", "Cost Of Revenue", "Gross Profit",
+                        "Operating Income", "EBITDA", "Net Income",
+                        "Diluted EPS", "Basic EPS",
                     ]
-                    show = fin_wan.iloc[:, :3]
-                    st.dataframe(
-                        show.style.format(lambda v: f"{v:,.0f}" if isinstance(v, (int, float)) and pd.notna(v) else "—"),
-                        use_container_width=True,
-                    )
-                    st.caption("科目已译为中文。金额单位：万元。未收录的科目会保留英文原名。")
+                    rows = []
+                    labels = []
+                    for key in keys:
+                        ser = series_at(qdf, [key])
+                        if ser is None:
+                            continue
+                        labels.append(to_cn(key))
+                        vals = []
+                        for v in list(ser.values)[:5]:
+                            if v is None or pd.isna(v):
+                                vals.append(None)
+                            elif "EPS" in key:
+                                vals.append(round(float(v), 2))
+                            else:
+                                vals.append(round(float(v) / 10000, 0))
+                        rows.append(vals)
+                    if rows:
+                        cols = [quarter_label(c) for c in list(qdf.columns)[:5]]
+                        table = pd.DataFrame(rows, index=labels, columns=cols)
+                        st.dataframe(
+                            table.style.format(lambda v: f"{v:,.0f}" if isinstance(v, (int, float)) and pd.notna(v) and abs(v) >= 50 else (f"{v:.2f}" if isinstance(v, (int, float)) and pd.notna(v) else "—")),
+                            use_container_width=True,
+                        )
+                        st.caption("最近最多 5 个季度，从左到右由新到旧。金额单位为万元，每股收益为原币金额。")
+                    else:
+                        st.info("有财报，但关键科目对不上。")
                 else:
-                    st.info("暂无详细财务数据")
-                
-                st.markdown("**关键指标（万元）**")
+                    st.info("暂无季度财报。ETF 和部分标的通常没有公司利润表。")
+
+                st.markdown("### 最新财报解读")
+                for line in build_earnings_note(stock, info):
+                    st.markdown(f"- {line}")
+
+                st.markdown("**全年关键指标**")
                 items = [
                     ("营收(TTM)", info.get("totalRevenue")),
                     ("净利润(TTM)", info.get("netIncomeToCommon")),
@@ -332,66 +515,128 @@ if st.session_state.selected_ticker:
                             st.write(f"- {label}: {val*100:.1f}%")
                         else:
                             st.write(f"- {label}: {format_wan(val)}")
-                
-                st.markdown("### 最新财报相关链接")
+
+                st.markdown("### 财报链接")
                 yahoo_url = f"https://finance.yahoo.com/quote/{ticker}/financials"
-                st.markdown(f'<div class="link-box"><a href="{yahoo_url}" target="_blank">📊 Yahoo Finance 财务报表</a></div>', unsafe_allow_html=True)
-                
-                # 尝试获取公司官网或 IR
+                st.markdown(f'<div class="link-box"><a href="{yahoo_url}" target="_blank">Yahoo Finance 财务报表</a></div>', unsafe_allow_html=True)
                 website = info.get("website")
                 if website:
-                    st.markdown(f'<div class="link-box"><a href="{website}" target="_blank">🏢 公司官网</a></div>', unsafe_allow_html=True)
-                
-                # SEC 或通用链接提示
+                    st.markdown(f'<div class="link-box"><a href="{website}" target="_blank">公司官网</a></div>', unsafe_allow_html=True)
                 if ticker.endswith(".HK"):
                     st.markdown('<div class="link-box">港股财报可前往港交所披露易查询</div>', unsafe_allow_html=True)
                 else:
                     sec_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={info.get('symbol', ticker)}&type=10-&dateb=&owner=include&count=10"
-                    st.markdown(f'<div class="link-box"><a href="{sec_url}" target="_blank">📄 SEC EDGAR 财报查询（美股）</a></div>', unsafe_allow_html=True)
-                    
+                    st.markdown(f'<div class="link-box"><a href="{sec_url}" target="_blank">SEC EDGAR 财报查询（美股）</a></div>', unsafe_allow_html=True)
             except Exception as e:
                 st.info(f"财务数据暂不可用：{str(e)}")
-        
+
         with tab3:
-            st.markdown("### 简短分析")
-            analysis = []
+            st.markdown("### 综合分析")
+            blocks = []
             hist_analysis = fetch_hist(ticker, "1d")
             if not hist_analysis.empty:
-                df_a = hist_analysis.tail(100).copy()
+                df_a = hist_analysis.copy()
+                df_a["MA7"] = df_a["Close"].rolling(7).mean()
                 df_a["MA25"] = df_a["Close"].rolling(25).mean()
+                df_a["MA60"] = df_a["Close"].rolling(60).mean()
                 delta = df_a["Close"].diff()
                 gain = (delta.where(delta > 0, 0)).rolling(14).mean()
                 loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
                 rs = gain / loss.replace(0, np.nan)
                 df_a["RSI"] = 100 - (100 / (1 + rs))
-                
-                last_rsi = df_a["RSI"].iloc[-1]
-                if not pd.isna(last_rsi):
-                    if last_rsi > 70:
-                        analysis.append("RSI 处于超买区域，短期注意回调风险。")
-                    elif last_rsi < 30:
-                        analysis.append("RSI 处于超卖区域，短期存在反弹可能。")
+                last = df_a.iloc[-1]
+                close = float(last["Close"])
+                tech = []
+                ma7, ma25, ma60 = last.get("MA7"), last.get("MA25"), last.get("MA60")
+                if pd.notna(ma7) and pd.notna(ma25) and pd.notna(ma60):
+                    if close > ma7 > ma25 > ma60:
+                        tech.append("均线多头排列（价格 > MA7 > MA25 > MA60），中期趋势偏强。")
+                    elif close < ma7 < ma25 < ma60:
+                        tech.append("均线空头排列，中期趋势偏弱。")
                     else:
-                        analysis.append("RSI 中性。")
-                
-                ma25 = df_a["MA25"].iloc[-1]
-                if current_price > ma25:
-                    analysis.append("价格位于 25 日均线上方，短期趋势偏多。")
-                else:
-                    analysis.append("价格位于 25 日均线下方，短期趋势偏空。")
-            
+                        tech.append(
+                            f"价格 {close:.2f}，MA7 {ma7:.2f}，MA25 {ma25:.2f}，MA60 {ma60:.2f}，均线纠缠，趋势不单一。"
+                        )
+                rsi = last.get("RSI")
+                if pd.notna(rsi):
+                    if rsi > 70:
+                        tech.append(f"RSI(14) {rsi:.1f}，超买，短线追高风险更大。")
+                    elif rsi < 30:
+                        tech.append(f"RSI(14) {rsi:.1f}，超卖，存在技术性反弹可能，但不等于趋势反转。")
+                    else:
+                        tech.append(f"RSI(14) {rsi:.1f}，处于中性区间。")
+                vol = df_a["Volume"].tail(20)
+                if len(vol) >= 20 and vol.mean():
+                    ratio = float(df_a["Volume"].iloc[-1]) / float(vol.mean())
+                    tech.append(f"最新成交量约为 20 日均量的 {ratio:.2f} 倍。")
+                rets = []
+                for days, name_cn in [(21, "近1月"), (63, "近3月"), (126, "近6月"), (252, "近1年")]:
+                    if len(df_a) > days:
+                        r = df_a["Close"].iloc[-1] / df_a["Close"].iloc[-1 - days] - 1
+                        rets.append(f"{name_cn} {r*100:+.1f}%")
+                if rets:
+                    tech.append("区间涨跌：" + "，".join(rets) + "。")
+                daily = df_a["Close"].pct_change().dropna()
+                if len(daily) > 20:
+                    vola = float(daily.tail(20).std() * np.sqrt(252) * 100)
+                    tech.append(f"近20日年化波动率约 {vola:.1f}%。")
+                hi = info.get("fiftyTwoWeekHigh")
+                lo = info.get("fiftyTwoWeekLow")
+                if hi and lo and hi != lo:
+                    pos = (close - lo) / (hi - lo) * 100
+                    tech.append(f"处于52周区间的 {pos:.0f}% 位置（低点 {lo}，高点 {hi}）。")
+                blocks.append(("技术面", tech))
+
+            fund = []
             pe = info.get("trailingPE")
+            fpe = info.get("forwardPE")
+            pb = info.get("priceToBook")
+            ps = info.get("priceToSalesTrailing12Months")
             if pe:
-                if pe < 25:
-                    analysis.append(f"市盈率 {pe:.1f}，估值相对合理。")
-                else:
-                    analysis.append(f"市盈率 {pe:.1f}，估值偏高。")
-            
-            if not analysis:
-                analysis.append("数据有限，建议结合更多信息判断。")
-            
-            st.markdown('<div class="analysis-box">' + "<br>".join(analysis) + "</div>", unsafe_allow_html=True)
-            st.caption("以上分析基于公开数据规则生成，仅供参考，不构成投资建议。")
+                fund.append(f"市盈率 {pe:.1f}" + (f"，远期市盈率 {fpe:.1f}" if fpe else "") + "。")
+            if pb:
+                fund.append(f"市净率 {pb:.2f}。")
+            if ps:
+                fund.append(f"市销率 {ps:.2f}。")
+            rg = info.get("revenueGrowth")
+            eg = info.get("earningsGrowth")
+            if rg is not None:
+                fund.append(f"营收同比增长 {rg*100:.1f}%。")
+            if eg is not None:
+                fund.append(f"盈利同比增长 {eg*100:.1f}%。")
+            div = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
+            if div:
+                fund.append(f"股息率 {div*100:.2f}%。")
+            target = info.get("targetMeanPrice")
+            rec = info.get("recommendationKey")
+            if target:
+                gap = (target / current_price - 1) * 100 if current_price else None
+                fund.append(f"分析师平均目标价 {target:.2f}" + (f"，较现价 {gap:+.1f}%" if gap is not None else "") + "。")
+            if rec:
+                rec_cn = {
+                    "strong_buy": "强力买入", "buy": "买入", "hold": "持有",
+                    "underperform": "跑输", "sell": "卖出",
+                }.get(rec, rec)
+                fund.append(f"卖方综合评级：{rec_cn}。")
+            if fund:
+                blocks.append(("基本面与预期", fund))
+
+            risks = []
+            if pe and pe > 40:
+                risks.append("估值偏高，盈利一旦放缓，回撤会更大。")
+            if info.get("beta") and info.get("beta") > 1.3:
+                risks.append(f"Beta {info.get('beta'):.2f}，波动大于大盘。")
+            if "杠杆" in (name or "") or ticker.endswith(("L", "U")) and info.get("quoteType") == "ETF":
+                risks.append("若是杠杆或反向 ETF，不适合当成长期持仓。")
+            risks.append("行情和财报都有延迟，模型不能替代阅读原文和电话会。")
+            blocks.append(("风险", risks))
+
+            if not blocks:
+                st.info("数据有限，暂时无法展开分析。")
+            for title, items in blocks:
+                st.markdown(f"**{title}**")
+                st.markdown('<div class="analysis-box">' + "<br>".join(items) + "</div>", unsafe_allow_html=True)
+            st.caption("分析由公开行情和财务数据自动整理，仅供参考，不构成投资建议。")
         
         with tab4:
             st.markdown("### 概率测算")
@@ -447,8 +692,13 @@ with list_col:
             name = summary["name"] or ticker
             c_name, c_px, c_btn = st.columns([2.4, 1.5, 0.9], vertical_alignment="center")
             with c_name:
-                st.markdown(f'<div class="ticker">{summary["ticker"]}</div>', unsafe_allow_html=True)
-                st.markdown(f'<span class="muted">{name}</span>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;">'
+                    f'{logo_html(summary["ticker"], summary.get("website", ""), 32)}'
+                    f'<div><div class="ticker">{summary["ticker"]}</div>'
+                    f'<span class="muted">{name}</span></div></div>',
+                    unsafe_allow_html=True,
+                )
             with c_px:
                 st.markdown(
                     f'<div style="text-align:right;">'
