@@ -140,7 +140,11 @@ DISPLAY = {
 }
 
 def show_symbol(ticker):
-    return DISPLAY.get(ticker, ticker)
+    if ticker in DISPLAY:
+        return DISPLAY[ticker]
+    if str(ticker).endswith("-USD"):
+        return str(ticker)[:-4]
+    return ticker
 
 FRIENDLY = {
     "BTC-USD": "比特币",
@@ -326,6 +330,25 @@ DISCOVER = [
     "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "TSM",
     "ASML", "AMD", "NFLX", "QQQ", "BTC-USD", "ETH-USD", "VTI", "ASTS",
 ]
+US_MARKET = (
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "BRK-B", "LLY", "JPM",
+    "TSLA", "UNH", "XOM", "V", "MA", "JNJ", "WMT", "PG", "ORCL", "HD",
+    "COST", "ABBV", "BAC", "NFLX", "CRM", "KO", "CVX", "MRK", "AMD", "PEP",
+    "LIN", "TMO", "ACN", "MCD", "CSCO", "ABT", "WFC", "IBM", "GE", "PM",
+    "CAT", "AXP", "DIS", "NOW", "GS", "QCOM", "TXN", "INTU", "AMGN", "ISRG",
+    "PFE", "BKNG", "T", "SPGI", "BLK", "NEE", "RTX", "AMAT", "LOW", "SYK",
+    "SCHW", "C", "HON", "BA", "ELV", "ADP", "DE", "GILD", "ADI", "MMC",
+    "LMT", "PLD", "SBUX", "VRTX", "MDLZ", "TJX", "CB", "PANW", "REGN", "BSX",
+    "CME", "SO", "DUK", "MO", "ZTS", "CL", "EQIX", "ICE", "WM", "SHW",
+    "ITW", "PGR", "APD", "MCO", "CMG", "SNPS", "CDNS", "KLAC", "LRCX", "APH",
+    "MU", "INTC", "ARM", "PLTR", "ASML", "TSM", "ASTS", "UBER", "APP", "CRWD",
+)
+CRYPTO_MARKET = (
+    "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "DOGE-USD",
+    "ADA-USD", "AVAX-USD", "LINK-USD", "LTC-USD", "BCH-USD", "DOT-USD",
+    "UNI-USD", "HYPE32196-USD",
+)
+MARKET = US_MARKET + CRYPTO_MARKET
 
 def rating_label(score):
     if score >= 4:
@@ -361,21 +384,56 @@ def rating_from_levels(levels, extra=0.0, extra_notes=None):
         notes.extend(extra_notes)
     return {"label": rating_label(score), "score": round(score, 1), "notes": notes}
 
+def rate_frame(ticker, hist):
+    if hist is None or getattr(hist, "empty", True) or "Close" not in getattr(hist, "columns", []):
+        return None
+    frame = hist.copy()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(0)
+    if "Volume" not in frame.columns:
+        frame["Volume"] = 0
+    frame = frame.dropna(subset=["Close"])
+    if len(frame) < 80:
+        return None
+    weekly = frame.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
+    monthly = frame.resample("ME").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
+    levels = [kline_level(frame.tail(320), "日"), kline_level(weekly, "周"), kline_level(monthly, "月")]
+    rated = rating_from_levels(levels)
+    rated["ticker"] = ticker
+    rated["price"] = float(frame["Close"].iloc[-1])
+    return rated
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def rate_ticker(ticker: str):
     try:
-        hist = yf.Ticker(ticker).history(period="5y", interval="1d")
+        hist = yf.Ticker(ticker).history(period="3y", interval="1d")
     except Exception:
         return None
-    if hist is None or hist.empty or len(hist) < 80:
-        return None
-    weekly = hist.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-    monthly = hist.resample("ME").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
-    levels = [kline_level(hist.tail(320), "日"), kline_level(weekly, "周"), kline_level(monthly, "月")]
-    rated = rating_from_levels(levels)
-    rated["ticker"] = ticker
-    rated["price"] = float(hist["Close"].iloc[-1])
-    return rated
+    return rate_frame(ticker, hist)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def rank_universe(tickers: tuple):
+    try:
+        data = yf.download(
+            list(tickers), period="3y", interval="1d", group_by="ticker",
+            auto_adjust=True, progress=False, threads=True,
+        )
+    except Exception:
+        return []
+    if data is None or data.empty:
+        return []
+    multi = isinstance(data.columns, pd.MultiIndex)
+    ranked = []
+    for ticker in tickers:
+        try:
+            hist = data[ticker].dropna(how="all") if multi else data
+        except Exception:
+            continue
+        rated = rate_frame(ticker, hist)
+        if rated:
+            ranked.append(rated)
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    return ranked
 
 def treasury_percent(symbol):
     cache = st.session_state.setdefault("yield_cache", {})
@@ -1556,24 +1614,24 @@ if st.session_state.selected_ticker:
     st.markdown("---")
 
 else:
-    scan_list = list(dict.fromkeys(DISCOVER + list(st.session_state.watchlist)))
-    ratings = {}
-    with st.spinner("正在按日线、周线、月线扫描买入评级"):
-        for symbol in scan_list:
+    with st.spinner("正在扫描美股龙头和主流加密货币，按买入评级取前十"):
+        ranked = rank_universe(MARKET)
+    ratings = {item["ticker"]: item for item in ranked}
+    for symbol in st.session_state.watchlist:
+        if symbol not in ratings:
             ratings[symbol] = rate_ticker(symbol)
-    ranked = sorted((item for item in ratings.values() if item), key=lambda item: item["score"], reverse=True)
-    picks = [item for item in ranked if item["label"] in ("强烈买入", "买入")]
-    st.markdown('<div class="board-head"><div class="section-title">高买入评级</div><div class="muted">日线、周线、月线</div></div>', unsafe_allow_html=True)
+    picks = ranked[:10]
+    st.markdown('<div class="board-head"><div class="section-title">买入评级前十</div><div class="muted">美股龙头 · 主流加密货币</div></div>', unsafe_allow_html=True)
+    st.caption("按日线、周线、月线给标普龙头和主流加密货币打分，取得分最高的十只。不是交易所里的每一只代码，全市场逐只拉取会超时。")
     if not picks:
-        st.caption("这批股票里现在没有达到买入。下面是相对更强的几只，评级仍按实际分数显示。")
-        picks = ranked[:3]
-    for item in picks[:6]:
+        st.info("这次没有拉到足够行情，前十暂时空着。过一会儿再刷新。")
+    for index, item in enumerate(picks, start=1):
         symbol = item["ticker"]
         with st.container(border=True):
             left, mid, right = st.columns([3.2, 1.3, 0.8], vertical_alignment="center")
             with left:
                 st.markdown(
-                    f'<div class="row-symbol">{show_symbol(symbol)} <span class="chg-pill {rate_class(item["label"])}">{item["label"]}</span></div>'
+                    f'<div class="row-symbol">{index}. {show_symbol(symbol)} <span class="chg-pill {rate_class(item["label"])}">{item["label"]}</span></div>'
                     f'<span class="row-name">{html.escape(item["notes"][0] if item["notes"] else "")}</span>',
                     unsafe_allow_html=True,
                 )
