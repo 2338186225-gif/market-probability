@@ -1024,6 +1024,11 @@ def score_trends(daily, weekly, monthly):
         if frame is None or frame.empty or "Close" not in frame:
             continue
         state = ma_state(frame["Close"], short, mid, long)
+        if not state and len(frame) >= 20:
+            long_n = min(long, max(8, len(frame) - 5))
+            mid_n = min(mid, max(5, long_n // 2))
+            short_n = min(short, max(3, mid_n // 2))
+            state = ma_state(frame["Close"], short_n, mid_n, long_n)
         if not state:
             continue
         part = state["base"] * weight
@@ -1098,7 +1103,7 @@ def rate_frame(ticker, hist):
     if "Volume" not in frame.columns:
         frame["Volume"] = 0
     frame = frame.dropna(subset=["Close"])
-    if len(frame) < 80:
+    if len(frame) < 20:
         return None
     weekly = frame.resample("W").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
     monthly = frame.resample("ME").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Close"])
@@ -2012,6 +2017,29 @@ def hydrate_ratings(watch):
         if ticker not in ratings and isinstance(disk.get(ticker), dict):
             ratings[ticker] = disk[ticker]
     return ratings
+
+def ensure_ratings(watch):
+    """画列表之前就把分数备好。磁盘里有的直接用，没有的当场算。"""
+    ratings = hydrate_ratings(watch)
+    pending = [
+        ticker for ticker in watch
+        if not (isinstance(ratings.get(ticker), dict) and ratings[ticker].get("score") is not None)
+    ]
+    if pending:
+        def one(ticker):
+            try:
+                return rate_fast(ticker)
+            except Exception:
+                return None
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for rated in pool.map(one, pending):
+                if isinstance(rated, dict) and rated.get("ticker") and rated.get("score") is not None:
+                    ratings[rated["ticker"]] = rated
+        save_rating_disk(ratings)
+    ranked = rank_ratings(ratings)
+    st.session_state.home_ratings = ratings
+    st.session_state.home_ranked = ranked
+    return ratings, ranked
 
 def fill_home_ratings(limit=6):
     """先用已经存下的分数。缺的每次补几只，失败的下次再试，不把空分当成算完。"""
@@ -4372,12 +4400,9 @@ else:
     basis = st.radio("按哪一级看", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
     level_unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
     watch_key = tuple(st.session_state.watchlist)
-    ratings = hydrate_ratings(list(watch_key))
-    st.session_state.home_ratings = ratings
-    if not st.session_state.get("home_ranked"):
-        st.session_state.home_ranked = rank_ratings(ratings)
+    ratings, ranked_all = ensure_ratings(list(watch_key))
     ranked = [
-        row for row in (st.session_state.get("home_ranked") or rank_ratings(ratings))
+        row for row in ranked_all
         if isinstance(row, dict) and row.get("ticker") in watch_key
     ]
 
