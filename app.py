@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 
