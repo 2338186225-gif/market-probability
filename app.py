@@ -368,21 +368,31 @@ def rate_class(label):
         return "rate-avoid"
     return "rate-hold"
 
+def level_call(item):
+    trend = item["trend"]
+    label = {"多头": "买入", "偏多": "持有", "偏空": "观望", "空头": "回避"}.get(trend, "观望")
+    why = next((line for line in item["notes"] if "均线" in line or "收盘在" in line), "")
+    why = f"{item['unit']}线：{why}" if why else f"{item['unit']}线历史不够，这一级先不评级。"
+    score = LEVEL_POINTS.get(trend, 0) * LEVEL_WEIGHT.get(item["unit"], 1)
+    if item["unit"] == "日" and any("超买" in line for line in item["notes"]) and label == "买入":
+        label = "持有"
+        score -= 1
+        why += " RSI 超买，日线不按买入计。"
+    return {"unit": item["unit"], "trend": trend, "label": label, "why": why, "score": round(score, 1)}
+
 def rating_from_levels(levels, extra=0.0, extra_notes=None):
     score = float(extra)
-    notes = []
+    by_unit = {}
     for item in levels or []:
         if not item:
             continue
-        delta = LEVEL_POINTS.get(item["trend"], 0) * LEVEL_WEIGHT.get(item["unit"], 1)
-        score += delta
-        notes.append(f"{item['unit']}线目前是{item['trend']}，这一项 {delta:+.1f} 分。")
-        if item["unit"] == "日" and any("超买" in line for line in item["notes"]):
-            score -= 1
-            notes.append("日线已经超买，买入评级再减 1 分，避免追在短线高点。")
+        brief = level_call(item)
+        by_unit[item["unit"]] = brief
+        score += brief["score"]
+    notes = [by_unit[unit]["why"] for unit in ("日", "周", "月") if unit in by_unit]
     if extra_notes:
         notes.extend(extra_notes)
-    return {"label": rating_label(score), "score": round(score, 1), "notes": notes}
+    return {"label": rating_label(score), "score": round(score, 1), "notes": notes, "by_unit": by_unit}
 
 def rate_frame(ticker, hist):
     if hist is None or getattr(hist, "empty", True) or "Close" not in getattr(hist, "columns", []):
@@ -432,7 +442,7 @@ def rank_universe(tickers: tuple):
         rated = rate_frame(ticker, hist)
         if rated:
             ranked.append(rated)
-    ranked.sort(key=lambda item: item["score"], reverse=True)
+    ranked.sort(key=lambda item: (item["score"], item.get("ticker", "")), reverse=True)
     return ranked
 
 def treasury_percent(symbol):
@@ -1395,10 +1405,17 @@ if st.session_state.selected_ticker:
             buy_rated = rating_from_levels(levels, extra, extra_notes)
             buy_class = {"强烈买入": "verdict-up", "买入": "verdict-up", "回避": "verdict-down"}.get(buy_rated["label"], "verdict-mid")
             buy_text = "<br>".join(html.escape(line) for line in buy_rated["notes"])
+            pills = []
+            for unit in ("日", "周", "月"):
+                cell = buy_rated.get("by_unit", {}).get(unit)
+                if cell:
+                    pills.append(f'<span class="chg-pill {rate_class(cell["label"])}">{unit}线 {cell["label"]}</span>')
             st.markdown("### 买入评级")
             st.markdown(
-                f'<div class="analysis-box"><span class="verdict {buy_class}">{buy_rated["label"]} · {buy_rated["score"]}</span><br>{buy_text}'
-                f'<br>达到 2 分是买入，4 分是强烈买入。这是公开行情的打分，不是下单建议。</div>',
+                f'<div class="analysis-box"><span class="verdict {buy_class}">综合 {buy_rated["label"]} · {buy_rated["score"]}</span> '
+                + " ".join(pills)
+                + f'<br>{buy_text}'
+                f'<br>多头是指这一级收盘价在短、中、长均线之上，而且短均线高于中均线、中均线高于长均线。日线用 7/25/60，周线用 10/20/40，月线用 6/12/24。三个级别都是买入时，综合分才会到强烈买入。不是下单建议。</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1621,22 +1638,36 @@ else:
         if symbol not in ratings:
             ratings[symbol] = rate_ticker(symbol)
     picks = ranked[:10]
-    st.markdown('<div class="board-head"><div class="section-title">买入评级前十</div><div class="muted">美股龙头 · 主流加密货币</div></div>', unsafe_allow_html=True)
-    st.caption("按日线、周线、月线给标普龙头和主流加密货币打分，取得分最高的十只。不是交易所里的每一只代码，全市场逐只拉取会超时。")
+    basis = st.radio("按哪一级看前十", ["综合", "日线", "周线", "月线"], horizontal=True, key="rank_basis")
+    unit = {"日线": "日", "周线": "周", "月线": "月"}.get(basis)
+    if unit:
+        ranked_view = sorted(ranked, key=lambda item: item.get("by_unit", {}).get(unit, {}).get("score", -99), reverse=True)
+    else:
+        ranked_view = ranked
+    picks = ranked_view[:10]
+    st.markdown(f'<div class="board-head"><div class="section-title">{basis}买入评级前十</div><div class="muted">美股龙头 · 主流加密货币</div></div>', unsafe_allow_html=True)
+    st.caption("多头不是套话：这一级收盘价在短、中、长均线之上，并且短均线高于中均线、中均线高于长均线。日线是 7/25/60 日，周线是 10/20/40 周，月线是 6/12/24 月。之前只显示了日线那一句，所以看起来全是日线多头。")
     if not picks:
         st.info("这次没有拉到足够行情，前十暂时空着。过一会儿再刷新。")
     for index, item in enumerate(picks, start=1):
         symbol = item["ticker"]
+        cells = item.get("by_unit") or {}
+        pills = " ".join(
+            f'<span class="chg-pill {rate_class(cells[name]["label"])}">{name}线{cells[name]["label"]}</span>'
+            for name in ("日", "周", "月") if name in cells
+        )
+        reasons = "<br>".join(html.escape(cells[name]["why"]) for name in ("日", "周", "月") if name in cells)
         with st.container(border=True):
-            left, mid, right = st.columns([3.2, 1.3, 0.8], vertical_alignment="center")
+            left, mid, right = st.columns([3.4, 1.2, 0.7], vertical_alignment="center")
             with left:
                 st.markdown(
-                    f'<div class="row-symbol">{index}. {show_symbol(symbol)} <span class="chg-pill {rate_class(item["label"])}">{item["label"]}</span></div>'
-                    f'<span class="row-name">{html.escape(item["notes"][0] if item["notes"] else "")}</span>',
+                    f'<div class="row-symbol">{index}. {show_symbol(symbol)} <span class="chg-pill {rate_class(item["label"])}">综合{item["label"]}</span></div>'
+                    f'<div style="margin-top:6px;">{pills}</div>'
+                    f'<div class="row-name" style="max-width:none;white-space:normal;overflow:visible;">{reasons}</div>',
                     unsafe_allow_html=True,
                 )
             with mid:
-                st.markdown(f'<div class="row-px"><div class="px">{fmt_px(item["price"])}</div><div class="muted">{item["score"]} 分</div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="row-px"><div class="px">{fmt_px(item["price"])}</div><div class="muted">综合 {item["score"]} 分</div></div>', unsafe_allow_html=True)
             with right:
                 if st.button("查看", key=f"pick_{symbol}", use_container_width=True):
                     if symbol not in st.session_state.watchlist:
