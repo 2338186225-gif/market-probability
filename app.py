@@ -431,31 +431,99 @@ def resolve_ticker(raw):
     text = raw.strip().upper()
     return ALIASES.get(text, text)
 
+def binance_symbol(ticker):
+    ticker = str(ticker or "")
+    if ticker == "HYPE32196-USD":
+        return "HYPEUSDT"
+    if ticker.endswith("-USD"):
+        base = ticker[:-4].replace("-", "")
+        return f"{base}USDT" if base else None
+    return None
+
+def binance_get(path, params):
+    query = urlencode(params)
+    url = f"https://data-api.binance.vision{path}?{query}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        return json.loads(resp.read().decode())
+
+def binance_klines(symbol, interval, limit=500):
+    rows = binance_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": int(limit)})
+    frame = pd.DataFrame(rows, columns=["open_time", "Open", "High", "Low", "Close", "Volume", "close_time", "quote", "trades", "taker", "taker_quote", "ignore"])
+    if frame.empty:
+        return frame
+    frame.index = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        frame[col] = frame[col].astype(float)
+    return frame[["Open", "High", "Low", "Close", "Volume"]]
+
+def binance_quote(symbol):
+    data = binance_get("/api/v3/ticker/24hr", {"symbol": symbol})
+    return {
+        "price": float(data["lastPrice"]),
+        "change": float(data["priceChange"]),
+        "pct": float(data["priceChangePercent"]),
+        "open": float(data["openPrice"]),
+        "high": float(data["highPrice"]),
+        "low": float(data["lowPrice"]),
+        "prev": float(data["prevClosePrice"]),
+        "volume": float(data["volume"]),
+    }
+
 def get_stock_summary(ticker):
-    if ticker in st.session_state.stock_cache:
-        return st.session_state.stock_cache[ticker]
+    cached = st.session_state.stock_cache.get(ticker) if ticker in st.session_state.stock_cache else None
+    symbol = binance_symbol(ticker)
+    if cached and (not symbol or cached.get("source") == "binance"):
+        return cached
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="5d")
-        if hist.empty:
-            return None
-        current = float(hist["Close"].iloc[-1])
-        prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current
-        change = current - prev
-        change_pct = (change / prev * 100) if prev else 0
-        info = stock.info
-        name = pretty_name(ticker, info)
-        summary = {
-            "ticker": ticker, "name": name, "price": current,
-            "change": change, "change_pct": change_pct, "info": info,
-            "website": info.get("website") or "",
-        }
+        if symbol:
+            quote = binance_quote(symbol)
+            price = quote["price"]
+            summary = {
+                "ticker": ticker, "name": pretty_name(ticker), "price": price,
+                "change": quote["change"], "change_pct": quote["pct"],
+                "info": {
+                    "quoteType": "CRYPTOCURRENCY",
+                    "regularMarketVolume": quote["volume"],
+                    "volume": quote["volume"],
+                    "regularMarketOpen": quote["open"],
+                    "regularMarketDayHigh": quote["high"],
+                    "regularMarketDayLow": quote["low"],
+                    "previousClose": quote["prev"],
+                },
+                "website": "",
+                "source": "binance",
+            }
+        else:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="5d")
+            if hist.empty:
+                return None
+            current = float(hist["Close"].iloc[-1])
+            prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current
+            change = current - prev
+            change_pct = (change / prev * 100) if prev else 0
+            info = stock.info
+            summary = {
+                "ticker": ticker, "name": pretty_name(ticker, info), "price": current,
+                "change": change, "change_pct": change_pct, "info": info,
+                "website": info.get("website") or "",
+                "source": "yahoo",
+            }
         st.session_state.stock_cache[ticker] = summary
         return summary
-    except:
-        return None
+    except Exception:
+        return cached
 
 def fetch_hist(ticker, timeframe):
+    symbol = binance_symbol(ticker)
+    if symbol:
+        interval = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "1wk": "1w", "1mo": "1M"}.get(timeframe, "1d")
+        limit = 500 if timeframe in ("15m", "1h") else 1000
+        try:
+            return binance_klines(symbol, interval, limit)
+        except Exception:
+            return pd.DataFrame()
     stock = yf.Ticker(ticker)
     mapping = {
         "15m": ("7d", "15m"),
@@ -744,30 +812,44 @@ def rate_frame(ticker, hist):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def rate_ticker(ticker: str):
-    """含 12 个月动量和 200 日均线。"""
+    """含 12 个月动量和 200 日均线。加密货币用币安现货。"""
     try:
-        hist = yf.Ticker(ticker).history(period="3y", interval="1d")
+        symbol = binance_symbol(ticker)
+        if symbol:
+            hist = binance_klines(symbol, "1d", 1000)
+        else:
+            hist = yf.Ticker(ticker).history(period="3y", interval="1d")
     except Exception:
         return None
     return rate_frame(ticker, hist)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def rank_universe(tickers: tuple):
-    """全市场扫描，结果里带动量。"""
-    try:
-        data = yf.download(
-            list(tickers), period="3y", interval="1d", group_by="ticker",
-            auto_adjust=True, progress=False, threads=True,
-        )
-    except Exception:
-        return []
-    if data is None or data.empty:
-        return []
-    multi = isinstance(data.columns, pd.MultiIndex)
+    """全市场扫描，结果里带动量。加密货币用币安日线。"""
     ranked = []
-    for ticker in tickers:
+    stocks = tuple(ticker for ticker in tickers if not binance_symbol(ticker))
+    cryptos = tuple(ticker for ticker in tickers if binance_symbol(ticker))
+    if stocks:
         try:
-            hist = data[ticker].dropna(how="all") if multi else data
+            data = yf.download(
+                list(stocks), period="3y", interval="1d", group_by="ticker",
+                auto_adjust=True, progress=False, threads=True,
+            )
+        except Exception:
+            data = None
+        if data is not None and not data.empty:
+            multi = isinstance(data.columns, pd.MultiIndex)
+            for ticker in stocks:
+                try:
+                    hist = data[ticker].dropna(how="all") if multi else data
+                except Exception:
+                    continue
+                rated = rate_frame(ticker, hist)
+                if rated:
+                    ranked.append(rated)
+    for ticker in cryptos:
+        try:
+            hist = binance_klines(binance_symbol(ticker), "1d", 1000)
         except Exception:
             continue
         rated = rate_frame(ticker, hist)
@@ -1820,49 +1902,48 @@ def crypto_market_rows():
     cache = globals().setdefault("_CRYPTO_15M", {"at": 0, "rows": []})
     if cache["rows"] and time.time() - cache["at"] < 180:
         return cache["rows"]
-    try:
-        data = yf.download(
-            list(CRYPTO_MARKET), period="5d", interval="15m", group_by="ticker",
-            auto_adjust=True, progress=False, threads=True,
-        )
-    except Exception:
-        return cache["rows"]
-    if data is None or data.empty:
-        return cache["rows"]
-    multi = isinstance(getattr(data, "columns", None), pd.MultiIndex)
-    rows = []
-    for ticker in CRYPTO_MARKET:
+
+    def one(ticker):
         try:
-            hist = data[ticker].dropna(how="all") if multi else data
-            close = hist["Close"].dropna()
+            symbol = binance_symbol(ticker)
+            if not symbol:
+                return None
+            hist = binance_klines(symbol, "15m", 80)
+            close = hist["Close"].dropna() if hist is not None and not hist.empty else None
+            if close is None or len(close) < 60:
+                return None
+            price = float(close.iloc[-1])
+            ma20 = float(close.tail(20).mean())
+            ma60 = float(close.tail(60).mean())
+            ret4 = float(close.iloc[-1] / close.iloc[-5] - 1)
+            rets = np.log(close / close.shift(1)).dropna().tail(32)
+            bar_vol = float(rets.std()) if len(rets) else 0.0
+            side = None
+            if price > ma20 > ma60 and ret4 > 0.0015:
+                side = "多"
+            elif price < ma20 < ma60 and ret4 < -0.0015:
+                side = "空"
+            if bar_vol <= 0:
+                lev = 2
+            else:
+                strength = min(4.0, abs(ret4) / bar_vol)
+                lev = int(min(10, max(2, round(strength * 2))))
+                if bar_vol > 0.02:
+                    lev = min(lev, 4)
+                if bar_vol > 0.035:
+                    lev = min(lev, 2)
+            return {
+                "ticker": ticker, "price": price, "side": side, "leverage": lev,
+                "ret": ret4, "vol": bar_vol, "horizons": {},
+            }
         except Exception:
-            continue
-        if close is None or len(close) < 60:
-            continue
-        price = float(close.iloc[-1])
-        ma20 = float(close.tail(20).mean())
-        ma60 = float(close.tail(60).mean())
-        ret4 = float(close.iloc[-1] / close.iloc[-5] - 1)
-        rets = np.log(close / close.shift(1)).dropna().tail(32)
-        bar_vol = float(rets.std()) if len(rets) else 0.0
-        side = None
-        if price > ma20 > ma60 and ret4 > 0.0015:
-            side = "多"
-        elif price < ma20 < ma60 and ret4 < -0.0015:
-            side = "空"
-        if bar_vol <= 0:
-            lev = 2
-        else:
-            strength = min(4.0, abs(ret4) / bar_vol)
-            lev = int(min(10, max(2, round(strength * 2))))
-            if bar_vol > 0.02:
-                lev = min(lev, 4)
-            if bar_vol > 0.035:
-                lev = min(lev, 2)
-        rows.append({
-            "ticker": ticker, "price": price, "side": side, "leverage": lev,
-            "ret": ret4, "vol": bar_vol, "horizons": {},
-        })
+            return None
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        for row in executor.map(one, CRYPTO_MARKET):
+            if row:
+                rows.append(row)
     if rows:
         cache["at"] = time.time()
         cache["rows"] = rows
@@ -2138,6 +2219,12 @@ def shock_headline(title):
     return any(word in text for word in SHOCKS)
 
 def last_price(ticker):
+    symbol = binance_symbol(ticker)
+    if symbol:
+        try:
+            return binance_quote(symbol)["price"]
+        except Exception:
+            return None
     try:
         hist = yf.Ticker(ticker).history(period="5d")
         if hist is not None and not hist.empty:
@@ -2561,23 +2648,38 @@ except Exception:
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        name = pretty_name(ticker, info)
-
-        quick = stock.history(period="2d")
-        current_price = float(quick["Close"].iloc[-1]) if not quick.empty else 0
-        prev_close = info.get("previousClose", current_price)
-        change = current_price - prev_close
-        change_pct = (change / prev_close * 100) if prev_close else 0
+        symbol = binance_symbol(ticker)
+        if symbol:
+            quote = binance_quote(symbol)
+            info = {"quoteType": "CRYPTOCURRENCY"}
+            name = pretty_name(ticker)
+            current_price = quote["price"]
+            prev_close = quote["prev"]
+            change = quote["change"]
+            change_pct = quote["pct"]
+            website = ""
+            open_px = quote["open"]
+            high_px = quote["high"]
+            low_px = quote["low"]
+            volume = quote["volume"]
+            cap = None
+        else:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            name = pretty_name(ticker, info)
+            quick = stock.history(period="2d")
+            current_price = float(quick["Close"].iloc[-1]) if not quick.empty else 0
+            prev_close = info.get("previousClose", current_price)
+            change = current_price - prev_close
+            change_pct = (change / prev_close * 100) if prev_close else 0
+            website = info.get("website") or ""
+            open_px = info.get("open") or info.get("regularMarketOpen")
+            high_px = info.get("dayHigh") or info.get("regularMarketDayHigh")
+            low_px = info.get("dayLow") or info.get("regularMarketDayLow")
+            volume = info.get("volume") or info.get("regularMarketVolume")
+            cap = info.get("marketCap")
         color = "up" if change >= 0 else "down"
         sign = "+" if change >= 0 else ""
-        website = info.get("website") or ""
-        open_px = info.get("open") or info.get("regularMarketOpen")
-        high_px = info.get("dayHigh") or info.get("regularMarketDayHigh")
-        low_px = info.get("dayLow") or info.get("regularMarketDayLow")
-        volume = info.get("volume") or info.get("regularMarketVolume")
-        cap = info.get("marketCap")
         structure = rate_ticker(ticker) or {"label": "观望", "score": 0, "notes": ["历史不够，先不给买入评级。"]}
 
         c_back, c_title, c_fresh = st.columns([0.5, 6, 0.7])
@@ -3306,4 +3408,4 @@ else:
                 unsafe_allow_html=True,
             )
 
-st.caption("仅供学习研究，不构成投资建议。行情来自 Yahoo Finance，有延迟。")
+st.caption("仅供学习研究，不构成投资建议。加密货币行情来自币安现货，股票来自 Yahoo Finance，有延迟。")
