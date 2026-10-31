@@ -1645,7 +1645,7 @@ else:
         ranked_view = ranked
     picks = ranked_view[:10]
 
-    watch_col, rank_col = st.columns([1, 1.45], gap="medium")
+    watch_col, rank_col = st.columns([1.15, 1], gap="medium")
 
     with watch_col:
         st.markdown('<div class="board-head"><div class="section-title">自选</div><div class="muted">美元 · 延迟行情</div></div>', unsafe_allow_html=True)
@@ -1690,27 +1690,24 @@ else:
                         st.rerun()
 
     with rank_col:
-        st.markdown(f'<div class="board-head"><div class="section-title">{basis}买入评级前十</div><div class="muted">美股龙头 · 主流加密货币</div></div>', unsafe_allow_html=True)
-        st.caption("多头：收盘在短、中、长均线之上，且短均线高于中均线、中均线高于长均线。日线 7/25/60，周线 10/20/40，月线 6/12/24。")
+        st.markdown(f'<div class="board-head"><div class="section-title">{basis}买入评级前十</div><div class="muted">日 7/25/60 · 周 10/20/40 · 月 6/12/24</div></div>', unsafe_allow_html=True)
         if not picks:
             st.info("这次没有拉到足够行情，前十暂时空着。过一会儿再刷新。")
         for index, item in enumerate(picks, start=1):
             symbol = item["ticker"]
             cells = item.get("by_unit") or {}
             pills = " ".join(
-                f'<span class="chg-pill {rate_class(cells[name]["label"])}">{name}线{cells[name]["label"]}</span>'
+                f'<span class="chg-pill {rate_class(cells[name]["label"])}">{name}{cells[name]["label"]}</span>'
                 for name in ("日", "周", "月") if name in cells
             )
-            reasons = "<br>".join(html.escape(cells[name]["why"]) for name in ("日", "周", "月") if name in cells)
             with st.container(border=True):
-                left, right = st.columns([4.2, 0.8], vertical_alignment="center")
+                left, right = st.columns([5, 1], vertical_alignment="center")
                 with left:
                     st.markdown(
-                        f'<div style="display:flex;justify-content:space-between;gap:8px;">'
-                        f'<div class="row-symbol">{index}. {show_symbol(symbol)} <span class="chg-pill {rate_class(item["label"])}">综合{item["label"]}</span></div>'
-                        f'<div class="row-px"><div class="px">{fmt_px(item["price"])}</div><div class="muted">综合 {item["score"]} 分</div></div></div>'
-                        f'<div style="margin-top:6px;">{pills}</div>'
-                        f'<div class="row-name" style="max-width:none;white-space:normal;overflow:visible;">{reasons}</div>',
+                        f'<div class="row-symbol">{index}. {show_symbol(symbol)} '
+                        f'<span class="chg-pill {rate_class(item["label"])}">{item["score"]}</span></div>'
+                        f'<div style="margin-top:4px;">{pills}</div>'
+                        f'<div class="row-px" style="text-align:left;margin-top:2px;"><span class="px" style="font-size:15px;">{fmt_px(item["price"])}</span></div>',
                         unsafe_allow_html=True,
                     )
                 with right:
