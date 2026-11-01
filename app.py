@@ -527,6 +527,14 @@ def nasdaq_quote(ticker):
     if price is None:
         return None
     change = parse_num(primary.get("netChange")) or 0.0
+    stats = {}
+    raw_stats = data.get("keyStats") or {}
+    if isinstance(raw_stats, dict):
+        raw_stats = list(raw_stats.values())
+    if isinstance(raw_stats, list):
+        for item in raw_stats:
+            if isinstance(item, dict) and item.get("label"):
+                stats[str(item["label"]).lower()] = item.get("value")
     return {
         "price": price,
         "change": change,
@@ -534,6 +542,10 @@ def nasdaq_quote(ticker):
         "prev": price - change,
         "volume": parse_num(primary.get("volume")),
         "name": data.get("companyName") or "",
+        "open": parse_num(stats.get("open")),
+        "high": parse_num(stats.get("high")),
+        "low": parse_num(stats.get("low")),
+        "cap": parse_num(stats.get("market cap")),
     }
 
 def extended_quote(ticker):
@@ -3942,30 +3954,32 @@ if st.session_state.selected_ticker:
         info = {}
         stock = None
         if symbol:
-            quote = binance_quote(symbol)
+            spot = binance_quote(symbol)
             info = {"quoteType": "CRYPTOCURRENCY"}
             name = pretty_name(ticker)
-            current_price = quote["price"]
-            prev_close = quote["prev"]
-            change = quote["change"]
-            change_pct = quote["pct"]
+            current_price = spot["price"]
+            prev_close = spot["prev"]
+            change = spot["change"]
+            change_pct = spot["pct"]
             website = ""
-            open_px = quote["open"]
-            high_px = quote["high"]
-            low_px = quote["low"]
-            volume = quote["volume"]
+            open_px = spot["open"]
+            high_px = spot["high"]
+            low_px = spot["low"]
+            volume = spot["volume"]
             cap = None
         else:
-            quote = nasdaq_quote(ticker) or {}
-            name = pretty_name(ticker) or quote.get("name") or ticker
-            current_price = quote.get("price") or 0
-            prev_close = quote.get("prev") or current_price
-            change = quote.get("change") or 0
-            change_pct = quote.get("pct") or 0
+            spot = nasdaq_quote(ticker) or {}
+            name = pretty_name(ticker) or spot.get("name") or ticker
+            current_price = spot.get("price") or 0
+            prev_close = spot.get("prev") or current_price
+            change = spot.get("change") or 0
+            change_pct = spot.get("pct") or 0
             website = ""
-            open_px = high_px = low_px = None
-            volume = quote.get("volume")
-            cap = None
+            open_px = spot.get("open")
+            high_px = spot.get("high")
+            low_px = spot.get("low")
+            volume = spot.get("volume")
+            cap = spot.get("cap")
         saved = load_rating_disk().get(ticker) or {}
         structure = saved if saved.get("label") else {"label": "—", "score": None, "notes": []}
         color = "up" if change >= 0 else "down"
