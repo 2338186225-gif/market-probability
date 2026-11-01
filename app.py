@@ -2249,6 +2249,8 @@ def load_books():
             st.session_state.books.setdefault(key, empty_paper())
     if ensure_crypto_reset(st.session_state.books):
         save_books(st.session_state.books)
+    if repair_broken_books(st.session_state.books):
+        save_books(st.session_state.books)
     return st.session_state.books
 
 def save_books(books):
@@ -2328,6 +2330,43 @@ def paper_signals(symbols):
             rows.append(row)
     return rows
 
+def mark_price(cost, price, limit=0.5):
+    """单次计价最多偏离成本 50%。错价不再把盈亏和下一笔仓位放大。"""
+    try:
+        cost = float(cost)
+        price = float(price)
+    except (TypeError, ValueError):
+        return 0.0
+    if cost <= 0 or price <= 0:
+        return 0.0
+    return min(cost * (1 + limit), max(cost * (1 - limit), price))
+
+def book_is_broken(book):
+    if not isinstance(book, dict):
+        return False
+    cash = float(book.get("cash") or 0)
+    fees = float(book.get("fees") or 0)
+    if cash < 0 or cash > PAPER_CASH * 5 or fees > PAPER_CASH:
+        return True
+    for pos in (book.get("positions") or {}).values():
+        if not isinstance(pos, dict):
+            continue
+        margin = float(pos.get("margin") or 0)
+        shares = float(pos.get("shares") or 0)
+        cost = float(pos.get("cost") or 0)
+        if margin > PAPER_CASH * 0.5 or shares * cost > PAPER_CASH * 8:
+            return True
+    return False
+
+def repair_broken_books(books):
+    changed = False
+    for name in ("watch", "market", "edge", "crypto"):
+        book = books.get(name) if isinstance(books, dict) else None
+        if book_is_broken(book):
+            books[name] = reset_book(name)
+            changed = True
+    return changed
+
 def close_position(book, ticker, price, reason, today):
     pos = book["positions"].pop(ticker, None)
     if not pos or not price:
@@ -2337,13 +2376,17 @@ def close_position(book, ticker, price, reason, today):
     shares = float(pos["shares"])
     cost = float(pos.get("cost") or 0)
     side = pos.get("side") or "多"
+    price = mark_price(cost, price) or float(price)
     pnl = (float(price) - cost) * shares if side != "空" else (cost - float(price)) * shares
+    margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
+    if margin > 0:
+        pnl = max(pnl, -margin)
     fee = commission(ticker, shares * float(price))
     open_fee = float(pos.get("fee") or 0)
     paid_fund = float(pos.get("funding") or 0)
     net = pnl - fee - open_fee - paid_fund
-    margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
-    book["cash"] += margin + pnl - fee
+    credit = margin + pnl - fee
+    book["cash"] = max(0.0, float(book.get("cash") or 0) + credit)
     book["fees"] = float(book.get("fees") or 0) + fee
     book["trades"].append({
         "date": today, "side": "平空" if side == "空" else "卖", "ticker": ticker, "shares": shares,
@@ -2424,8 +2467,11 @@ def position_margin_pnl(pos, price):
     cost = float(pos.get("cost") or 0)
     side = pos.get("side") or "多"
     price = float(price or 0)
+    price = mark_price(cost, price) or price
     pnl = (price - cost) * shares if side != "空" else (cost - price) * shares
     margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
+    if margin > 0:
+        pnl = max(pnl, -margin)
     return margin, pnl
 
 def crypto_marks():
@@ -2601,9 +2647,13 @@ def note_drawdown(book, equity):
 
 def order_margin(equity, cash, used, lev, sleeve=0.6, name=0.15):
     lev = max(float(lev or 1), 1.0)
-    room = float(equity) * sleeve - float(used)
-    margin = min(float(cash), room, float(equity) * min(name, 0.8 / lev))
-    if margin < max(1000, float(equity) * 0.02):
+    cash = max(float(cash or 0), 0.0)
+    used = max(float(used or 0), 0.0)
+    # 只用已经交出去的本金，不把未实现盈亏滚进下一笔。上限按 300 万美元，坏行情不能把仓位越开越大。
+    base = min(cash + used, PAPER_CASH * 3)
+    room = base * sleeve - used
+    margin = min(cash, room, base * min(name, 0.8 / lev))
+    if margin < max(1000, base * 0.02):
         return 0.0
     return margin
 
@@ -3333,7 +3383,7 @@ def _monitor_loop():
                 if not isinstance(books, dict) or "watch" not in books:
                     continue
                 books.setdefault("crypto", empty_paper())
-                if ensure_crypto_reset(books):
+                if ensure_crypto_reset(books) or repair_broken_books(books):
                     books["updated"] = datetime.now().isoformat(timespec="seconds")
                     PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False))
                 before = json.dumps(books, sort_keys=True, default=str)
@@ -3572,13 +3622,9 @@ def book_equity(book, signals):
         if not isinstance(pos, dict):
             continue
         price = float(prices.get(ticker) or pos.get("cost") or 0)
-        shares = float(pos.get("shares") or 0)
-        cost = float(pos.get("cost") or 0)
-        side = pos.get("side") or "多"
-        pnl = (price - cost) * shares if side != "空" else (cost - price) * shares
-        margin = float(pos["margin"]) if pos.get("margin") is not None else shares * cost
+        margin, pnl = position_margin_pnl(pos, price)
         equity += margin + pnl
-    return equity
+    return max(0.0, equity)
 
 def book_rows_from_book(book):
     rows = []
