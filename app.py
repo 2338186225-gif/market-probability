@@ -2031,17 +2031,26 @@ def to_zh(text):
         return cached
     translated = ""
     try:
-        url = "https://api.mymemory.translated.net/get?langpair=en|zh-CN&q=" + quote(text[:420])
+        url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=" + quote(text[:420])
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            payload = json.loads(resp.read().decode())
-        translated = ((payload.get("responseData") or {}).get("translatedText") or "").strip()
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode())
+        translated = "".join(part[0] for part in data[0] if part and part[0]).strip()
     except Exception:
         translated = ""
-    if not translated or translated.upper() == text.upper() or "MYMEMORY WARNING" in translated.upper():
-        translated = text
-    _ZH_CACHE[text] = translated
-    return translated
+    if not translated or not any("\u4e00" <= ch <= "\u9fff" for ch in translated):
+        try:
+            url = "https://api.mymemory.translated.net/get?langpair=en|zh-CN&q=" + quote(text[:420])
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                payload = json.loads(resp.read().decode())
+            translated = ((payload.get("responseData") or {}).get("translatedText") or "").strip()
+        except Exception:
+            translated = ""
+    if translated and any("\u4e00" <= ch <= "\u9fff" for ch in translated) and "MYMEMORY WARNING" not in translated.upper():
+        _ZH_CACHE[text] = translated
+        return translated
+    return text
 
 def to_zh_long(text):
     text = (text or "").strip()
