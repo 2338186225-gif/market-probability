@@ -2403,7 +2403,8 @@ def load_books():
     else:
         for key in ("watch", "market", "edge", "crypto"):
             st.session_state.books.setdefault(key, empty_paper())
-    if repair_broken_books(st.session_state.books):
+    changed = repair_broken_books(st.session_state.books) or settle_books(st.session_state.books)
+    if changed:
         st.session_state.books["epoch"] = int(st.session_state.books.get("epoch") or 0) + 1
         save_books(st.session_state.books)
     return st.session_state.books
@@ -2536,6 +2537,60 @@ def repair_broken_books(books):
             changed = True
     return changed
 
+def closed_pnl(book):
+    trades = [trade for trade in (book.get("trades") or []) if isinstance(trade, dict) and trade.get("side") in ("卖", "平空")]
+    total = sum(float(trade.get("pnl") or 0) for trade in trades)
+    if book.get("realized") is None or len(book.get("trades") or []) < 200:
+        book["realized"] = total
+        return total
+    return float(book.get("realized") or 0)
+
+def settle_books(books):
+    """总资产必须等于 100 万加上已实现和未实现盈亏。多出来的现金是错账，扣回去。超限的加密仓缩到本金的 10%。"""
+    changed = False
+    if not isinstance(books, dict):
+        return False
+    for name in ("watch", "market", "edge", "crypto"):
+        book = books.get(name)
+        if not isinstance(book, dict):
+            continue
+        for pos in (book.get("positions") or {}).values():
+            if not isinstance(pos, dict):
+                continue
+            shares = float(pos.get("shares") or 0)
+            cost = float(pos.get("cost") or 0)
+            lev = max(float(pos.get("leverage") or 1), 1.0)
+            implied = shares * cost / lev if shares and cost else float(pos.get("margin") or 0)
+            stored = float(pos.get("margin") or 0)
+            if implied > 0 and (stored <= 0 or stored > implied * 1.05):
+                pos["margin"] = implied
+                changed = True
+            if name == "crypto" and implied > PAPER_CASH * 0.105 and cost > 0 and shares > 0:
+                cap = PAPER_CASH * 0.10
+                scale = cap / implied
+                book["cash"] = float(book.get("cash") or 0) + (implied - cap)
+                pos["shares"] = shares * scale
+                pos["margin"] = cap
+                changed = True
+        margin_sum = 0.0
+        open_fee = 0.0
+        open_fund = 0.0
+        for pos in (book.get("positions") or {}).values():
+            if not isinstance(pos, dict):
+                continue
+            shares = float(pos.get("shares") or 0)
+            cost = float(pos.get("cost") or 0)
+            lev = max(float(pos.get("leverage") or 1), 1.0)
+            margin_sum += shares * cost / lev if shares and cost else float(pos.get("margin") or 0)
+            open_fee += float(pos.get("fee") or 0)
+            open_fund += float(pos.get("funding") or 0)
+        cash = float(book.get("cash") or 0)
+        expected_cash = PAPER_CASH + closed_pnl(book) - margin_sum - open_fee - open_fund
+        if cash > expected_cash + 50:
+            book["cash"] = max(0.0, expected_cash)
+            changed = True
+    return changed
+
 def close_position(book, ticker, price, reason, today):
     pos = book["positions"].pop(ticker, None)
     if not pos or not price:
@@ -2557,6 +2612,8 @@ def close_position(book, ticker, price, reason, today):
     credit = margin + pnl - fee
     book["cash"] = max(0.0, float(book.get("cash") or 0) + credit)
     book["fees"] = float(book.get("fees") or 0) + fee
+    if book.get("realized") is not None:
+        book["realized"] = float(book["realized"]) + net
     book["trades"].append({
         "date": today, "side": "平空" if side == "空" else "卖", "ticker": ticker, "shares": shares,
         "price": round(float(price), 4), "reason": reason,
@@ -3550,7 +3607,7 @@ def _monitor_loop():
                 continue
             books.setdefault("crypto", empty_paper())
             epoch = int(books.get("epoch") or 0)
-            if repair_broken_books(books):
+            if repair_broken_books(books) or settle_books(books):
                 books["epoch"] = epoch + 1
                 epoch = books["epoch"]
                 books["updated"] = datetime.now().isoformat(timespec="seconds")
