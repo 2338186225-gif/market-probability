@@ -2051,7 +2051,10 @@ def fill_home_ratings(limit=6):
         return
     watch = list(st.session_state.get("watchlist") or [])
     ratings = hydrate_ratings(watch)
+    disk = load_rating_disk()
     pending = [ticker for ticker in watch if ticker not in ratings]
+    if not pending:
+        pending = [ticker for ticker in MARKET if not isinstance(disk.get(ticker), dict) or disk[ticker].get("score") is None]
     st.session_state.home_ratings = ratings
     st.session_state.home_ranked = rank_ratings(ratings)
     if not pending:
@@ -2247,8 +2250,6 @@ def load_books():
     else:
         for key in ("watch", "market", "edge", "crypto"):
             st.session_state.books.setdefault(key, empty_paper())
-    if ensure_crypto_reset(st.session_state.books):
-        save_books(st.session_state.books)
     if repair_broken_books(st.session_state.books):
         save_books(st.session_state.books)
     return st.session_state.books
@@ -2258,9 +2259,18 @@ def save_books(books):
     st.session_state.books = books
     with _BOOK_LOCK:
         try:
-            PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False))
+            PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False, default=float))
         except Exception:
             pass
+
+def apply_reset(books, name):
+    """显式重置。epoch 变了，后台线程手里的旧账就不能再写回来。"""
+    if name not in ("watch", "market", "edge", "crypto"):
+        return False
+    books[name] = reset_book(name)
+    books["epoch"] = int(books.get("epoch") or 0) + 1
+    save_books(books)
+    return True
 
 def win_record(books):
     n = wins = 0
@@ -3026,7 +3036,7 @@ def paper_rebalance(book, signals, kind):
         room = equity * caps.get(horizon, 0.7) - margin_used(horizon)
         total_room = equity * (0.70 if kind == "edge" else 0.75) - margin_used()
         name_cap = min(0.12, 0.90 / lev)
-        margin = min(float(book["cash"]), room, total_room, equity * name_cap)
+        margin = min(float(book["cash"]), room, total_room, equity * name_cap, PAPER_CASH * 0.15)
         if margin < max(1000, equity * 0.02) or price <= 0:
             continue
         if not binance_symbol(row["ticker"]):
@@ -3380,30 +3390,38 @@ def _monitor_loop():
                     books = json.loads(PAPER_PATH.read_text())
                 except Exception:
                     continue
-                if not isinstance(books, dict) or "watch" not in books:
+            if not isinstance(books, dict) or "watch" not in books:
+                continue
+            books.setdefault("crypto", empty_paper())
+            epoch = int(books.get("epoch") or 0)
+            if repair_broken_books(books):
+                books["epoch"] = epoch + 1
+                epoch = books["epoch"]
+                books["updated"] = datetime.now().isoformat(timespec="seconds")
+                with _BOOK_LOCK:
+                    PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False, default=float))
+            seen_updated = books.get("updated")
+            for name in ("watch", "market", "edge", "crypto"):
+                book = books.get(name)
+                if not isinstance(book, dict):
                     continue
-                books.setdefault("crypto", empty_paper())
-                if ensure_crypto_reset(books) or repair_broken_books(books):
-                    books["updated"] = datetime.now().isoformat(timespec="seconds")
-                    PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False))
-                before = json.dumps(books, sort_keys=True, default=str)
-                for name in ("watch", "market", "edge", "crypto"):
-                    book = books.get(name)
-                    if not isinstance(book, dict):
-                        continue
-                    prices = {}
-                    for ticker, pos in (book.get("positions") or {}).items():
-                        prices[ticker] = last_price(ticker) or pos.get("cost")
-                    accrue_book(book, prices)
-                    review_drawdown(book, prices, cn_stamp())
-                crypto_edge = (books.get("crypto") or {}).get("entry_edge")
-                crypto_rebalance(books["crypto"], crypto_market_rows(crypto_edge))
-                acted = apply_shocks(books)
-                after = json.dumps(books, sort_keys=True, default=str)
-                if not acted and before == after:
+                prices = {}
+                for ticker, pos in (book.get("positions") or {}).items():
+                    prices[ticker] = last_price(ticker) or pos.get("cost")
+                accrue_book(book, prices)
+                review_drawdown(book, prices, cn_stamp())
+            crypto_edge = (books.get("crypto") or {}).get("entry_edge")
+            crypto_rebalance(books["crypto"], crypto_market_rows(crypto_edge))
+            acted = apply_shocks(books)
+            with _BOOK_LOCK:
+                try:
+                    latest = json.loads(PAPER_PATH.read_text())
+                except Exception:
+                    latest = None
+                if not isinstance(latest, dict) or int(latest.get("epoch") or 0) != epoch or latest.get("updated") != seen_updated:
                     continue
                 books["updated"] = datetime.now().isoformat(timespec="seconds")
-                PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False))
+                PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False, default=float))
         except Exception:
             continue
 
@@ -3660,20 +3678,27 @@ def render_paper():
     )
     st.markdown(tabs, unsafe_allow_html=True)
     names = {"watch": "自选", "market": "全市场", "edge": "择股", "crypto": "加密"}
-    if st.session_state.get("reset_ask") == key:
-        st.caption(f"确认后，{names[key]}仓的持仓和成交记录清空，现金回到 100 万美元。")
-        yes, no = st.columns(2)
-        if yes.button("确认重置", type="primary", use_container_width=True):
-            books[key] = reset_book(key)
-            save_books(books)
-            st.session_state.reset_ask = ""
-            st.rerun()
-        if no.button("取消", use_container_width=True):
-            st.session_state.reset_ask = ""
-            st.rerun()
-    elif st.button(f"重置{names[key]}仓为 100 万美元", use_container_width=True):
-        st.session_state.reset_ask = key
+    action = st.query_params.get("do")
+    if isinstance(action, list):
+        action = action[0] if action else None
+    if action == "reset":
+        apply_reset(books, key)
+        del st.query_params["do"]
         st.rerun()
+    if action == "ask-reset":
+        st.caption(f"确认后，{names[key]}仓的持仓和成交记录清空，现金回到 100 万美元。")
+        st.markdown(
+            f'<div class="paper-tabs">'
+            f'<a class="on" href="?view=paper&book={key}&do=reset" target="_self">确认重置</a>'
+            f'<a href="?view=paper&book={key}" target="_self">取消</a>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div class="paper-tabs"><a href="?view=paper&book={key}&do=ask-reset" target="_self">重置{names[key]}仓为 100 万美元</a></div>',
+            unsafe_allow_html=True,
+        )
     paper_at = st.session_state.get("paper_board_at") or 0
     paper_key = (tuple(st.session_state.watchlist), "lev-v2")
     fresh = (
@@ -4556,13 +4581,20 @@ else:
             )
 
     with rank_col:
+        board = []
+        for ticker, item in load_rating_disk().items():
+            if ticker in MARKET and isinstance(item, dict) and item.get("score") is not None:
+                board.append(item)
+        for ticker, item in ratings.items():
+            if isinstance(item, dict) and item.get("score") is not None and item.get("ticker") not in {row.get("ticker") for row in board}:
+                board.append(item)
         if level_unit:
-            ranked_view = sorted(ranked, key=lambda item: (item.get("by_unit") or {}).get(level_unit, {}).get("score", -99), reverse=True)
+            ranked_view = sorted(board, key=lambda item: (item.get("by_unit") or {}).get(level_unit, {}).get("score", -99), reverse=True)
         else:
-            ranked_view = list(ranked)
+            ranked_view = sorted(board, key=lambda item: item.get("score") or -999, reverse=True)
         picks = ranked_view[:10]
         st.markdown(f'<div class="board-head"><div class="section-title">综合买入评级</div><div class="muted">{basis}前十</div></div>', unsafe_allow_html=True)
-        st.caption("按自选打分，不在打开页面时扫完全市场。选日线、周线、月线时只看那一级。评级会分批出来。")
+        st.caption("从美股和加密的已算分数里取前十，不限于自选。没算过的会在后台补，选日线、周线、月线时只看那一级。")
         if not picks:
             st.info("评级还在分批计算，行情先显示。稍等或点一下页面就会补上。")
         for index, item in enumerate(picks, start=1):
