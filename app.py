@@ -2331,6 +2331,7 @@ def load_books():
         for key in ("watch", "market", "edge", "crypto"):
             st.session_state.books.setdefault(key, empty_paper())
     if repair_broken_books(st.session_state.books):
+        st.session_state.books["epoch"] = int(st.session_state.books.get("epoch") or 0) + 1
         save_books(st.session_state.books)
     return st.session_state.books
 
@@ -2449,22 +2450,16 @@ def book_is_broken(book):
     return False
 
 def repair_broken_books(books):
+    """只在现金、手续费或单笔仓位大到不可能时才整本重置。正常的小时线持仓留着。"""
     changed = False
     for name in ("watch", "market", "edge", "crypto"):
         book = books.get(name) if isinstance(books, dict) else None
-        broken = book_is_broken(book)
-        if name == "crypto" and isinstance(book, dict):
-            if book.get("rules") == "crypto-15m-v3":
-                broken = True
-            for pos in (book.get("positions") or {}).values():
-                if not isinstance(pos, dict):
-                    continue
-                margin = float(pos.get("margin") or 0)
-                notional = float(pos.get("shares") or 0) * float(pos.get("cost") or 0)
-                if margin > PAPER_CASH * 0.12 or notional > PAPER_CASH:
-                    broken = True
-        if broken:
+        if book_is_broken(book):
             books[name] = reset_book(name)
+            changed = True
+            continue
+        if name == "crypto" and isinstance(book, dict) and book.get("rules") == "crypto-15m-v3":
+            book["rules"] = "crypto-1h-v1"
             changed = True
     return changed
 
