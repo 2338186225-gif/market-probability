@@ -10,6 +10,7 @@ import html
 import json
 import os
 import re
+import socket
 import threading
 import time
 import urllib.request
@@ -834,23 +835,7 @@ def fetch_hist(ticker, timeframe):
             bars = pd.DataFrame()
         if bars is not None and not bars.empty:
             return bars
-    stock = yf.Ticker(ticker)
-    mapping = {
-        "15m": ("7d", "15m"),
-        "1h": ("60d", "1h"),
-        "4h": ("60d", "1h"),
-        "1d": ("1y", "1d"),
-        "1wk": ("5y", "1wk"),
-        "1mo": ("max", "1mo"),
-    }
-    period, interval = mapping.get(timeframe, ("1y", "1d"))
-    hist = stock.history(period=period, interval=interval)
-    if timeframe == "4h" and not hist.empty:
-        hist = hist.resample("4h").agg({
-            "Open": "first", "High": "max", "Low": "min",
-            "Close": "last", "Volume": "sum"
-        }).dropna()
-    return hist
+    return pd.DataFrame()
 
 def kline_level(df, unit):
     windows = {"日": (7, 25, 60, 20), "周": (10, 20, 40, 12), "月": (6, 12, 24, 6)}
@@ -1163,6 +1148,78 @@ def rank_universe(tickers: tuple):
             ranked.append(rated)
     ranked.sort(key=lambda item: item.get("score") or 0, reverse=True)
     return ranked
+
+US_RANK_PATH = Path(__file__).with_name("us_rank.json")
+
+def load_us_rank():
+    try:
+        raw = json.loads(US_RANK_PATH.read_text())
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    raw.setdefault("day", "")
+    raw.setdefault("rows", {})
+    raw.setdefault("prev", {})
+    return raw
+
+def save_us_rank(payload):
+    try:
+        US_RANK_PATH.write_text(json.dumps(payload, ensure_ascii=False, default=float))
+    except Exception:
+        pass
+
+def advance_us_rank(limit=8):
+    """美股名单每天只算一轮。算完就停，第二天再换。"""
+    today = cn_now().date().isoformat()
+    payload = load_us_rank()
+    if payload.get("day") != today:
+        payload["prev"] = payload.get("rows") or payload.get("prev") or {}
+        payload["rows"] = {}
+        payload["day"] = today
+    rows = payload["rows"]
+    pending = [ticker for ticker in US_MARKET if ticker not in rows]
+    if not pending:
+        return payload
+    for ticker in pending[:limit]:
+        try:
+            rated = rate_fast(ticker)
+        except Exception:
+            rated = None
+        if isinstance(rated, dict) and rated.get("score") is not None:
+            rows[ticker] = {
+                "ticker": ticker,
+                "score": rated.get("score"),
+                "label": rated.get("label"),
+                "by_unit": rated.get("by_unit") or {},
+                "price": rated.get("price"),
+            }
+        else:
+            rows[ticker] = {"ticker": ticker, "score": None, "label": "—"}
+    save_us_rank(payload)
+    save_rating_disk({key: row for key, row in rows.items() if isinstance(row, dict) and row.get("score") is not None})
+    return payload
+
+def us_board_rows():
+    payload = load_us_rank()
+    today = cn_now().date().isoformat()
+    rows = payload.get("rows") or {}
+    done = len(rows)
+    total = len(US_MARKET)
+    complete = payload.get("day") == today and done >= total and total > 0
+    picked = {}
+    if complete:
+        for ticker, row in rows.items():
+            if isinstance(row, dict) and row.get("score") is not None:
+                picked[ticker] = row
+    else:
+        for source in (rows, payload.get("prev") or {}, load_rating_disk()):
+            for ticker, row in source.items():
+                if ticker in picked or ticker not in US_MARKET:
+                    continue
+                if isinstance(row, dict) and row.get("score") is not None:
+                    picked[ticker] = row
+    return list(picked.values()), done, total, payload.get("day") or ""
 
 def quote_bar(ticker, price, change_pct, label, name, website="", prefix="", amount=None, score=None):
     tone = "up" if change_pct >= 0 else "down"
@@ -1736,6 +1793,23 @@ def _estimate_row(table):
             return table.loc[label]
     return table.iloc[0]
 
+def load_yf(ticker, info):
+    """只在财务、分析里用。概览不碰雅虎，避免详情页一直转圈。"""
+    if binance_symbol(ticker):
+        return None, info or {}
+    old = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(8)
+    try:
+        stock = yf.Ticker(ticker)
+        try:
+            extra = stock.info or {}
+            info = {**(info or {}), **extra}
+        except Exception:
+            pass
+        return stock, info or {}
+    finally:
+        socket.setdefaulttimeout(old)
+
 def earnings_schedule(stock, info):
     now = pd.Timestamp.utcnow().tz_localize(None)
     past, future = [], []
@@ -1892,26 +1966,22 @@ def to_zh(text):
         return text
     if any("\u4e00" <= ch <= "\u9fff" for ch in text):
         return text
+    cached = _ZH_CACHE.get(text)
+    if cached:
+        return cached
     translated = ""
     try:
         url = "https://api.mymemory.translated.net/get?langpair=en|zh-CN&q=" + quote(text[:420])
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=3) as resp:
             payload = json.loads(resp.read().decode())
         translated = ((payload.get("responseData") or {}).get("translatedText") or "").strip()
     except Exception:
         translated = ""
     if not translated or translated.upper() == text.upper() or "MYMEMORY WARNING" in translated.upper():
-        try:
-            url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=" + quote(text[:420])
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = json.loads(resp.read().decode())
-            translated = "".join(part[0] for part in data[0] if part and part[0])
-        except Exception:
-            translated = text
-    _ZH_CACHE[text] = translated or text
-    return _ZH_CACHE[text]
+        translated = text
+    _ZH_CACHE[text] = translated
+    return translated
 
 _HEADLINE_CACHE = {}
 
@@ -2053,8 +2123,6 @@ def fill_home_ratings(limit=6):
     ratings = hydrate_ratings(watch)
     disk = load_rating_disk()
     pending = [ticker for ticker in watch if ticker not in ratings]
-    if not pending:
-        pending = [ticker for ticker in MARKET if not isinstance(disk.get(ticker), dict) or disk[ticker].get("score") is None]
     st.session_state.home_ratings = ratings
     st.session_state.home_ranked = rank_ratings(ratings)
     if not pending:
@@ -3401,6 +3469,10 @@ def _monitor_loop():
                 with _BOOK_LOCK:
                     PAPER_PATH.write_text(json.dumps(books, ensure_ascii=False, default=float))
             seen_updated = books.get("updated")
+            try:
+                advance_us_rank(8)
+            except Exception:
+                pass
             for name in ("watch", "market", "edge", "crypto"):
                 book = books.get(name)
                 if not isinstance(book, dict):
@@ -3859,6 +3931,8 @@ if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
     try:
         symbol = binance_symbol(ticker)
+        info = {}
+        stock = None
         if symbol:
             quote = binance_quote(symbol)
             info = {"quoteType": "CRYPTOCURRENCY"}
@@ -3874,41 +3948,20 @@ if st.session_state.selected_ticker:
             volume = quote["volume"]
             cap = None
         else:
-            quote = nasdaq_quote(ticker)
-            stock = yf.Ticker(ticker)
-            info = {}
-            try:
-                info = stock.info or {}
-            except Exception:
-                info = {}
-            if quote:
-                name = pretty_name(ticker, info)
-                current_price = quote["price"]
-                prev_close = quote["prev"]
-                change = quote["change"]
-                change_pct = quote["pct"]
-                website = info.get("website") or ""
-                open_px = info.get("open") or info.get("regularMarketOpen")
-                high_px = info.get("dayHigh") or info.get("regularMarketDayHigh")
-                low_px = info.get("dayLow") or info.get("regularMarketDayLow")
-                volume = quote.get("volume") or info.get("volume") or info.get("regularMarketVolume")
-                cap = info.get("marketCap")
-            else:
-                name = pretty_name(ticker, info)
-                quick = stock.history(period="2d")
-                current_price = float(quick["Close"].iloc[-1]) if not quick.empty else 0
-                prev_close = info.get("previousClose", current_price)
-                change = current_price - prev_close
-                change_pct = (change / prev_close * 100) if prev_close else 0
-                website = info.get("website") or ""
-                open_px = info.get("open") or info.get("regularMarketOpen")
-                high_px = info.get("dayHigh") or info.get("regularMarketDayHigh")
-                low_px = info.get("dayLow") or info.get("regularMarketDayLow")
-                volume = info.get("volume") or info.get("regularMarketVolume")
-                cap = info.get("marketCap")
+            quote = nasdaq_quote(ticker) or {}
+            name = pretty_name(ticker) or quote.get("name") or ticker
+            current_price = quote.get("price") or 0
+            prev_close = quote.get("prev") or current_price
+            change = quote.get("change") or 0
+            change_pct = quote.get("pct") or 0
+            website = ""
+            open_px = high_px = low_px = None
+            volume = quote.get("volume")
+            cap = None
+        saved = load_rating_disk().get(ticker) or {}
+        structure = saved if saved.get("label") else {"label": "—", "score": None, "notes": []}
         color = "up" if change >= 0 else "down"
         sign = "+" if change >= 0 else ""
-        structure = rate_ticker(ticker) or {"label": "观望", "score": 0, "notes": ["历史不够，先不给买入评级。"]}
 
         c_back, c_title, c_fresh = st.columns([0.5, 6, 0.7])
         with c_back:
@@ -3964,9 +4017,9 @@ if st.session_state.selected_ticker:
                     post = text
             st.markdown(f'<div class="bn-name">{pre} · {post}</div>', unsafe_allow_html=True)
 
-        tab1, tab2, tab3, tab4 = st.tabs(["概览", "财务", "分析", "行情预测"])
+        section = st.radio("详情栏目", ["概览", "财务", "分析", "行情预测"], horizontal=True, label_visibility="collapsed", key=f"detail_sec_{ticker}")
         
-        with tab1:
+        if section == "概览":
             tf_labels = ["15分", "1小时", "4小时", "1天", "周线", "月线"]
             tf_values = ["15m", "1h", "4h", "1d", "1wk", "1mo"]
             current_tf = st.session_state.timeframe if st.session_state.timeframe in tf_values else "1d"
@@ -4042,15 +4095,13 @@ if st.session_state.selected_ticker:
                 st.caption(f"RSI(6) {last_num('RSI6')} · RSI(12) {last_num('RSI12')} · RSI(24) {last_num('RSI24')} · DIF {last_num('DIF')} · DEA {last_num('DEA')} · MACD {last_num('MACD')}")
 
             st.markdown("### 最新相关新闻")
-            news = fetch_news(ticker)
+            news = fetch_news(ticker, limit=4, timeout=4)
             if not news:
                 st.info("暂时没有拉到这只标的的新闻。")
             else:
                 for item in news:
                     title = html.escape(to_zh(item["title"]))
-                    raw_summary = re.sub(r"<[^>]+>", " ", item.get("summary") or "")
-                    raw_summary = re.sub(r"\s+", " ", html.unescape(raw_summary)).strip()
-                    summary = html.escape(to_zh(raw_summary)) if raw_summary else ""
+                    summary = ""
                     meta = " · ".join(part for part in (item["source"], item["time"]) if part)
                     link = html.escape(item["link"], quote=True)
                     body = f'<a href="{link}" target="_self">{title}</a>' if link else title
@@ -4061,105 +4112,109 @@ if st.session_state.selected_ticker:
                     )
                 st.caption("新闻已译成中文，来自 Yahoo Finance。点标题打开原文。")
         
-        with tab2:
-            st.markdown("### 财报日程")
-            try:
-                sched = earnings_schedule(stock, info)
-                d1, d2 = st.columns(2)
-                d1.metric("本季财报", fmt_earnings_when(sched["this_ts"]))
-                d2.metric("下一季公布", fmt_earnings_when(sched["next_ts"]))
-                if sched["this_eps"] is not None:
-                    st.caption(f"本季已公布每股收益 {sched['this_eps']:.2f}。日期来自行情源，临近公布时可能改期。")
-                st.markdown("### 下一季度财报")
-                nxt = next_quarter_lines(sched)
-                st.markdown(
-                    '<div class="analysis-box">' + "<br>".join(html.escape(line) for line in nxt) + "</div>",
-                    unsafe_allow_html=True,
-                )
-            except Exception:
-                st.info("财报日程暂时取不到。")
-            st.markdown("### 最新财报解读")
-            try:
-                verdict, klass, body = earnings_view(stock, info)
-                text = "<br>".join(html.escape(line) for line in body)
-                st.markdown(
-                    f'<div class="analysis-box"><span class="verdict {klass}">{verdict}</span><br>{text}</div>',
-                    unsafe_allow_html=True,
-                )
-                st.caption("根据公开财报和一致预期自动整理，不是投研报告，也不构成投资建议。")
-            except Exception:
-                st.info("这份财报暂时解读不了。")
-            st.markdown("### 近几个季度对比")
-            try:
-                qdf = stock.quarterly_income_stmt
-                if qdf is None or qdf.empty:
-                    qdf = stock.quarterly_financials
-                if qdf is not None and not qdf.empty:
-                    qdf = qdf.iloc[:, :5]
-                    keys = [
-                        "Total Revenue", "Cost Of Revenue", "Gross Profit",
-                        "Operating Income", "EBITDA", "Net Income",
-                        "Diluted EPS", "Basic EPS",
-                    ]
-                    rows = []
-                    labels = []
-                    for key in keys:
-                        ser = series_at(qdf, [key])
-                        if ser is None:
-                            continue
-                        labels.append(to_cn(key))
-                        vals = []
-                        for v in list(ser.values)[:5]:
-                            if v is None or pd.isna(v):
-                                vals.append(None)
-                            elif "EPS" in key:
-                                vals.append(round(float(v), 2))
-                            else:
-                                vals.append(round(float(v) / 10000, 0))
-                        rows.append(vals)
-                    if rows:
-                        cols = [quarter_label(c) for c in list(qdf.columns)[:5]]
-                        table = pd.DataFrame(rows, index=labels, columns=cols)
-                        st.dataframe(
-                            table.style.format(lambda v: f"{v:,.0f}" if isinstance(v, (int, float)) and pd.notna(v) and abs(v) >= 50 else (f"{v:.2f}" if isinstance(v, (int, float)) and pd.notna(v) else "—")),
-                            use_container_width=True,
-                        )
-                        st.caption("最近最多 5 个季度，从左到右由新到旧。金额单位为万元，每股收益为原币金额。")
-                    else:
-                        st.info("有财报，但关键科目对不上。")
-                else:
-                    st.info("暂无季度财报。ETF 和部分标的通常没有公司利润表。")
-
-                st.markdown("**全年关键指标**")
-                items = [
-                    ("营收(TTM)", info.get("totalRevenue")),
-                    ("净利润(TTM)", info.get("netIncomeToCommon")),
-                    ("毛利率", info.get("grossMargins")),
-                    ("净利率", info.get("profitMargins")),
-                    ("ROE", info.get("returnOnEquity")),
-                ]
-                for label, val in items:
-                    if val is not None:
-                        if isinstance(val, float) and abs(val) < 1:
-                            st.write(f"- {label}: {val*100:.1f}%")
+        elif section == "财务":
+            stock, info = load_yf(ticker, info)
+            if stock is None:
+                st.info("加密资产没有公司财报。")
+            else:
+                try:
+                    sched = earnings_schedule(stock, info)
+                    d1, d2 = st.columns(2)
+                    d1.metric("本季财报", fmt_earnings_when(sched["this_ts"]))
+                    d2.metric("下一季公布", fmt_earnings_when(sched["next_ts"]))
+                    if sched["this_eps"] is not None:
+                        st.caption(f"本季已公布每股收益 {sched['this_eps']:.2f}。日期来自行情源，临近公布时可能改期。")
+                    st.markdown("### 下一季度财报")
+                    nxt = next_quarter_lines(sched)
+                    st.markdown(
+                        '<div class="analysis-box">' + "<br>".join(html.escape(line) for line in nxt) + "</div>",
+                        unsafe_allow_html=True,
+                    )
+                except Exception:
+                    st.info("财报日程暂时取不到。")
+                st.markdown("### 最新财报解读")
+                try:
+                    verdict, klass, body = earnings_view(stock, info)
+                    text = "<br>".join(html.escape(line) for line in body)
+                    st.markdown(
+                        f'<div class="analysis-box"><span class="verdict {klass}">{verdict}</span><br>{text}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption("根据公开财报和一致预期自动整理，不是投研报告，也不构成投资建议。")
+                except Exception:
+                    st.info("这份财报暂时解读不了。")
+                st.markdown("### 近几个季度对比")
+                try:
+                    qdf = stock.quarterly_income_stmt
+                    if qdf is None or qdf.empty:
+                        qdf = stock.quarterly_financials
+                    if qdf is not None and not qdf.empty:
+                        qdf = qdf.iloc[:, :5]
+                        keys = [
+                            "Total Revenue", "Cost Of Revenue", "Gross Profit",
+                            "Operating Income", "EBITDA", "Net Income",
+                            "Diluted EPS", "Basic EPS",
+                        ]
+                        rows = []
+                        labels = []
+                        for key in keys:
+                            ser = series_at(qdf, [key])
+                            if ser is None:
+                                continue
+                            labels.append(to_cn(key))
+                            vals = []
+                            for v in list(ser.values)[:5]:
+                                if v is None or pd.isna(v):
+                                    vals.append(None)
+                                elif "EPS" in key:
+                                    vals.append(round(float(v), 2))
+                                else:
+                                    vals.append(round(float(v) / 10000, 0))
+                            rows.append(vals)
+                        if rows:
+                            cols = [quarter_label(c) for c in list(qdf.columns)[:5]]
+                            table = pd.DataFrame(rows, index=labels, columns=cols)
+                            st.dataframe(
+                                table.style.format(lambda v: f"{v:,.0f}" if isinstance(v, (int, float)) and pd.notna(v) and abs(v) >= 50 else (f"{v:.2f}" if isinstance(v, (int, float)) and pd.notna(v) else "—")),
+                                use_container_width=True,
+                            )
+                            st.caption("最近最多 5 个季度，从左到右由新到旧。金额单位为万元，每股收益为原币金额。")
                         else:
-                            st.write(f"- {label}: {format_wan(val)}")
+                            st.info("有财报，但关键科目对不上。")
+                    else:
+                        st.info("暂无季度财报。ETF 和部分标的通常没有公司利润表。")
 
-                st.markdown("### 财报链接")
-                yahoo_url = f"https://finance.yahoo.com/quote/{ticker}/financials"
-                st.markdown(f'<div class="link-box"><a href="{yahoo_url}" target="_self">Yahoo Finance 财务报表</a></div>', unsafe_allow_html=True)
-                website = info.get("website")
-                if website:
-                    st.markdown(f'<div class="link-box"><a href="{website}" target="_self">公司官网</a></div>', unsafe_allow_html=True)
-                if ticker.endswith(".HK"):
-                    st.markdown('<div class="link-box">港股财报可前往港交所披露易查询</div>', unsafe_allow_html=True)
-                else:
-                    sec_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={info.get('symbol', ticker)}&type=10-&dateb=&owner=include&count=10"
-                    st.markdown(f'<div class="link-box"><a href="{sec_url}" target="_self">SEC EDGAR 财报查询（美股）</a></div>', unsafe_allow_html=True)
-            except Exception as e:
-                st.info(f"财务数据暂不可用：{str(e)}")
+                    st.markdown("**全年关键指标**")
+                    items = [
+                        ("营收(TTM)", info.get("totalRevenue")),
+                        ("净利润(TTM)", info.get("netIncomeToCommon")),
+                        ("毛利率", info.get("grossMargins")),
+                        ("净利率", info.get("profitMargins")),
+                        ("ROE", info.get("returnOnEquity")),
+                    ]
+                    for label, val in items:
+                        if val is not None:
+                            if isinstance(val, float) and abs(val) < 1:
+                                st.write(f"- {label}: {val*100:.1f}%")
+                            else:
+                                st.write(f"- {label}: {format_wan(val)}")
 
-        with tab3:
+                    st.markdown("### 财报链接")
+                    yahoo_url = f"https://finance.yahoo.com/quote/{ticker}/financials"
+                    st.markdown(f'<div class="link-box"><a href="{yahoo_url}" target="_self">Yahoo Finance 财务报表</a></div>', unsafe_allow_html=True)
+                    website = info.get("website")
+                    if website:
+                        st.markdown(f'<div class="link-box"><a href="{website}" target="_self">公司官网</a></div>', unsafe_allow_html=True)
+                    if ticker.endswith(".HK"):
+                        st.markdown('<div class="link-box">港股财报可前往港交所披露易查询</div>', unsafe_allow_html=True)
+                    else:
+                        sec_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={info.get('symbol', ticker)}&type=10-&dateb=&owner=include&count=10"
+                        st.markdown(f'<div class="link-box"><a href="{sec_url}" target="_self">SEC EDGAR 财报查询（美股）</a></div>', unsafe_allow_html=True)
+                except Exception as e:
+                    st.info(f"财务数据暂不可用：{str(e)}")
+
+        elif section == "分析":
+            stock, info = load_yf(ticker, info)
             st.markdown("### 日线 · 周线 · 月线")
             st.caption("月线看大方向，周线看波段，日线看短线进出。均线按各自周期计算：日线 7/25/60，周线 10/20/40，月线 6/12/24。")
             levels = [kline_level(fetch_hist(ticker, tf), unit) for tf, unit in (("1d", "日"), ("1wk", "周"), ("1mo", "月"))]
@@ -4320,7 +4375,7 @@ if st.session_state.selected_ticker:
                 st.markdown('<div class="analysis-box">' + "<br>".join(items) + "</div>", unsafe_allow_html=True)
             st.caption("分析由公开行情和财务数据自动整理，仅供参考，不构成投资建议。")
         
-        with tab4:
+        elif section == "行情预测":
             st.markdown("### 行情预测")
             st.caption("把 Black-Scholes、蒙特卡洛和二叉树放在一起。概率是模型结果，不是市场一定会这样走。")
             c_a, c_b, c_c = st.columns(3)
@@ -4581,20 +4636,14 @@ else:
             )
 
     with rank_col:
-        board = []
-        for ticker, item in load_rating_disk().items():
-            if ticker in MARKET and isinstance(item, dict) and item.get("score") is not None:
-                board.append(item)
-        for ticker, item in ratings.items():
-            if isinstance(item, dict) and item.get("score") is not None and item.get("ticker") not in {row.get("ticker") for row in board}:
-                board.append(item)
+        board, done, total, rank_day = us_board_rows()
         if level_unit:
-            ranked_view = sorted(board, key=lambda item: (item.get("by_unit") or {}).get(level_unit, {}).get("score", -99), reverse=True)
+            ranked_view = sorted(board, key=lambda item: ((item.get("by_unit") or {}).get(level_unit) or {}).get("score", -99), reverse=True)
         else:
             ranked_view = sorted(board, key=lambda item: item.get("score") or -999, reverse=True)
         picks = ranked_view[:10]
         st.markdown(f'<div class="board-head"><div class="section-title">综合买入评级</div><div class="muted">{basis}前十</div></div>', unsafe_allow_html=True)
-        st.caption("从美股和加密的已算分数里取前十，不限于自选。没算过的会在后台补，选日线、周线、月线时只看那一级。")
+        st.caption(f"从美股大盘股里排，不看自选。每天更新一次。{rank_day or '今天'} 已算 {done}/{total}。没算完之前，空位用上一天的分数。")
         if not picks:
             st.info("评级还在分批计算，行情先显示。稍等或点一下页面就会补上。")
         for index, item in enumerate(picks, start=1):
