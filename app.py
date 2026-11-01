@@ -548,6 +548,54 @@ def nasdaq_quote(ticker):
         "cap": parse_num(stats.get("market cap")),
     }
 
+_PROFILE = {}
+_CRYPTO_ABOUT = {
+    "BTC-USD": "比特币是最早的加密货币，总量上限约 2100 万枚。它主要被当作可转移的数字资产和价值储藏，不代表某家公司的股权。",
+    "ETH-USD": "以太坊是一条可编程的公链。上面可以运行智能合约、稳定币和去中心化应用。ETH 用来支付网络费用，并参与质押。",
+    "BNB-USD": "BNB 是币安体系的代币，用于交易手续费、币安链上的费用和平台活动。价格受平台业务和代币销毁安排影响。",
+    "SOL-USD": "Solana 是一条追求高吞吐、低费用的公链，常见用途是交易、支付和链上应用。SOL 用来支付网络费用和质押。",
+    "XRP-USD": "XRP 是瑞波网络中的支付代币，定位是跨境转账的桥接资产。它不是股票，也没有公司财报。",
+    "DOGE-USD": "狗狗币最早是一个玩笑项目，后来成为交易活跃的支付型加密货币。供给没有硬顶，价格波动通常很大。",
+    "ADA-USD": "卡尔达诺是一条使用权益证明的公链。ADA 用来支付手续费、质押和参与网络治理。",
+    "AVAX-USD": "Avalanche 是一条支持智能合约的公链，主打较快确认。AVAX 用来支付费用和质押。",
+    "LINK-USD": "Chainlink 为智能合约提供外部数据和价格喂价。LINK 用来支付预言机服务。",
+    "LTC-USD": "莱特币是早期的比特币分叉，定位是更快、更便宜的支付。总量上限约 8400 万枚。",
+    "BCH-USD": "比特币现金是比特币的分叉，强调更大的区块和更低的转账费用，主要用作支付。",
+    "DOT-USD": "波卡想把不同的区块链连在一起，让它们能交换数据和资产。DOT 用于质押和网络治理。",
+    "UNI-USD": "Uniswap 是以太坊上的去中心化交易所。UNI 是它的治理代币，持有人可以参与协议参数的投票。",
+    "HYPE32196-USD": "HYPE 是 Hyperliquid 的代币。Hyperliquid 是一个链上衍生品交易场所，代币和平台交易、治理有关。",
+}
+
+def company_profile(ticker):
+    hit = _PROFILE.get(ticker)
+    if hit and time.time() - hit[0] < 86400:
+        return hit[1]
+    found = None
+    if binance_symbol(ticker):
+        text = _CRYPTO_ABOUT.get(ticker) or "这是一种加密资产，不代表公司股权，也没有上市公司那种季度财报。"
+        found = {"text": text, "sector": "加密资产", "industry": "", "url": ""}
+    else:
+        symbol = quote(nasdaq_symbol(ticker), safe=".")
+        order = ("etf", "stocks") if str(ticker).upper() in ETFS else ("stocks", "etf")
+        for asset in order:
+            try:
+                data = nasdaq_get(f"/api/company/{symbol}/company-profile?assetclass={asset}", timeout=4)
+            except Exception:
+                continue
+            payload = (data or {}).get("data") or {}
+            desc = ((payload.get("CompanyDescription") or {}).get("value") or "").strip()
+            if not desc:
+                continue
+            found = {
+                "text": desc,
+                "sector": ((payload.get("Sector") or {}).get("value") or "").strip(),
+                "industry": ((payload.get("Industry") or {}).get("value") or "").strip(),
+                "url": ((payload.get("CompanyUrl") or {}).get("value") or "").strip(),
+            }
+            break
+    _PROFILE[ticker] = (time.time(), found)
+    return found
+
 def extended_quote(ticker):
     if binance_symbol(ticker):
         return None
@@ -1994,6 +2042,22 @@ def to_zh(text):
         translated = text
     _ZH_CACHE[text] = translated
     return translated
+
+def to_zh_long(text):
+    text = (text or "").strip()
+    if not text or any("\u4e00" <= ch <= "\u9fff" for ch in text):
+        return text
+    chunks = []
+    buf = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        if buf and len(buf) + len(sentence) > 360:
+            chunks.append(buf)
+            buf = sentence
+        else:
+            buf = (buf + " " + sentence).strip()
+    if buf:
+        chunks.append(buf)
+    return "".join(to_zh(part) for part in chunks)
 
 _HEADLINE_CACHE = {}
 
@@ -4110,6 +4174,22 @@ if st.session_state.selected_ticker:
                 fig.update_yaxes(showgrid=True, gridcolor="#f3f4f6")
                 st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
                 st.caption(f"RSI(6) {last_num('RSI6')} · RSI(12) {last_num('RSI12')} · RSI(24) {last_num('RSI24')} · DIF {last_num('DIF')} · DEA {last_num('DEA')} · MACD {last_num('MACD')}")
+
+            profile = company_profile(ticker)
+            if profile and profile.get("text"):
+                about_title = "简介" if binance_symbol(ticker) else "公司介绍"
+                about = html.escape(to_zh_long(profile["text"]))
+                bits = [to_zh(part) for part in (profile.get("sector"), profile.get("industry")) if part]
+                about_meta = " · ".join(html.escape(part) for part in bits)
+                site = profile.get("url") or ""
+                site_html = f'<div class="muted" style="margin-top:6px;"><a href="{html.escape(site, quote=True)}" target="_self">公司网站</a></div>' if site.startswith("http") else ""
+                st.markdown(
+                    f'<div class="section-title" style="margin-top:16px;">{about_title}</div>'
+                    f'<div class="analysis-box">{about}{site_html}</div>',
+                    unsafe_allow_html=True,
+                )
+                if about_meta:
+                    st.caption(about_meta)
 
             st.markdown("### 最新相关新闻")
             news = fetch_news(ticker, limit=4, timeout=4)
